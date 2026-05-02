@@ -7,11 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/google/uuid"
-
 	"github.com/bo0tzz/pgmqtt/internal/config"
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/listener"
 )
 
 func main() {
@@ -49,10 +48,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// M4 baseline: single-pod operation. M5 replaces this with the listener
-	// that holds an advisory lock per its UUID and fans out via pg_notify.
-	eng.SetBrokerID(uuid.New())
-	eng.SetNotifier(engine.NewInProcessNotifier(eng))
+	lst, err := listener.Start(ctx, cfg.DatabaseURL, eng, logger)
+	if err != nil {
+		logger.Error("listener", "err", err)
+		os.Exit(1)
+	}
+	defer lst.Stop()
+	eng.SetBrokerID(lst.BrokerID())
+	eng.SetNotifier(listener.NewNotifier(pool))
+	eng.SetTakeoverNotifier(listener.NewTakeoverNotifier(pool))
 
 	logger.Info("pgmqttd starting", "tcp", cfg.TCPAddr, "ws", cfg.WSAddr, "broker", eng.BrokerID())
 	if err := eng.Serve(ctx); err != nil {

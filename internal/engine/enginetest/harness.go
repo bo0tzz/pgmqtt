@@ -43,24 +43,39 @@ func NewHarness(t *testing.T) *Harness {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
+	seedUser(t, pool, "test", "test")
 
-	hash, _ := bcrypt.GenerateFromPassword([]byte("test"), bcrypt.MinCost)
-	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO users(username, password_hash) VALUES('test', $1)`, string(hash)); err != nil {
-		t.Fatalf("seed user: %v", err)
+	eng, brokerID, addr, cancel, done := startBroker(t, pool, url, nil)
+	h := &Harness{
+		T:         t,
+		Pool:      pool,
+		URL:       url,
+		Engine:    eng,
+		BrokerID:  brokerID,
+		cancel:    cancel,
+		doneServe: done,
+		tcpAddr:   addr,
 	}
+	t.Cleanup(h.Stop)
+	return h
+}
 
+// PodSetup customises a per-Pod engine boot.
+type PodSetup func(*engine.Engine) (cleanup func())
+
+func startBroker(t *testing.T, pool *pgxpool.Pool, url string, customise PodSetup) (
+	*engine.Engine, uuid.UUID, string, context.CancelFunc, chan struct{},
+) {
+	t.Helper()
 	cfg := &config.Config{
 		DatabaseURL: url,
 		TCPAddr:     "127.0.0.1:0",
 		WSAddr:      "",
 	}
-
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if testing.Verbose() {
 		logger = slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
-
 	eng, err := engine.New(context.Background(), cfg, pool, logger)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
@@ -69,10 +84,18 @@ func NewHarness(t *testing.T) *Harness {
 	eng.SetBrokerID(brokerID)
 	eng.SetNotifier(engine.NewInProcessNotifier(eng))
 
+	var cleanup func()
+	if customise != nil {
+		cleanup = customise(eng)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		_ = eng.Serve(ctx)
+		if cleanup != nil {
+			cleanup()
+		}
 		close(done)
 	}()
 
@@ -87,19 +110,118 @@ func NewHarness(t *testing.T) *Harness {
 		cancel()
 		t.Fatal("engine never bound TCP")
 	}
+	return eng, brokerID, eng.TCPAddr().String(), cancel, done
+}
 
-	h := &Harness{
-		T:         t,
-		Pool:      pool,
-		URL:       url,
-		Engine:    eng,
-		BrokerID:  brokerID,
-		cancel:    cancel,
-		doneServe: done,
-		tcpAddr:   eng.TCPAddr().String(),
+func seedUser(t *testing.T, pool *pgxpool.Pool, user, pass string) {
+	t.Helper()
+	hash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.MinCost)
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users(username, password_hash) VALUES($1, $2) ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash`,
+		user, string(hash)); err != nil {
+		t.Fatalf("seed user: %v", err)
 	}
-	t.Cleanup(h.Stop)
-	return h
+}
+
+// MultiHarness boots N independent Pods sharing a Postgres database. Each Pod
+// has its own engine and (via apply) optionally its own listener.
+type MultiHarness struct {
+	T    *testing.T
+	URL  string
+	Pool *pgxpool.Pool
+	Pods []*Pod
+}
+
+// Pod is one node within a MultiHarness.
+type Pod struct {
+	Engine    *engine.Engine
+	BrokerID  uuid.UUID
+	TCPAddr   string
+	cancel    context.CancelFunc
+	doneServe chan struct{}
+}
+
+// Connect opens a TCP client against this Pod.
+func (p *Pod) Connect(t *testing.T, clientID string, opts ...func(*packets.Packet)) *TestClient {
+	t.Helper()
+	addr := p.TCPAddr
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	tc := &TestClient{Conn: c, r: mqttwire.NewReader(c)}
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte("MQTT"),
+			Clean:            true,
+			Keepalive:        60,
+			ClientIdentifier: clientID,
+			Username:         []byte("test"),
+			UsernameFlag:     true,
+			Password:         []byte("test"),
+			PasswordFlag:     true,
+		},
+	}
+	for _, o := range opts {
+		o(pk)
+	}
+	if err := mqttwire.Write(c, pk); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	tc.r.ProtocolVersion = pk.ProtocolVersion
+	resp, err := tc.r.Read()
+	if err != nil {
+		t.Fatalf("read connack: %v", err)
+	}
+	if resp.FixedHeader.Type != packets.Connack {
+		t.Fatalf("expected CONNACK got %d", resp.FixedHeader.Type)
+	}
+	if resp.ReasonCode != 0 {
+		t.Fatalf("connack reason=%d", resp.ReasonCode)
+	}
+	return tc
+}
+
+// NewMultiHarness boots n Pods. The customise function receives each pod's
+// engine and may install a listener (which sets brokerID + notifier from
+// the listener).
+func NewMultiHarness(t *testing.T, n int, customise PodSetup) *MultiHarness {
+	t.Helper()
+	url := dbtest.FreshURL(t)
+	pool, err := pgxpoolOpen(t, url)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	seedUser(t, pool, "test", "test")
+
+	mh := &MultiHarness{T: t, URL: url, Pool: pool}
+	for i := 0; i < n; i++ {
+		eng, brokerID, addr, cancel, done := startBroker(t, pool, url, customise)
+		mh.Pods = append(mh.Pods, &Pod{
+			Engine:    eng,
+			BrokerID:  brokerID,
+			TCPAddr:   addr,
+			cancel:    cancel,
+			doneServe: done,
+		})
+	}
+	t.Cleanup(mh.Stop)
+	return mh
+}
+
+// Stop cancels all pods.
+func (mh *MultiHarness) Stop() {
+	for _, p := range mh.Pods {
+		p.cancel()
+		select {
+		case <-p.doneServe:
+		case <-time.After(5 * time.Second):
+			mh.T.Logf("pod shutdown timed out")
+		}
+	}
+	mh.Pool.Close()
 }
 
 // Stop cancels the engine's context and waits for shutdown.

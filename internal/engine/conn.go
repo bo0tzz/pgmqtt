@@ -152,6 +152,13 @@ func (c *Conn) shutdown() {
 	})
 }
 
+// Shutdown closes the connection. Safe to call from outside the connection's
+// goroutine — used by takeover and at server shutdown.
+func (c *Conn) Shutdown() { c.shutdown() }
+
+// ClientID returns the resolved client identifier (empty before CONNECT).
+func (c *Conn) ClientID() string { return c.clientID }
+
 // gracefulClose is invoked at server shutdown — sends a v5 Disconnect with
 // reason code 0x8b (Server shutting down) when applicable, then closes.
 func (c *Conn) gracefulClose() {
