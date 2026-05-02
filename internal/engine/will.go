@@ -10,19 +10,26 @@ func (c *Conn) fireWill(ctx context.Context) error {
 	if c.willTopic == "" {
 		return nil
 	}
-	msgID, brokerIDs, err := c.eng.publishCore(ctx, publishCore{
-		Topic:      c.willTopic,
-		Payload:    c.willPayload,
-		QoS:        c.willQoS,
-		Retain:     c.willRetain,
-		Properties: c.willProps,
+	return c.eng.PublishWill(ctx, c.willTopic, c.willPayload, c.willQoS, c.willRetain, c.willProps)
+}
+
+// PublishWill is invoked by both the per-Conn ungraceful path and by the
+// janitor's dead-broker scan. It runs the publisher path with no publisher
+// client id (so no_local-blocking subscribers still receive the will).
+func (e *Engine) PublishWill(ctx context.Context, topic string, payload []byte, qos byte, retain bool, props []byte) error {
+	msgID, brokerIDs, err := e.publishCore(ctx, publishCore{
+		Topic:      topic,
+		Payload:    payload,
+		QoS:        qos,
+		Retain:     retain,
+		Properties: props,
 		Publisher:  "",
 	})
 	if err != nil {
 		return err
 	}
-	if err := c.eng.notify.Notify(ctx, brokerIDs, msgID); err != nil {
-		c.eng.logger.Warn("will notify", "msg", msgID, "err", err)
+	if err := e.notify.Notify(ctx, brokerIDs, msgID); err != nil {
+		e.logger.Warn("will notify", "msg", msgID, "err", err)
 	}
 	return nil
 }

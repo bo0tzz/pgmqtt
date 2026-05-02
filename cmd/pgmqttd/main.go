@@ -10,6 +10,8 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/config"
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/janitor"
+	"github.com/bo0tzz/pgmqtt/internal/leader"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
 )
 
@@ -57,6 +59,16 @@ func main() {
 	eng.SetBrokerID(lst.BrokerID())
 	eng.SetNotifier(listener.NewNotifier(pool))
 	eng.SetTakeoverNotifier(listener.NewTakeoverNotifier(pool))
+
+	ld, err := leader.Start(ctx, cfg.DatabaseURL, logger)
+	if err != nil {
+		logger.Error("leader", "err", err)
+		os.Exit(1)
+	}
+	defer ld.Stop()
+
+	jt := janitor.New(pool, eng, logger)
+	go jt.RunWith(ctx, ld)
 
 	logger.Info("pgmqttd starting", "tcp", cfg.TCPAddr, "ws", cfg.WSAddr, "broker", eng.BrokerID())
 	if err := eng.Serve(ctx); err != nil {
