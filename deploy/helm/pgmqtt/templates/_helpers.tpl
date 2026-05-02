@@ -39,10 +39,6 @@ app.kubernetes.io/name: {{ include "pgmqtt.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{- define "pgmqtt.serviceAccountName" -}}
-{{- default (include "pgmqtt.fullname" .) .Values.serviceAccount.name -}}
-{{- end -}}
-
 {{- define "pgmqtt.serviceHost" -}}
 {{- if .Values.operator.serviceHost -}}
 {{- .Values.operator.serviceHost -}}
