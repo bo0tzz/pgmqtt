@@ -6,12 +6,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
 )
 
 var _ net.Conn = (*net.TCPConn)(nil)
+
+func openTestPool(t *testing.T, url string) *pgxpool.Pool {
+	t.Helper()
+	p, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	return p
+}
 
 func TestQoS0PublishSubscribeRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -176,6 +186,77 @@ func TestWillFiresOnUngraceful(t *testing.T) {
 	}
 	if string(pk.Payload) != "died" || pk.TopicName != "lwt/foo" {
 		t.Errorf("got %q/%q", pk.TopicName, pk.Payload)
+	}
+}
+
+func TestQoS2RoundTrip(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	sub := h.Connect(t, "sub-2")
+	pub := h.Connect(t, "pub-2")
+	defer sub.Close()
+	defer pub.Close()
+
+	sub.Subscribe(t, "q2/+", 2)
+	pub.Publish(t, "q2/topic", []byte("exact-once"), 2, false)
+
+	pk := sub.Read(t, 2*time.Second)
+	if pk.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected publish, got %d", pk.FixedHeader.Type)
+	}
+	if pk.FixedHeader.Qos != 2 {
+		t.Errorf("delivered qos = %d, want 2", pk.FixedHeader.Qos)
+	}
+	if string(pk.Payload) != "exact-once" {
+		t.Errorf("payload = %q", pk.Payload)
+	}
+}
+
+func TestMQTTv311PublishSubscribe(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	v311 := func(p *packets.Packet) {
+		p.ProtocolVersion = 4
+	}
+	sub := h.Connect(t, "v311-sub", v311)
+	pub := h.Connect(t, "v311-pub", v311)
+	defer sub.Close()
+	defer pub.Close()
+
+	sub.Subscribe(t, "legacy/+", 1)
+	pub.Publish(t, "legacy/topic", []byte("ok"), 1, false)
+
+	pk := sub.Read(t, 2*time.Second)
+	if pk.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected publish, got %d", pk.FixedHeader.Type)
+	}
+	if string(pk.Payload) != "ok" {
+		t.Errorf("payload = %q", pk.Payload)
+	}
+}
+
+func TestGracefulShutdownClearsBrokerID(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	clean := func(p *packets.Packet) { p.Connect.Clean = false }
+	c := h.Connect(t, "shut-1", clean)
+	c.Subscribe(t, "x/y", 1)
+	c.Close()
+
+	// Stop engine to simulate graceful shutdown.
+	h.Stop()
+
+	pool := openTestPool(t, h.URL)
+	defer pool.Close()
+	var brokerID *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT broker_id::text FROM sessions WHERE client_id='shut-1'`).Scan(&brokerID); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if brokerID != nil {
+		t.Errorf("expected broker_id cleared after shutdown, got %v", *brokerID)
 	}
 }
 
