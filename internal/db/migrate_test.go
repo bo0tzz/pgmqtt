@@ -37,7 +37,10 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		}
 	}
 
-	for _, m := range []struct{ filter, topic string; want bool }{
+	for _, m := range []struct {
+		filter, topic string
+		want          bool
+	}{
 		{"a/b", "a/b", true},
 		{"a/+", "a/b", true},
 		{"a/+/c", "a/b/c", true},

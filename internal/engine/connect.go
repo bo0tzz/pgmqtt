@@ -22,12 +22,12 @@ import (
 //	0x86 Bad username or password
 //	0x87 Not authorized
 const (
-	cackSuccess              byte = 0x00
-	cackUnsupportedProtocol  byte = 0x84
-	cackBadCredentials       byte = 0x86
-	cackNotAuthorized        byte = 0x87
-	cackClientIDInvalid      byte = 0x85
-	cackUnspecified          byte = 0x80
+	cackSuccess             byte = 0x00
+	cackUnsupportedProtocol byte = 0x84
+	cackBadCredentials      byte = 0x86
+	cackNotAuthorized       byte = 0x87
+	cackClientIDInvalid     byte = 0x85
+	cackUnspecified         byte = 0x80
 )
 
 func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {

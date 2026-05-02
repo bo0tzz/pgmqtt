@@ -24,14 +24,14 @@ import (
 // Harness wraps an Engine running on a random port plus a shared Postgres
 // for end-to-end tests.
 type Harness struct {
-	T          *testing.T
-	Pool       *pgxpool.Pool
-	URL        string
-	Engine     *engine.Engine
-	BrokerID   uuid.UUID
-	cancel     context.CancelFunc
-	doneServe  chan struct{}
-	tcpAddr    string
+	T         *testing.T
+	Pool      *pgxpool.Pool
+	URL       string
+	Engine    *engine.Engine
+	BrokerID  uuid.UUID
+	cancel    context.CancelFunc
+	doneServe chan struct{}
+	tcpAddr   string
 }
 
 // NewHarness boots a single-pod broker with InProcessNotifier and a default

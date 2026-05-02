@@ -21,14 +21,14 @@ const LeaderKey int64 = 42
 
 // Leader is the per-Pod handle to leader election.
 type Leader struct {
-	logger    *slog.Logger
-	conn      *pgx.Conn
-	cancel    context.CancelFunc
-	done      chan struct{}
-	acquired  chan struct{}
-	lost      chan struct{}
-	once      sync.Once
-	isLeader  atomic.Bool
+	logger   *slog.Logger
+	conn     *pgx.Conn
+	cancel   context.CancelFunc
+	done     chan struct{}
+	acquired chan struct{}
+	lost     chan struct{}
+	once     sync.Once
+	isLeader atomic.Bool
 }
 
 // Start opens a dedicated connection and tries to acquire pg_advisory_lock.

@@ -14,15 +14,15 @@ import (
 // packet (or any chunk) as a binary WebSocket frame; we concatenate frame
 // payloads on read.
 type wsConnAdapter struct {
-	ws       *websocket.Conn
-	readBuf  []byte
-	readErr  error
-	readPos  int
+	ws      *websocket.Conn
+	readBuf []byte
+	readErr error
+	readPos int
 }
 
-func (w *wsConnAdapter) Close() error                         { return w.ws.Close() }
-func (w *wsConnAdapter) LocalAddr() net.Addr                  { return w.ws.LocalAddr() }
-func (w *wsConnAdapter) RemoteAddr() net.Addr                 { return w.ws.RemoteAddr() }
+func (w *wsConnAdapter) Close() error         { return w.ws.Close() }
+func (w *wsConnAdapter) LocalAddr() net.Addr  { return w.ws.LocalAddr() }
+func (w *wsConnAdapter) RemoteAddr() net.Addr { return w.ws.RemoteAddr() }
 func (w *wsConnAdapter) SetDeadline(t time.Time) error {
 	if err := w.ws.SetReadDeadline(t); err != nil {
 		return err

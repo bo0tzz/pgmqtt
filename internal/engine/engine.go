@@ -40,9 +40,9 @@ type TakeoverNotifier interface {
 
 // Engine is the per-Pod broker.
 type Engine struct {
-	cfg     *config.Config
-	pool    *pgxpool.Pool
-	logger  *slog.Logger
+	cfg    *config.Config
+	pool   *pgxpool.Pool
+	logger *slog.Logger
 
 	brokerIDMu sync.RWMutex
 	brokerID   uuid.UUID

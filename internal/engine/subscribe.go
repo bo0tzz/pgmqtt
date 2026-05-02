@@ -12,10 +12,10 @@ import (
 
 // SUBACK reason codes.
 const (
-	subackQoS0       byte = 0x00
-	subackQoS1       byte = 0x01
-	subackQoS2       byte = 0x02
-	subackUnspec     byte = 0x80
+	subackQoS0               byte = 0x00
+	subackQoS1               byte = 0x01
+	subackQoS2               byte = 0x02
+	subackUnspec             byte = 0x80
 	subackTopicFilterInvalid byte = 0x8F
 )
 

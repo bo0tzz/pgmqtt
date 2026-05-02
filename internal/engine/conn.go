@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	connectTimeout       = 10 * time.Second
-	defaultKeepalive     = 60 * time.Second
+	connectTimeout        = 10 * time.Second
+	defaultKeepalive      = 60 * time.Second
 	maxConcurrentInflight = 1024 // upper bound on per-conn outgoing inflight messages
 )
 
@@ -34,13 +34,13 @@ type Conn struct {
 
 	writeMu sync.Mutex
 
-	keepalive    time.Duration
-	cleanStart   bool
-	willTopic    string
-	willPayload  []byte
-	willQoS      byte
-	willRetain   bool
-	willProps    []byte // jsonb-serialised v5 will properties
+	keepalive   time.Duration
+	cleanStart  bool
+	willTopic   string
+	willPayload []byte
+	willQoS     byte
+	willRetain  bool
+	willProps   []byte // jsonb-serialised v5 will properties
 
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool

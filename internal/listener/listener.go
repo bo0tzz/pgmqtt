@@ -37,13 +37,13 @@ const (
 // Listener owns one dedicated Postgres connection used purely for the Pod's
 // LISTEN + advisory-lock identity. Stop it to release the lock and disconnect.
 type Listener struct {
-	uuid     uuid.UUID
-	logger   *slog.Logger
-	eng      *engine.Engine
-	cancel   context.CancelFunc
-	doneCh   chan struct{}
+	uuid      uuid.UUID
+	logger    *slog.Logger
+	eng       *engine.Engine
+	cancel    context.CancelFunc
+	doneCh    chan struct{}
 	closeOnce sync.Once
-	conn     *pgx.Conn
+	conn      *pgx.Conn
 }
 
 // Start opens a dedicated *pgx.Conn against url, takes the broker advisory
