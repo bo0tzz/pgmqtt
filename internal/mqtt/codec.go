@@ -1,0 +1,205 @@
+// Package mqtt wraps github.com/mochi-mqtt/server/v2/packets with framed
+// read/write helpers for net.Conn-shaped transports. The packets subpackage
+// itself is just a v3.1.1+v5 codec; we use it as such and ignore the rest of
+// the mochi broker.
+package mqtt
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/mochi-mqtt/server/v2/packets"
+)
+
+const (
+	// MaxPacketSize is the absolute upper bound on packet size we will accept,
+	// independent of any v5-negotiated limit. 256 MiB matches the MQTT v5
+	// variable-byte-integer max (268435455 bytes). Smaller per-client limits
+	// can be enforced by the engine.
+	MaxPacketSize = 268435455
+
+	// ProtocolMQTT311 = 4 (per MQTT-3.1.2-2).
+	ProtocolMQTT311 byte = 4
+	// ProtocolMQTT5 = 5.
+	ProtocolMQTT5 byte = 5
+)
+
+// ErrPacketTooLarge indicates the framed length exceeds MaxPacketSize.
+var ErrPacketTooLarge = errors.New("mqtt: packet too large")
+
+// Reader reads MQTT packets from a buffered byte stream. The first packet must
+// be CONNECT. After CONNECT is decoded, set ProtocolVersion so subsequent reads
+// can decode v3.1.1- vs v5-specific layouts.
+type Reader struct {
+	br              *bufio.Reader
+	ProtocolVersion byte
+}
+
+// NewReader wraps r. If r is already a *bufio.Reader it is reused.
+func NewReader(r io.Reader) *Reader {
+	if br, ok := r.(*bufio.Reader); ok {
+		return &Reader{br: br}
+	}
+	return &Reader{br: bufio.NewReader(r)}
+}
+
+// Read reads one packet. The Packet's ProtocolVersion field is populated from
+// the Reader's setting (which must be set after a successful CONNECT decode).
+func (r *Reader) Read() (packets.Packet, error) {
+	var pk packets.Packet
+	hb, err := r.br.ReadByte()
+	if err != nil {
+		return pk, err
+	}
+	if err := pk.FixedHeader.Decode(hb); err != nil {
+		return pk, fmt.Errorf("decode fixed header: %w", err)
+	}
+	remaining, _, err := packets.DecodeLength(r.br)
+	if err != nil {
+		return pk, fmt.Errorf("decode length: %w", err)
+	}
+	if remaining > MaxPacketSize {
+		return pk, ErrPacketTooLarge
+	}
+	pk.FixedHeader.Remaining = remaining
+	pk.ProtocolVersion = r.ProtocolVersion
+
+	body := make([]byte, remaining)
+	if remaining > 0 {
+		if _, err := io.ReadFull(r.br, body); err != nil {
+			return pk, fmt.Errorf("read body: %w", err)
+		}
+	}
+	if err := decodeBody(&pk, body); err != nil {
+		return pk, err
+	}
+	// CONNECT carries its own protocol version; remember it for subsequent reads.
+	if pk.FixedHeader.Type == packets.Connect {
+		r.ProtocolVersion = pk.ProtocolVersion
+	}
+	return pk, nil
+}
+
+func decodeBody(pk *packets.Packet, body []byte) error {
+	// PublishDecode mutates body; copy it so we can safely keep references in
+	// memory if the caller chooses.
+	px := append([]byte(nil), body...)
+	switch pk.FixedHeader.Type {
+	case packets.Connect:
+		return pk.ConnectDecode(px)
+	case packets.Connack:
+		return pk.ConnackDecode(px)
+	case packets.Publish:
+		return pk.PublishDecode(px)
+	case packets.Puback:
+		return pk.PubackDecode(px)
+	case packets.Pubrec:
+		return pk.PubrecDecode(px)
+	case packets.Pubrel:
+		return pk.PubrelDecode(px)
+	case packets.Pubcomp:
+		return pk.PubcompDecode(px)
+	case packets.Subscribe:
+		return pk.SubscribeDecode(px)
+	case packets.Suback:
+		return pk.SubackDecode(px)
+	case packets.Unsubscribe:
+		return pk.UnsubscribeDecode(px)
+	case packets.Unsuback:
+		return pk.UnsubackDecode(px)
+	case packets.Pingreq, packets.Pingresp:
+		return nil
+	case packets.Disconnect:
+		return pk.DisconnectDecode(px)
+	case packets.Auth:
+		return pk.AuthDecode(px)
+	default:
+		return fmt.Errorf("invalid packet type %d", pk.FixedHeader.Type)
+	}
+}
+
+// Write encodes pk and writes it to w. ProtocolVersion on pk must be set
+// (caller's responsibility — usually copied from the Reader after CONNECT).
+func Write(w io.Writer, pk *packets.Packet) error {
+	buf, err := Encode(pk)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(buf)
+	return err
+}
+
+// Encode returns the wire bytes for pk.
+func Encode(pk *packets.Packet) ([]byte, error) {
+	var buf = newBuf()
+	defer buf.Reset()
+
+	switch pk.FixedHeader.Type {
+	case packets.Connect:
+		if err := pk.ConnectEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Connack:
+		if err := pk.ConnackEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Publish:
+		if err := pk.PublishEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Puback:
+		if err := pk.PubackEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Pubrec:
+		if err := pk.PubrecEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Pubrel:
+		if err := pk.PubrelEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Pubcomp:
+		if err := pk.PubcompEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Subscribe:
+		if err := pk.SubscribeEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Suback:
+		if err := pk.SubackEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Unsubscribe:
+		if err := pk.UnsubscribeEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Unsuback:
+		if err := pk.UnsubackEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Pingreq:
+		if err := pk.PingreqEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Pingresp:
+		if err := pk.PingrespEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Disconnect:
+		if err := pk.DisconnectEncode(buf.b); err != nil {
+			return nil, err
+		}
+	case packets.Auth:
+		if err := pk.AuthEncode(buf.b); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("encode: invalid packet type %d", pk.FixedHeader.Type)
+	}
+	out := append([]byte(nil), buf.b.Bytes()...)
+	return out, nil
+}
