@@ -42,9 +42,10 @@ type Conn struct {
 	willRetain   bool
 	willProps    []byte // jsonb-serialised v5 will properties
 
-	closing atomic.Bool
-	closed  chan struct{}
-	once    sync.Once
+	closing           atomic.Bool
+	gracefulRequested atomic.Bool
+	closed            chan struct{}
+	once              sync.Once
 }
 
 func newConn(e *Engine, nc net.Conn) *Conn {
@@ -89,12 +90,20 @@ func (c *Conn) run(ctx context.Context) {
 			return
 		}
 		if err := c.dispatch(ctx, &pk); err != nil {
-			c.eng.logger.Warn("dispatch", "client", c.clientID, "type", pk.FixedHeader.Type, "err", err)
+			// io.EOF / errClientDisconnect signals "this is a normal close" —
+			// don't log at warn level. Real dispatch errors stay at warn.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, errClientDisconnect) {
+				c.eng.logger.Warn("dispatch", "client", c.clientID, "type", pk.FixedHeader.Type, "err", err)
+			}
 			c.handleDisconnect(ctx, err)
 			return
 		}
 	}
 }
+
+// errClientDisconnect is returned from handleGracefulDisconnect to terminate
+// the read loop without being logged as an error.
+var errClientDisconnect = errors.New("client disconnected")
 
 func (c *Conn) armReadDeadline() error {
 	if c.keepalive == 0 {
@@ -182,16 +191,22 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	if c.clientID == "" {
 		return
 	}
-	logArgs := []any{"client", c.clientID, "cause", cause}
-	if errors.Is(cause, io.EOF) {
-		logArgs = append(logArgs, "kind", "eof")
-	} else if errors.Is(cause, net.ErrClosed) {
-		logArgs = append(logArgs, "kind", "closed")
+	graceful := c.gracefulRequested.Load() || errors.Is(cause, errClientDisconnect)
+	if graceful {
+		c.eng.logger.Debug("client disconnect (graceful)", "client", c.clientID)
+	} else {
+		logArgs := []any{"client", c.clientID, "cause", cause}
+		if errors.Is(cause, io.EOF) {
+			logArgs = append(logArgs, "kind", "eof")
+		} else if errors.Is(cause, net.ErrClosed) {
+			logArgs = append(logArgs, "kind", "closed")
+		}
+		c.eng.logger.Info("client disconnect (ungraceful)", logArgs...)
 	}
-	c.eng.logger.Info("client disconnect (ungraceful)", logArgs...)
 
 	// Detach from session BEFORE firing will so the will publish can re-acquire
-	// the row's broker_id when a future client reconnects.
+	// the row's broker_id when a future client reconnects. Graceful disconnects
+	// have already cleared willTopic in handleGracefulDisconnect.
 	if c.willTopic != "" {
 		if err := c.fireWill(ctx); err != nil {
 			c.eng.logger.Warn("fire will", "err", err)
@@ -219,10 +234,12 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 // disconnect: the will is dropped (must not be sent), the session may persist
 // or be cleaned per cleanStart. v5 SessionExpiryInterval extension is ignored
 // here for v1 — we treat any non-zero as "keep until evicted".
-func (c *Conn) handleGracefulDisconnect(ctx context.Context, _ *packets.Packet) error {
+func (c *Conn) handleGracefulDisconnect(_ context.Context, _ *packets.Packet) error {
 	c.willTopic = "" // [MQTT-3.14.4-3]
-	c.handleDisconnect(ctx, errors.New("client requested disconnect"))
-	return io.EOF
+	// The dispatch loop will call handleDisconnect on the returned error;
+	// errClientDisconnect signals "graceful, don't log as warn".
+	c.gracefulRequested.Store(true)
+	return errClientDisconnect
 }
 
 // handlePuback / handlePubrec / handlePubrel / handlePubcomp — receiver-side

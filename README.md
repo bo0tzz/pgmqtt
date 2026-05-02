@@ -49,14 +49,23 @@ Postgres you almost certainly already run.
 v1 covers everything in the design plan. See [PLAN.md](docs/PLAN.md) and the
 verification checklist in [docs/VERIFY.md](docs/VERIFY.md).
 
-What's NOT in v1:
+### What's NOT in v1
 
-- ACLs / topic-level authorization (auth ends at username).
-- Shared subscriptions (`$share/{group}/{filter}`) — accepted but treated as
-  a normal subscription.
-- Bridges, plugin hooks, dashboards.
-- `ltree`-backed retained/subscription indexes (linear scan with the SQL
-  match function is fine until tens of thousands).
+- **ACLs / topic-level authorization.** Auth ends at username.
+- **Shared subscriptions** (`$share/{group}/{filter}`) — the wire form is
+  parsed but the underlying filter is treated as a normal subscription.
+- **MQTT v5 message expiry on retained.** Retained messages persist until
+  overwritten or explicitly cleared. v5 `Message Expiry Interval` is stored
+  but not enforced.
+- **MQTT v5 topic aliases.** Aliases are decoded but not maintained
+  per-connection. Add as a `topicAliasMaximum`-aware client side feature.
+- **Inbound QoS-2 dedup.** The PUBREL/PUBCOMP dance works on the publisher
+  side, but the broker doesn't track inbound packet-id state to suppress a
+  duplicate PUBLISH from a buggy client. Realistic clients don't retry mid-
+  PUBREL.
+- **Bridges, plugin hooks, dashboards.**
+- **`ltree`-backed retained/subscription indexes.** Linear scan with the SQL
+  match function is fine until tens of thousands of subs.
 
 ## Quick start (Kubernetes)
 
