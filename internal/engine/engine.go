@@ -53,6 +53,7 @@ type Engine struct {
 	connsMu sync.RWMutex
 	conns   map[string]*Conn // client_id -> *Conn
 
+	listenersMu  sync.RWMutex
 	tcpListener  net.Listener
 	wsListener   net.Listener
 	wsServer     *http.Server
@@ -111,7 +112,9 @@ func (e *Engine) Serve(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("listen tcp %s: %w", e.cfg.TCPAddr, err)
 		}
+		e.listenersMu.Lock()
 		e.tcpListener = ln
+		e.listenersMu.Unlock()
 		e.logger.Info("tcp listening", "addr", ln.Addr())
 		e.wg.Add(1)
 		go e.acceptTCP(ctx, ln)
@@ -121,7 +124,9 @@ func (e *Engine) Serve(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("listen ws %s: %w", e.cfg.WSAddr, err)
 		}
+		e.listenersMu.Lock()
 		e.wsListener = ln
+		e.listenersMu.Unlock()
 		e.logger.Info("ws listening", "addr", ln.Addr())
 		e.wg.Add(1)
 		go e.serveWS(ctx, ln)
@@ -136,6 +141,8 @@ func (e *Engine) Serve(ctx context.Context) error {
 
 // TCPAddr returns the bound TCP address (post-Listen). Useful for tests using :0.
 func (e *Engine) TCPAddr() net.Addr {
+	e.listenersMu.RLock()
+	defer e.listenersMu.RUnlock()
 	if e.tcpListener == nil {
 		return nil
 	}
@@ -144,6 +151,8 @@ func (e *Engine) TCPAddr() net.Addr {
 
 // WSAddr returns the bound WS address.
 func (e *Engine) WSAddr() net.Addr {
+	e.listenersMu.RLock()
+	defer e.listenersMu.RUnlock()
 	if e.wsListener == nil {
 		return nil
 	}
@@ -197,7 +206,9 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 	mux.HandleFunc("/", handler)
 	mux.HandleFunc("/mqtt", handler)
 	srv := &http.Server{Handler: mux}
+	e.listenersMu.Lock()
 	e.wsServer = srv
+	e.listenersMu.Unlock()
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !isClosedNetErr(err) {
 		e.logger.Error("ws serve", "err", err)
 	}
@@ -206,15 +217,20 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 func (e *Engine) shutdownGracefully() {
 	e.shutdownOnce.Do(func() {
 		close(e.shutdown)
-		if e.tcpListener != nil {
-			_ = e.tcpListener.Close()
+		e.listenersMu.RLock()
+		tcpLn := e.tcpListener
+		wsLn := e.wsListener
+		wsSrv := e.wsServer
+		e.listenersMu.RUnlock()
+		if tcpLn != nil {
+			_ = tcpLn.Close()
 		}
-		if e.wsServer != nil {
+		if wsSrv != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_ = e.wsServer.Shutdown(ctx)
-		} else if e.wsListener != nil {
-			_ = e.wsListener.Close()
+			_ = wsSrv.Shutdown(ctx)
+		} else if wsLn != nil {
+			_ = wsLn.Close()
 		}
 
 		// Snapshot connections, instruct each to drain.

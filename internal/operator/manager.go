@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -43,6 +44,23 @@ func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.L
 	cfg, err := config.GetConfig()
 	if err != nil {
 		logger.Info("kubernetes config not found; operator disabled", "err", err)
+		return nil
+	}
+
+	// Bail early if the User CRD isn't registered. Avoids the controller-
+	// runtime informer's repeated "no matches for kind" log spam in
+	// environments where the CRD wasn't installed (e.g., a dev workstation
+	// whose kubeconfig points at an unrelated cluster).
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		logger.Warn("operator: discovery client", "err", err)
+		return nil
+	}
+	groupVersion := pgmqttv1alpha1.GroupVersion.String()
+	resources, err := dc.ServerResourcesForGroupVersion(groupVersion)
+	if err != nil || resources == nil || len(resources.APIResources) == 0 {
+		logger.Info("operator: pgmqtt.io/v1alpha1 not registered in cluster; user reconciler disabled",
+			"hint", "install the User CRD to enable")
 		return nil
 	}
 

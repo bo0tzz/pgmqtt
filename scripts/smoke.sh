@@ -39,14 +39,7 @@ done
 echo "==> building pgmqttd"
 go build -o "$ROOT/pgmqttd" ./cmd/pgmqttd
 
-echo "==> seeding test user"
-HASH="$(go run ./scripts/internal/hash.go test)"
-docker exec -e PGPASSWORD=pgmqtt "$PG_NAME" psql -U pgmqtt -d pgmqtt -c \
-  "CREATE TABLE IF NOT EXISTS users (username text primary key, password_hash text not null);"
-docker exec -e PGPASSWORD=pgmqtt "$PG_NAME" psql -U pgmqtt -d pgmqtt -c \
-  "INSERT INTO users(username,password_hash) VALUES('test', '${HASH}') ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash;"
-
-echo "==> launching broker"
+echo "==> launching broker (will run migrations)"
 PGMQTT_DATABASE_URL="$DB_URL" PGMQTT_TCP_ADDR=127.0.0.1:11883 PGMQTT_WS_ADDR=127.0.0.1:18083 \
   "$ROOT/pgmqttd" >"$ROOT/.smoke-broker.log" 2>&1 &
 BROKER_PID=$!
@@ -58,6 +51,11 @@ for _ in $(seq 1 60); do
   fi
   sleep 0.2
 done
+
+echo "==> seeding test user"
+HASH="$(go run ./scripts/internal/hash.go test)"
+docker exec -e PGPASSWORD=pgmqtt "$PG_NAME" psql -U pgmqtt -d pgmqtt -c \
+  "INSERT INTO users(username,password_hash) VALUES('test', '${HASH}') ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash;"
 
 if command -v mosquitto_pub >/dev/null && command -v mosquitto_sub >/dev/null; then
   echo "==> mosquitto round-trip"
