@@ -2,3 +2,7 @@
 /dist/
 *.log
 .env
+coverage.out
+.smoke-*
+*.test
+
