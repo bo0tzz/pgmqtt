@@ -1,0 +1,77 @@
+# Default values for pgmqtt.
+
+## Number of pgmqttd Pods. Each Pod is fully stateless w.r.t. local state;
+## scale freely.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/bo0tzz/pgmqtt
+  tag: ""           # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+## Postgres connection. Either set existingSecret to a Secret containing a
+## "url" key (e.g. one provisioned by CloudNativePG) or set the URL directly.
+database:
+  url: ""
+  existingSecret: ""
+  existingSecretKey: "url"
+
+## TCP / WS listener configuration.
+listeners:
+  tcp:
+    enabled: true
+    port: 1883
+  ws:
+    enabled: true
+    port: 8083
+
+## Service exposing the broker. Use ClusterIP behind your TLS terminator
+## (Nginx stream / HAProxy / ingress-nginx tcp-services) for tls://1883;
+## a normal HTTPS proxy works for wss://8083.
+service:
+  type: ClusterIP
+  annotations: {}
+
+## Optional ServiceMonitor for prometheus-operator. Disabled by default; set
+## to true if you have prometheus-operator installed.
+serviceMonitor:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+## Liveness/readiness probe is a TCP connect to the MQTT port.
+probes:
+  enabled: true
+
+## Install the User CRD. Set to false if managing CRDs out-of-band.
+crds:
+  install: true
+
+## Service host advertised in auto-generated User credential Secrets. Defaults
+## to <release-name>.<namespace>.svc.cluster.local.
+operator:
+  serviceHost: ""

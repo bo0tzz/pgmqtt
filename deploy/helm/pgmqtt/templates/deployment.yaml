@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgmqtt.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pgmqtt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "pgmqtt.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pgmqtt.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pgmqtt.fullname" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pgmqttd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGMQTT_DATABASE_URL
+              {{- if .Values.database.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.existingSecretKey }}
+              {{- else }}
+              value: {{ required "database.url is required when database.existingSecret is empty" .Values.database.url | quote }}
+              {{- end }}
+            - name: PGMQTT_TCP_ADDR
+              value: {{ if .Values.listeners.tcp.enabled }}":{{ .Values.listeners.tcp.port }}"{{ else }}""{{ end }}
+            - name: PGMQTT_WS_ADDR
+              value: {{ if .Values.listeners.ws.enabled }}":{{ .Values.listeners.ws.port }}"{{ else }}""{{ end }}
+            - name: PGMQTT_SERVICE_HOST
+              value: {{ include "pgmqtt.serviceHost" . | quote }}
+            - name: PGMQTT_SERVICE_PORT
+              value: {{ .Values.listeners.tcp.port | quote }}
+            - name: PGMQTT_SERVICE_WS_PORT
+              value: {{ .Values.listeners.ws.port | quote }}
+          ports:
+            {{- if .Values.listeners.tcp.enabled }}
+            - name: mqtt
+              containerPort: {{ .Values.listeners.tcp.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.listeners.ws.enabled }}
+            - name: mqtt-ws
+              containerPort: {{ .Values.listeners.ws.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.probes.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

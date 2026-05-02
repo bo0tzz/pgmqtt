@@ -1,0 +1,34 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pgmqtt.fullname" . }}
+  labels:
+    {{- include "pgmqtt.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["pgmqtt.io"]
+    resources: ["users"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["pgmqtt.io"]
+    resources: ["users/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["pgmqtt.io"]
+    resources: ["users/finalizers"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pgmqtt.fullname" . }}
+  labels:
+    {{- include "pgmqtt.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pgmqtt.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pgmqtt.fullname" . }}
+    namespace: {{ .Release.Namespace }}

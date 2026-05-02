@@ -1,0 +1,21 @@
+apiVersion: v2
+name: pgmqtt
+description: |
+  pgmqtt — a stateless, Postgres-coordinated MQTT 3.1.1/5 broker.
+
+  Each pgmqttd Pod stores no state in process beyond the per-connection
+  sockets. All routing, retained messages, sessions, and inflight delivery
+  state live in Postgres. Run N replicas behind one Service; killing any
+  Pod is safe — clients reconnect transparently.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - mqtt
+  - homelab
+  - postgres
+home: https://github.com/bo0tzz/pgmqtt
+sources:
+  - https://github.com/bo0tzz/pgmqtt
+maintainers:
+  - name: bo0tzz
