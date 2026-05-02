@@ -13,6 +13,7 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/janitor"
 	"github.com/bo0tzz/pgmqtt/internal/leader"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
+	"github.com/bo0tzz/pgmqtt/internal/operator"
 )
 
 func main() {
@@ -69,6 +70,17 @@ func main() {
 
 	jt := janitor.New(pool, eng, logger)
 	go jt.RunWith(ctx, ld)
+
+	go func() {
+		opts := operator.Options{
+			ServiceHost: cfg.ServiceHost,
+			ServicePort: cfg.ServicePort,
+			WSPort:      cfg.WSPort,
+		}
+		if err := operator.Run(ctx, ld, pool, logger, opts); err != nil {
+			logger.Error("operator", "err", err)
+		}
+	}()
 
 	logger.Info("pgmqttd starting", "tcp", cfg.TCPAddr, "ws", cfg.WSAddr, "broker", eng.BrokerID())
 	if err := eng.Serve(ctx); err != nil {
