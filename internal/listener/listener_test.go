@@ -50,6 +50,49 @@ func TestCrossPodFanout(t *testing.T) {
 	}
 }
 
+func TestSessionMigratesOnPodLoss(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	listeners := make(map[int]*listener.Listener)
+	for i, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		listeners[i] = l
+		t.Cleanup(l.Stop)
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	// Persistent client on pod 0 with a subscription, then disconnect cleanly.
+	notClean := func(p *packets.Packet) { p.Connect.Clean = false }
+	c1 := mh.Pods[0].Connect(t, "migrant", notClean)
+	c1.Subscribe(t, "mig/#", 1)
+	c1.Close()
+
+	// "Kill" pod 0 by stopping its listener — releases its advisory lock.
+	// Any session rows still pointing at broker 0 would now be reclaimable.
+	listeners[0].Stop()
+
+	// Reconnect same client_id on pod 1 — it should succeed (the dead pod's
+	// takeover NOTIFY is unobserved but irrelevant) and the subscription must
+	// still be intact.
+	c2 := mh.Pods[1].Connect(t, "migrant", notClean)
+	defer c2.Close()
+
+	pub := mh.Pods[1].Connect(t, "mig-pub")
+	defer pub.Close()
+	pub.Publish(t, "mig/x", []byte("alive"), 1, false)
+
+	pk := c2.Read(t, 3*time.Second)
+	if pk.FixedHeader.Type != packets.Publish || string(pk.Payload) != "alive" {
+		t.Fatalf("post-migration delivery failed: type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
+	}
+}
+
 func TestTakeoverClosesPriorPodSocket(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 2, nil)
