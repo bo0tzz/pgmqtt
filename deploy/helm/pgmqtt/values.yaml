@@ -34,6 +34,17 @@ auth:
 ##       value: debug
 extraEnv: []
 
+## Bulk-load env from ConfigMaps/Secrets without enumerating each key in
+## extraEnv. Useful for sharing tuning blocks across installs or pulling
+## sensitive knobs from a Secret. Each entry follows the standard EnvFromSource
+## schema:
+##   extraEnvFrom:
+##     - secretRef:
+##         name: pgmqtt-tuning
+##     - configMapRef:
+##         name: pgmqtt-flags
+extraEnvFrom: []
+
 ## Logger configuration. `format: text` is human-readable for `kubectl logs`;
 ## `format: json` emits one JSON object per line, ready for ingestion by log
 ## aggregation systems (Loki, Elasticsearch, Datadog, ...) without a custom
@@ -56,6 +67,19 @@ listeners:
 service:
   type: ClusterIP
   annotations: {}
+  ## externalTrafficPolicy is honoured for type=LoadBalancer / NodePort.
+  ## Set to "Local" to preserve client source IPs (and skip the extra
+  ## hop) on LB-exposed deployments. Empty leaves the cluster default.
+  externalTrafficPolicy: ""
+  ## loadBalancerIP requests a specific LB IP from the cloud controller.
+  ## Empty lets the controller choose. Ignored for type=ClusterIP.
+  loadBalancerIP: ""
+  ## loadBalancerSourceRanges restricts which CIDRs can reach the LB.
+  ## Strongly recommended for type=LoadBalancer in public clouds.
+  ##   loadBalancerSourceRanges:
+  ##     - 10.0.0.0/8
+  ##     - 192.168.0.0/16
+  loadBalancerSourceRanges: []
 
 ## Optional ServiceMonitor for prometheus-operator. Disabled by default; set
 ## to true if you have prometheus-operator installed. The metrics endpoint
@@ -250,9 +274,45 @@ extraVolumeMounts: []
 ## connections cleanly during this window — bump for very large fan-outs.
 terminationGracePeriodSeconds: 30
 
-## Liveness/readiness probe is a TCP connect to the MQTT port.
+## Use the host's network namespace. Almost never needed — the broker is a
+## standard in-cluster TCP/WebSocket listener — but exposed for completeness
+## (e.g. running on a pre-K8s VM that already has port 1883 bound).
+hostNetwork: false
+
+## DNS policy & config. Leave empty to inherit the cluster default
+## (ClusterFirst, or ClusterFirstWithHostNet when hostNetwork=true).
+dnsPolicy: ""
+dnsConfig: {}
+
+## RuntimeClassName. Use to schedule onto sandboxed runtimes (gVisor, Kata).
+## Leave empty for the default runtime.
+runtimeClassName: ""
+
+## The broker container does not call the K8s API and does not need a token
+## mounted by default. Keeps a credential out of the Pod's filesystem on
+## hardened clusters. Flip to true if you wire the broker into something that
+## does (e.g. a future leader-election-via-K8s-Lease backend).
+automountServiceAccountToken: false
+
+## Liveness/readiness probe is a TCP connect to the MQTT port. The default
+## thresholds are conservative for normal startup; production operators
+## frequently bump failureThreshold / timeoutSeconds when their Postgres is
+## occasionally slow (managed PG vacuums, PITR replays, etc.) so a brief
+## stall doesn't restart the broker mid-stream.
 probes:
   enabled: true
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
+    successThreshold: 1
+  readiness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 3
+    successThreshold: 1
 
 ## Install the User CRD. Set to false if managing CRDs out-of-band.
 crds:

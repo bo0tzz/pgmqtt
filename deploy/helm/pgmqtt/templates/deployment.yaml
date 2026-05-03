@@ -28,12 +28,26 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgmqtt.fullname" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
       {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -96,6 +110,10 @@ spec:
             {{- end }}
             - name: PGMQTT_METRICS_ADDR
               value: {{ if .Values.metrics.enabled }}":{{ .Values.metrics.port }}"{{ else }}""{{ end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             {{- if .Values.listeners.tcp.enabled }}
             - name: mqtt
@@ -116,13 +134,19 @@ spec:
           livenessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+            successThreshold: {{ .Values.probes.liveness.successThreshold | default 1 }}
           readinessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: 2
-            periodSeconds: 5
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 1 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold | default 1 }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
