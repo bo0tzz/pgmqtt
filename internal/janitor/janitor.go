@@ -31,10 +31,14 @@ type Janitor struct {
 // New constructs a Janitor.
 func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 	return &Janitor{
-		pool:        pool,
-		eng:         eng,
-		logger:      logger,
-		interval:    10 * time.Second,
+		pool:   pool,
+		eng:    eng,
+		logger: logger,
+		// 1s default. Time-bound operations (will-delay, session-expire,
+		// retained-expire) all key off this. The dead-broker advisory-lock
+		// scan rides along; it's a handful of point queries against an
+		// already-indexed `broker_id` column, so 1s is fine.
+		interval:    1 * time.Second,
 		orphanGrace: 10 * time.Minute,
 	}
 }
@@ -89,7 +93,106 @@ func (j *Janitor) Tick(ctx context.Context) error {
 			j.logger.Warn("dead broker handling", "broker", id, "err", err)
 		}
 	}
+	if err := j.fireDueWills(ctx); err != nil {
+		j.logger.Warn("fire due wills", "err", err)
+	}
+	if err := j.expireSessions(ctx); err != nil {
+		j.logger.Warn("expire sessions", "err", err)
+	}
+	if err := j.expireRetained(ctx); err != nil {
+		j.logger.Warn("expire retained", "err", err)
+	}
 	return j.sweepOrphanMessages(ctx)
+}
+
+// fireDueWills publishes wills whose scheduled fire-time has arrived. We use
+// a CTE that captures the OLD values via a self-join (UPDATE...RETURNING in
+// Postgres returns the post-UPDATE row) and SELECT FOR UPDATE SKIP LOCKED so
+// concurrent janitors don't double-fire.
+func (j *Janitor) fireDueWills(ctx context.Context) error {
+	tx, err := j.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties
+		  FROM sessions
+		 WHERE will_fire_at IS NOT NULL
+		   AND will_fire_at <= now()
+		   AND will_topic IS NOT NULL
+		 FOR UPDATE SKIP LOCKED
+	`)
+	if err != nil {
+		return err
+	}
+	type w struct {
+		client  string
+		topic   string
+		payload []byte
+		qos     int
+		retain  bool
+		props   []byte
+	}
+	var wills []w
+	for rows.Next() {
+		var x w
+		if err := rows.Scan(&x.client, &x.topic, &x.payload, &x.qos, &x.retain, &x.props); err != nil {
+			rows.Close()
+			return err
+		}
+		wills = append(wills, x)
+	}
+	rows.Close()
+
+	if len(wills) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	clientIDs := make([]string, len(wills))
+	for i, w := range wills {
+		clientIDs[i] = w.client
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions SET will_fire_at=NULL,
+		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
+		    will_retain=NULL, will_delay=NULL, will_properties=NULL
+		 WHERE client_id = ANY($1)
+	`, clientIDs); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	for _, w := range wills {
+		if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
+			j.logger.Warn("fire delayed will", "client", w.client, "err", err)
+		}
+	}
+	return nil
+}
+
+// expireSessions deletes session rows whose v5 SessionExpiryInterval has
+// elapsed. Subscriptions and deliveries cascade via FK ON DELETE CASCADE.
+func (j *Janitor) expireSessions(ctx context.Context) error {
+	_, err := j.pool.Exec(ctx, `
+		DELETE FROM sessions
+		 WHERE connected = false
+		   AND session_expires_at IS NOT NULL
+		   AND session_expires_at <= now()
+	`)
+	return err
+}
+
+// expireRetained drops retained rows past their MessageExpiryInterval.
+func (j *Janitor) expireRetained(ctx context.Context) error {
+	_, err := j.pool.Exec(ctx, `
+		DELETE FROM retained
+		 WHERE expires_at IS NOT NULL AND expires_at <= now()
+	`)
+	return err
 }
 
 // findDeadBrokers selects every distinct broker_id currently referenced in

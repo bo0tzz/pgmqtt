@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -34,13 +35,15 @@ type Conn struct {
 
 	writeMu sync.Mutex
 
-	keepalive   time.Duration
-	cleanStart  bool
-	willTopic   string
-	willPayload []byte
-	willQoS     byte
-	willRetain  bool
-	willProps   []byte // jsonb-serialised v5 will properties
+	keepalive     time.Duration
+	cleanStart    bool
+	willTopic     string
+	willPayload   []byte
+	willQoS       byte
+	willRetain    bool
+	willProps     []byte // jsonb-serialised v5 will properties
+	willDelay     *int32 // v5 WillDelayInterval (seconds); nil for v3.1.1
+	sessionExpiry *int32 // v5 SessionExpiryInterval (seconds); nil = "no value sent"
 
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool
@@ -180,10 +183,16 @@ func (c *Conn) gracefulClose() {
 	c.shutdown()
 }
 
-// handleDisconnect runs the ungraceful path when the read loop fails for any
-// reason: socket error, deadline, decode failure. Will (if armed) is fired
-// here. Sessions row is updated to disconnected; ownership is *not* cleared
-// for clean-start=false clients (so subscriptions/queued deliveries persist).
+// handleDisconnect runs at the end of a connection's life. It implements:
+//
+//   - Will firing or scheduling. Graceful DISCONNECT (v3 + v5) discards the
+//     will. v5 ungraceful with WillDelayInterval > 0 schedules the will to
+//     fire after min(WillDelayInterval, SessionExpiryInterval) seconds; the
+//     janitor fires it (or skips it if the client reconnects in time).
+//   - Session lifecycle. v3.1.1 cleanSession=true deletes the row. v5 with
+//     SessionExpiryInterval == 0 deletes; otherwise persists with
+//     session_expires_at = now() + SessionExpiryInterval (or NULL = forever
+//     when expiry is "0xFFFFFFFF" / never).
 func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	if c.closing.Load() {
 		return
@@ -204,44 +213,70 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		c.eng.logger.Info("client disconnect (ungraceful)", logArgs...)
 	}
 
-	// Detach from session BEFORE firing will so the will publish can re-acquire
-	// the row's broker_id when a future client reconnects. Graceful disconnects
-	// have already cleared willTopic in handleGracefulDisconnect.
+	bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Compute will-fire timing.
+	willFireImmediate := false
+	willFireAt := (*time.Time)(nil)
 	if c.willTopic != "" {
-		if err := c.fireWill(ctx); err != nil {
+		switch c.protocol {
+		case mqttwire.ProtocolMQTT5:
+			delay := c.willDelay
+			if expiry := c.sessionExpiry; expiry != nil && (delay == nil || int64(*expiry) < int64(*delay)) {
+				delay = expiry
+			}
+			if delay == nil || *delay == 0 {
+				willFireImmediate = true
+			} else {
+				t := time.Now().Add(time.Duration(*delay) * time.Second)
+				willFireAt = &t
+			}
+		default:
+			willFireImmediate = true
+		}
+	}
+
+	// Decide session lifetime.
+	deleteSession := false
+	persistExpiresAt := (*time.Time)(nil)
+	switch c.protocol {
+	case mqttwire.ProtocolMQTT311:
+		deleteSession = c.cleanStart
+	case mqttwire.ProtocolMQTT5:
+		if c.sessionExpiry == nil || *c.sessionExpiry == 0 {
+			deleteSession = true
+		} else if *c.sessionExpiry != math.MaxInt32 && *c.sessionExpiry != -1 {
+			t := time.Now().Add(time.Duration(*c.sessionExpiry) * time.Second)
+			persistExpiresAt = &t
+		}
+	}
+
+	if willFireImmediate && c.willTopic != "" {
+		if err := c.fireWill(bgCtx); err != nil {
 			c.eng.logger.Warn("fire will", "err", err)
 		}
 	}
 
-	bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// Whether to delete the session row on disconnect:
-	//   v3.1.1 + clean=true             → delete
-	//   v5 + SessionExpiryInterval == 0 → delete
-	//   otherwise                       → persist (broker_id=NULL, connected=false)
-	deleteSession := false
-	if c.protocol == mqttwire.ProtocolMQTT311 {
-		deleteSession = c.cleanStart
-	} else {
-		// v5: SessionExpiryInterval is stored on the row; 0/null means no persistence.
-		var expiry *int32
-		if err := c.eng.pool.QueryRow(bgCtx,
-			`SELECT expiry_interval FROM sessions WHERE client_id=$1`, c.clientID).Scan(&expiry); err == nil {
-			deleteSession = expiry == nil || *expiry == 0
-		}
-	}
 	if deleteSession {
 		_, err := c.eng.pool.Exec(bgCtx, `DELETE FROM sessions WHERE client_id=$1`, c.clientID)
 		if err != nil {
 			c.eng.logger.Warn("delete clean session", "client", c.clientID, "err", err)
 		}
-	} else {
-		_, err := c.eng.pool.Exec(bgCtx,
-			`UPDATE sessions SET connected=false, broker_id=NULL, last_seen=now()
-			 WHERE client_id=$1`, c.clientID)
-		if err != nil {
-			c.eng.logger.Warn("mark disconnected", "client", c.clientID, "err", err)
-		}
+		return
+	}
+
+	_, err := c.eng.pool.Exec(bgCtx, `
+		UPDATE sessions SET
+			connected=false,
+			broker_id=NULL,
+			last_seen=now(),
+			will_fire_at=$2,
+			session_expires_at=$3
+		WHERE client_id=$1`,
+		c.clientID, willFireAt, persistExpiresAt)
+	if err != nil {
+		c.eng.logger.Warn("mark disconnected", "client", c.clientID, "err", err)
 	}
 }
 
@@ -249,10 +284,18 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 // disconnect: the will is dropped (must not be sent), the session may persist
 // or be cleaned per cleanStart. v5 SessionExpiryInterval extension is ignored
 // here for v1 — we treat any non-zero as "keep until evicted".
-func (c *Conn) handleGracefulDisconnect(_ context.Context, _ *packets.Packet) error {
+func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) error {
 	c.willTopic = "" // [MQTT-3.14.4-3]
-	// The dispatch loop will call handleDisconnect on the returned error;
-	// errClientDisconnect signals "graceful, don't log as warn".
+	// v5 [MQTT-3.14.2.2.2]: a DISCONNECT may override SessionExpiryInterval.
+	// Per spec, the server treats the packet as invalid if the original
+	// CONNECT had SessionExpiryInterval=0 and DISCONNECT supplies non-zero.
+	if c.protocol == mqttwire.ProtocolMQTT5 && pk.Properties.SessionExpiryIntervalFlag {
+		v := int32(pk.Properties.SessionExpiryInterval)
+		invalidIncrease := c.sessionExpiry != nil && *c.sessionExpiry == 0 && v != 0
+		if !invalidIncrease {
+			c.sessionExpiry = &v
+		}
+	}
 	c.gracefulRequested.Store(true)
 	return errClientDisconnect
 }

@@ -84,7 +84,14 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			if err == nil && string(b) != "{}" && string(b) != "null" {
 				c.willProps = b
 			}
+			d := int32(pk.Connect.WillProperties.WillDelayInterval)
+			c.willDelay = &d
 		}
+	}
+	// SessionExpiryInterval (v5). nil for v3.1.1.
+	if pv == mqttwire.ProtocolMQTT5 {
+		v := int32(pk.Properties.SessionExpiryInterval)
+		c.sessionExpiry = &v
 	}
 
 	// Take ownership in a single transaction.
@@ -114,6 +121,14 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		if _, err := c.eng.pool.Exec(ctx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
 			return err
 		}
+	}
+
+	// Cancel any pending will + session-expiry from the prior life of this
+	// session (the client beat the timer to reconnect).
+	if _, err := c.eng.pool.Exec(ctx,
+		`UPDATE sessions SET will_fire_at=NULL, session_expires_at=NULL WHERE client_id=$1`,
+		c.clientID); err != nil {
+		return err
 	}
 
 	sessionPresent := !c.cleanStart && !newSession
