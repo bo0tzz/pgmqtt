@@ -52,6 +52,97 @@ scheduling under CPU pressure, or a stage that isn't yet
 instrumented. Cross-check against `process_cpu_seconds_total` and
 `go_sched_latencies_seconds`.
 
+## A measured baseline
+
+To avoid the "is my cluster broken or is this normal?" question, here's
+one calibrated point — an instrumented kind cluster running on a single
+Linux x86_64 host with NVMe storage. **Numbers below are from this
+specific shape; they are NOT a target or a guarantee.**
+
+### Setup
+
+- 3 broker replicas (`pgmqtt:perf` build, instrumented), Service VIP
+  cluster IP, `auth.allowAnonymous=true`.
+- Postgres 16 (alpine), single replica, `emptyDir` volume on the kind
+  node's NVMe through Docker's overlay storage. `synchronous_commit=on`,
+  `fsync=on`, `wal_sync_method=fdatasync`. `pg_stat_statements` and
+  `track_io_timing` enabled.
+- Default broker pool config (`MaxConns=8`).
+- kind cluster sharing a host with other concurrent workloads (other
+  kind clusters running chaos / Mosquitto soaks during the run); CPU
+  contention is real, not a clean bench.
+
+### Shape A: single publisher, strict-serial QoS-1 at 50 msg/s target
+
+Rig: `-pubs 1 -inflight 1 -subs 1 -rate 50 -duration 60s`. Result: 2974
+publishes, 0 lost / 0 dups. The rig hit its target rate, so the broker
+was not the bottleneck at this load.
+
+| Stage                | Mean (ms) | Share |
+| ---                  | ---       | ---   |
+| `total`              | 3.49      | 100%  |
+| `mqtt_publish_query` | 2.17      | 62%   |
+| `tx_commit`          | 0.60      | 17%   |
+| `tx_begin`           | 0.33      | 9%    |
+| `notify`             | 0.27      | 8%    |
+| `response_write`     | 0.06      | 2%    |
+
+`pg_stat_io` for the same window: mean fsync **0.109 ms** (NVMe through
+Docker overlay is essentially free). `tx_commit`'s 0.60 ms is dominated
+by the broker→PG round-trip, not the disk.
+
+The dominant stage is the fanout SELECT inside `mqtt_publish()` — even
+with one subscriber. A `pg_stat_statements` breakdown attributes ~37%
+of total PG time to the function's outer SELECT and another ~24% to
+the embedded `WITH matches` CTE that does the topic-filter JOIN +
+delivery insert.
+
+### Shape B: 5 publishers × `-inflight 50`, 3 subs, 5000 msg/s target
+
+Rig: `-pubs 5 -inflight 50 -subs 3 -rate 5000 -duration 60s`. Result:
+7545 publishes per sub, 0 lost / 0 dups, ~125 msg/s total = **2.5%
+of the rig's 5000/s target**. The broker is the bottleneck here.
+
+What the histograms say (per-Pod, one pod's view):
+
+| Stage                | Mean (ms) under load | Shape A baseline |
+| ---                  | ---                  | ---              |
+| `total`              | 41.8                 | 3.49             |
+| `mqtt_publish_query` | 41.1                 | 2.17             |
+| `tx_commit`          | 0.48                 | 0.60             |
+| `tx_begin`           | 0.13                 | 0.33             |
+| `notify`             | 0.06                 | 0.27             |
+| `response_write`     | 0.03                 | 0.06             |
+
+The fanout query went from 2.17 ms to **41 ms** — 19× slowdown — while
+fsync, network, and pool acquire stayed the same or got faster. This
+is Postgres lock / row contention, not disk. `pg_stat_statements`
+during the same window:
+
+- `mqtt_publish` SELECT: **39.9 ms** mean (was 1.7 ms)
+- `mqtt_next_packet_id` (per outbound delivery): **6.1 ms** mean
+- `UPDATE sessions SET next_packet_id`: **6.0 ms** mean
+- Outbound delivery SELECT: 8.3 ms mean
+
+Mean fsync across the same window is still 0.109 ms — disk path is
+unaffected.
+
+### What this tells us
+
+- **Fsync is not the bottleneck on this cluster.** A single PUBLISH's
+  durable commit is ~0.1 ms of disk time inside a ~0.5–0.6 ms
+  `tx_commit` round-trip; the rest is network and PG transaction
+  overhead.
+- **The fanout SQL is the bottleneck** under concurrency. `mqtt_publish`
+  + `mqtt_next_packet_id` + the per-delivery `UPDATE sessions` all
+  contend on the same handful of rows when many publishers concurrently
+  fan out to the same set of subscribers. This is where future
+  optimisation effort goes — not async dispatch, not group commit.
+- **Disclosure**: this was a single-host kind cluster with active
+  contention from concurrent workloads. Real-hardware multi-node
+  Postgres on dedicated WAL volumes will look different. Re-run on
+  your shape before treating any of these numbers as a baseline.
+
 ## Common patterns
 
 **`tx_commit` dominates.** This is fsync. Either your disk is slow,
