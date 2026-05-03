@@ -34,6 +34,13 @@ auth:
 ##       value: debug
 extraEnv: []
 
+## Logger configuration. `format: text` is human-readable for `kubectl logs`;
+## `format: json` emits one JSON object per line, ready for ingestion by log
+## aggregation systems (Loki, Elasticsearch, Datadog, ...) without a custom
+## text-format extractor.
+logging:
+  format: text
+
 ## TCP / WS listener configuration.
 listeners:
   tcp:

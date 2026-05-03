@@ -22,7 +22,20 @@ func main() {
 	if os.Getenv("PGMQTT_LOG_LEVEL") == "debug" {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	// Pick the handler from PGMQTT_LOG_FORMAT (text|json). Read directly here
+	// — config.FromEnv runs after this point, but we want the same handler
+	// used for any startup-config errors so log aggregators don't see a
+	// stray text line before JSON kicks in. config.FromEnv re-validates
+	// the value below and rejects unknown formats.
+	handlerOpts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	switch os.Getenv("PGMQTT_LOG_FORMAT") {
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
+	default:
+		handler = slog.NewTextHandler(os.Stderr, handlerOpts)
+	}
+	logger := slog.New(handler)
 	slog.SetDefault(logger)
 
 	cfg, err := config.FromEnv()

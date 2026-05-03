@@ -145,6 +145,7 @@ psql "$PGMQTT_DATABASE_URL" -c "INSERT INTO users(username,password_hash) VALUES
 | `PGMQTT_SERVICE_WS_PORT` | `8083` | WS port advertised in auto-generated Secrets |
 | `PGMQTT_ALLOW_ANONYMOUS` | `false` | Skip auth when CONNECT has no username (test rigs only) |
 | `PGMQTT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `PGMQTT_LOG_FORMAT` | `text` | slog handler format: `text` (human-readable) or `json` (one object per line, for log aggregators) |
 | `PGMQTT_BCRYPT_COST` | `10` | Bcrypt cost for password hashes (4–31) |
 | `PGMQTT_RECEIVE_MAXIMUM` | `100` | v5 server `ReceiveMaximum` advertised to clients |
 | `PGMQTT_KEEPALIVE_MAX_SEC` | `60` | Server cap on negotiated keepalive |

@@ -71,6 +71,12 @@ type Config struct {
 	// same setting; LISTEN itself is instant, so WaitForNotification is
 	// unaffected.
 	PGStatementTimeout time.Duration
+
+	// LogFormat selects the slog handler emitted on stderr. "text" (default)
+	// is human-readable; "json" emits one JSON object per line which log
+	// aggregation systems (Loki, Elasticsearch, Datadog, …) parse without
+	// a dedicated text-format extractor. Anything else is rejected.
+	LogFormat string
 }
 
 func FromEnv() (*Config, error) {
@@ -92,6 +98,7 @@ func FromEnv() (*Config, error) {
 		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
 		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
+		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")
@@ -108,6 +115,11 @@ func FromEnv() (*Config, error) {
 	if c.PGStatementTimeout < 0 {
 		return nil, fmt.Errorf("PGMQTT_PG_STATEMENT_TIMEOUT_MS must be >= 0")
 	}
+	switch c.LogFormat {
+	case "text", "json":
+	default:
+		return nil, fmt.Errorf("PGMQTT_LOG_FORMAT must be \"text\" or \"json\", got %q", c.LogFormat)
+	}
 	return c, nil
 }
 
@@ -116,6 +128,18 @@ func FromEnv() (*Config, error) {
 // explicitly want this listener disabled".
 func getenv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+// getenvDefaultEmpty is like getenv but also substitutes the default when
+// the variable is set to the empty string. Use this for knobs where empty
+// is meaningless (e.g. log format) and the only sane interpretation is
+// "fall back to default", as opposed to listener addresses where empty has
+// the explicit meaning "disable this listener".
+func getenvDefaultEmpty(key, def string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
