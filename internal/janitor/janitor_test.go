@@ -130,3 +130,78 @@ func TestJanitorOrphanSweep(t *testing.T) {
 		t.Errorf("topics after sweep: %v", topics)
 	}
 }
+
+// TestJanitorInboundQoS2Sweep seeds inbound_qos2 rows for a disconnected
+// client and a connected client, both older than grace, and asserts the
+// sweep only evicts the disconnected one's tombstones.
+func TestJanitorInboundQoS2Sweep(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+
+	ctx := context.Background()
+	// Disconnected session — its tombstone should go.
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start)
+		VALUES ('q2-dead', NULL, false, 5, false)`); err != nil {
+		t.Fatalf("seed dead session: %v", err)
+	}
+	// Connected session — its tombstone must survive.
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start)
+		VALUES ('q2-live', $1, true, 5, false)`, l.BrokerID()); err != nil {
+		t.Fatalf("seed live session: %v", err)
+	}
+	// Old tombstones (older than 1h grace).
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO inbound_qos2(client_id, packet_id, received_at) VALUES
+		('q2-dead', 1, now() - interval '2 hours'),
+		('q2-live', 1, now() - interval '2 hours')`); err != nil {
+		t.Fatalf("seed tombstones: %v", err)
+	}
+	// Recent tombstone for dead session — must survive (within grace).
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO inbound_qos2(client_id, packet_id, received_at) VALUES
+		('q2-dead', 2, now())`); err != nil {
+		t.Fatalf("seed recent tombstone: %v", err)
+	}
+
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetInboundQoS2Grace(1 * time.Hour)
+	if err := jt.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	type tomb struct {
+		client string
+		packet int
+	}
+	var got []tomb
+	rows, err := mh.Pool.Query(ctx,
+		`SELECT client_id, packet_id FROM inbound_qos2 ORDER BY client_id, packet_id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for rows.Next() {
+		var v tomb
+		if err := rows.Scan(&v.client, &v.packet); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, v)
+	}
+	want := []tomb{{"q2-dead", 2}, {"q2-live", 1}}
+	if len(got) != len(want) {
+		t.Fatalf("rows after sweep: got=%v want=%v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d: got %v want %v", i, got[i], want[i])
+		}
+	}
+}

@@ -26,6 +26,11 @@ type Janitor struct {
 	// orphanGrace is the minimum age of a message with zero deliveries before
 	// the sweep deletes it. Keeps very-recent publishes safe from races.
 	orphanGrace time.Duration
+
+	// inboundQoS2Grace is the minimum age of an inbound_qos2 row before the
+	// sweep evicts it for sessions that are currently disconnected. Protects
+	// against pathological clients that send PUBLISH but never PUBREL.
+	inboundQoS2Grace time.Duration
 }
 
 // New constructs a Janitor.
@@ -38,8 +43,9 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 		// retained-expire) all key off this. The dead-broker advisory-lock
 		// scan rides along; it's a handful of point queries against an
 		// already-indexed `broker_id` column, so 1s is fine.
-		interval:    1 * time.Second,
-		orphanGrace: 10 * time.Minute,
+		interval:         1 * time.Second,
+		orphanGrace:      10 * time.Minute,
+		inboundQoS2Grace: 1 * time.Hour,
 	}
 }
 
@@ -48,6 +54,9 @@ func (j *Janitor) SetInterval(d time.Duration) { j.interval = d }
 
 // SetOrphanGrace overrides the orphan-message grace period.
 func (j *Janitor) SetOrphanGrace(d time.Duration) { j.orphanGrace = d }
+
+// SetInboundQoS2Grace overrides the inbound_qos2 grace period.
+func (j *Janitor) SetInboundQoS2Grace(d time.Duration) { j.inboundQoS2Grace = d }
 
 // Leader is the subset of leader.Leader the janitor depends on.
 type Leader interface {
@@ -101,6 +110,9 @@ func (j *Janitor) Tick(ctx context.Context) error {
 	}
 	if err := j.expireRetained(ctx); err != nil {
 		j.logger.Warn("expire retained", "err", err)
+	}
+	if err := j.sweepInboundQoS2(ctx); err != nil {
+		j.logger.Warn("sweep inbound qos2", "err", err)
 	}
 	return j.sweepOrphanMessages(ctx)
 }
@@ -193,6 +205,31 @@ func (j *Janitor) expireRetained(ctx context.Context) error {
 		 WHERE expires_at IS NOT NULL AND expires_at <= now()
 	`)
 	return err
+}
+
+// sweepInboundQoS2 deletes inbound_qos2 rows that are older than the grace
+// period AND belong to a currently-disconnected session. A v5 client that
+// sends QoS-2 PUBLISH but never sends PUBREL would otherwise leave its
+// (client_id, packet_id) tombstones forever. Connected sessions are left
+// alone — those rows are still in-flight from the broker's perspective.
+func (j *Janitor) sweepInboundQoS2(ctx context.Context) error {
+	cutoff := time.Now().Add(-j.inboundQoS2Grace)
+	ct, err := j.pool.Exec(ctx, `
+		DELETE FROM inbound_qos2 q
+		 WHERE q.received_at < $1
+		   AND EXISTS (
+		         SELECT 1 FROM sessions s
+		          WHERE s.client_id = q.client_id
+		            AND s.connected = false
+		       )
+	`, cutoff)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() > 0 {
+		j.logger.Debug("inbound_qos2 sweep", "deleted", ct.RowsAffected())
+	}
+	return nil
 }
 
 // findDeadBrokers selects every distinct broker_id currently referenced in

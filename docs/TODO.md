@@ -6,14 +6,11 @@ suggested below. Cross items off in this file as they ship.
 
 ## 1. Broker quality
 
-- [ ] **`inbound_qos2` GC.** A v5 client that sends QoS-2 PUBLISHes but never
-      sends PUBREL leaves rows in `inbound_qos2` forever (rows are only FK-
-      cascaded when the session row is deleted). Add a janitor sweep that
-      deletes rows whose `received_at < now() - 1h` and the corresponding
-      session is disconnected; needs a test that seeds rows + advances a
-      simulated clock. New migration likely needed only if we want a partial
-      index by `received_at` (current PK on `(client_id, packet_id)` is fine
-      for the predicate).
+- [x] **`inbound_qos2` GC.** Janitor sweeps rows whose `received_at` is past
+      the grace period and whose session is currently disconnected; default
+      grace 1h, tunable via `SetInboundQoS2Grace`. Connected sessions are
+      left alone — those rows are still in-flight. Test in
+      `janitor_test.go::TestJanitorInboundQoS2Sweep`.
 
 - [ ] **Slow-subscriber backpressure.** Today the drain loop will keep
       writing to a slow client without bound; deliveries pile up in Postgres.
@@ -182,3 +179,10 @@ These were explicitly listed in the plan as out-of-scope and stay that way:
 
 When in doubt: add it as a checkbox here, file a separate test, and leave
 the production-readiness label on the chart until the matrix is green.
+
+**Note on completion.** This list is a planning aid, not the definition of
+done. When every box above is ticked, do *not* declare the project shipped
+— re-audit the repo (drift between docs and code, weak failure modes,
+freshly-introduced dead code, missing tests, conformance/CI status) and
+add fresh items to this file. Production-ready is a property of the
+software, not of the checklist.
