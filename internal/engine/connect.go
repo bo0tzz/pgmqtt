@@ -135,21 +135,31 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		prev.shutdown()
 	}
 
-	// Clean-start drops any persisted state from a prior session.
+	// Clean-start drops any persisted state from a prior session, and
+	// in any case we cancel pending will + session-expiry timers (the
+	// client beat the timer to reconnect). All three writes share one
+	// tx so a partial failure can't leave (e.g.) orphan subscriptions
+	// after a "session is gone" CONNACK or, conversely, the prior
+	// will_fire_at active after a successful clean reconnect.
+	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
 	if c.cleanStart {
-		if _, err := c.eng.pool.Exec(ctx, `DELETE FROM subscriptions WHERE client_id=$1`, c.clientID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM subscriptions WHERE client_id=$1`, c.clientID); err != nil {
 			return err
 		}
-		if _, err := c.eng.pool.Exec(ctx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
 			return err
 		}
 	}
-
-	// Cancel any pending will + session-expiry from the prior life of this
-	// session (the client beat the timer to reconnect).
-	if _, err := c.eng.pool.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`UPDATE sessions SET will_fire_at=NULL, session_expires_at=NULL WHERE client_id=$1`,
 		c.clientID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 
