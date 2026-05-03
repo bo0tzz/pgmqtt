@@ -89,8 +89,9 @@ v1 plan (ACLs).
 | test_subscribe_failure | **FAIL** | Needs ACLs; out of v1 scope. |
 | test_shared_subscriptions | **FAIL** | Shared subscriptions are out of v1 scope per the design plan. |
 
-**24/27** clean pass. 2 flake on a Paho-side race. 2 fail on documented
-out-of-scope features (shared subs, ACLs).
+**23/27** deterministic pass; 24/27 with the Paho `waitfor` flake counted
+as a pass when timing favours it. 2 fails on documented out-of-scope
+features (shared subs, ACLs).
 
 ## Local kind smoke
 
