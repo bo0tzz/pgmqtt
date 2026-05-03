@@ -124,6 +124,9 @@ func (j *Janitor) Tick(ctx context.Context) error {
 	if err := j.sweepInboundQoS2(ctx); err != nil {
 		j.logger.Warn("sweep inbound qos2", "err", err)
 	}
+	if err := j.sweepOrphanDeliveries(ctx); err != nil {
+		j.logger.Warn("sweep orphan deliveries", "err", err)
+	}
 	if err := j.refreshDeliveriesGauge(ctx); err != nil {
 		j.logger.Warn("refresh deliveries gauge", "err", err)
 	}
@@ -255,21 +258,67 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 }
 
 // expireSessions deletes session rows whose v5 SessionExpiryInterval has
-// elapsed. Subscriptions and deliveries cascade via FK ON DELETE CASCADE.
+// elapsed. Subscriptions still cascade via FK; deliveries cascade was
+// dropped in migration 0006 (MultiXact SLRU thrash), so we delete those
+// explicitly in the same tx.
 func (j *Janitor) expireSessions(ctx context.Context) error {
-	ct, err := j.pool.Exec(ctx, `
-		DELETE FROM sessions
+	tx, err := j.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT client_id FROM sessions
 		 WHERE connected = false
 		   AND session_expires_at IS NOT NULL
 		   AND session_expires_at <= now()
+		 FOR UPDATE
 	`)
 	if err != nil {
 		return err
 	}
-	if j.metrics != nil && ct.RowsAffected() > 0 {
-		j.metrics.SessionsExpired.Add(float64(ct.RowsAffected()))
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM deliveries WHERE client_id = ANY($1)`, ids); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE client_id = ANY($1)`, ids); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if j.metrics != nil {
+		j.metrics.SessionsExpired.Add(float64(len(ids)))
 	}
 	return nil
+}
+
+// sweepOrphanDeliveries deletes deliveries rows whose client_id no
+// longer has a sessions row. Orphans accumulate when sessions are
+// removed by an out-of-band path (operator psql, restore from backup);
+// the in-broker delete paths clean explicitly. Rare in steady state.
+func (j *Janitor) sweepOrphanDeliveries(ctx context.Context) error {
+	_, err := j.pool.Exec(ctx, `
+		DELETE FROM deliveries
+		 WHERE NOT EXISTS (
+		    SELECT 1 FROM sessions s WHERE s.client_id = deliveries.client_id
+		 )
+	`)
+	return err
 }
 
 // expireRetained drops retained rows past their MessageExpiryInterval.

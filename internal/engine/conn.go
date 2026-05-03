@@ -556,9 +556,26 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	}
 
 	if deleteSession {
-		_, err := c.eng.pool.Exec(bgCtx, `DELETE FROM sessions WHERE client_id=$1`, c.clientID)
+		// deliveries no longer cascades from sessions (FK dropped in
+		// migration 0006 to eliminate MultiXact SLRU thrash). Clean
+		// them explicitly in the same tx as the session DELETE so a
+		// fresh client_id reconnect can't see prior-incarnation rows.
+		tx, err := c.eng.pool.BeginTx(bgCtx, pgx.TxOptions{})
 		if err != nil {
+			c.eng.logger.Warn("begin clean session", "client", c.clientID, "err", err)
+			return
+		}
+		defer tx.Rollback(bgCtx)
+		if _, err := tx.Exec(bgCtx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
+			c.eng.logger.Warn("delete clean session deliveries", "client", c.clientID, "err", err)
+			return
+		}
+		if _, err := tx.Exec(bgCtx, `DELETE FROM sessions WHERE client_id=$1`, c.clientID); err != nil {
 			c.eng.logger.Warn("delete clean session", "client", c.clientID, "err", err)
+			return
+		}
+		if err := tx.Commit(bgCtx); err != nil {
+			c.eng.logger.Warn("commit clean session", "client", c.clientID, "err", err)
 		}
 		return
 	}

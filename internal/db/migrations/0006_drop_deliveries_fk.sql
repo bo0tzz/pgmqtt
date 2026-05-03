@@ -1,0 +1,27 @@
+-- Drop the FK from deliveries.client_id → sessions(client_id).
+--
+-- Why: every INSERT INTO deliveries fires the implicit FK trigger
+-- `SELECT 1 FROM sessions WHERE client_id = $1 FOR KEY SHARE`. Under
+-- concurrent fanout (N publishers × M matching subscribers) this
+-- accumulates long Multixact lock chains on a tiny set of session
+-- rows — Postgres' MultiXactOffset/MultiXactMember SLRU buffers
+-- (default 8 pages each) thrash, and *every other query* touching
+-- `sessions` slows 10–20× from buffer-cache eviction. EXPLAIN ANALYZE
+-- under load confirmed `mqtt_publish`'s session_pkey lookup taking
+-- ~24 ms for 8 rows (308 buffer hits) due to HOT-chain bloat caused
+-- by the SHARE-lock chains.
+--
+-- Trade-off: deliveries are no longer auto-cleaned on session DELETE.
+-- We compensate explicitly: every DELETE FROM sessions site in the
+-- broker (handleDisconnect's clean-session path, janitor's
+-- expireSessions) now issues an explicit `DELETE FROM deliveries
+-- WHERE client_id = $1` first in the same transaction. Janitor's
+-- sweepOrphanDeliveries provides belt-and-suspenders for any rows
+-- that slip through (e.g. a session deleted out-of-band by an
+-- operator).
+--
+-- The FK on deliveries.message_id → messages stays — it's also HOT
+-- but the SHARE locks are short-lived (a delivery references one
+-- immutable message row once at INSERT, no chain accumulation).
+
+ALTER TABLE deliveries DROP CONSTRAINT deliveries_client_id_fkey;
