@@ -512,15 +512,18 @@ func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
 }
 
 // handlePubrel completes the QoS-2 publisher-side handshake. The matching
-// row in inbound_qos2 is removed so the same packet_id may be reused.
+// row in inbound_qos2 is removed so the same packet_id may be reused, and
+// the v5 inbound-flow-control slot is released.
 func (c *Conn) handlePubrel(ctx context.Context, pk *packets.Packet) error {
 	_, _ = c.eng.pool.Exec(ctx,
 		`DELETE FROM inbound_qos2 WHERE client_id=$1 AND packet_id=$2`,
 		c.clientID, pk.PacketID)
-	return c.write(&packets.Packet{
+	err := c.write(&packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Pubcomp},
 		PacketID:    pk.PacketID,
 	})
+	c.inboundInflight.Add(-1)
+	return err
 }
 
 func (c *Conn) handlePubcomp(ctx context.Context, pk *packets.Packet) error {

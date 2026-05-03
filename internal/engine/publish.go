@@ -21,10 +21,12 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		return err
 	}
 	// v5 inbound flow control: enforce serverReceiveMaximum on un-ACKed QoS>0
-	// inbound PUBLISHes. [MQTT-3.3.4-9].
+	// inbound PUBLISHes. [MQTT-3.3.4-9]. The counter is decremented at the
+	// receive-side ACK boundary: PUBACK for QoS 1, PUBCOMP for QoS 2 (which
+	// only happens after PUBREL is received). Decrement-after-defer would
+	// effectively mean "always 1" so flow control would never trip.
 	if pk.FixedHeader.Qos > 0 && c.protocol == mqttwire.ProtocolMQTT5 {
 		current := c.inboundInflight.Add(1)
-		defer c.inboundInflight.Add(-1)
 		if uint16(current) > serverReceiveMaximum {
 			_ = c.write(&packets.Packet{
 				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
@@ -94,11 +96,17 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	case 0:
 		return nil
 	case 1:
-		return c.write(&packets.Packet{
+		// PUBACK closes the inbound flow-control slot for QoS 1.
+		err := c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Puback},
 			PacketID:    pk.PacketID,
 		})
+		c.inboundInflight.Add(-1)
+		return err
 	case 2:
+		// PUBREC alone doesn't close the slot — we're still waiting for
+		// PUBREL (which triggers PUBCOMP). The slot is released in
+		// handlePubrel.
 		return c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
 			PacketID:    pk.PacketID,
