@@ -215,7 +215,22 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 
 	bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if c.cleanStart {
+	// Whether to delete the session row on disconnect:
+	//   v3.1.1 + clean=true             → delete
+	//   v5 + SessionExpiryInterval == 0 → delete
+	//   otherwise                       → persist (broker_id=NULL, connected=false)
+	deleteSession := false
+	if c.protocol == mqttwire.ProtocolMQTT311 {
+		deleteSession = c.cleanStart
+	} else {
+		// v5: SessionExpiryInterval is stored on the row; 0/null means no persistence.
+		var expiry *int32
+		if err := c.eng.pool.QueryRow(bgCtx,
+			`SELECT expiry_interval FROM sessions WHERE client_id=$1`, c.clientID).Scan(&expiry); err == nil {
+			deleteSession = expiry == nil || *expiry == 0
+		}
+	}
+	if deleteSession {
 		_, err := c.eng.pool.Exec(bgCtx, `DELETE FROM sessions WHERE client_id=$1`, c.clientID)
 		if err != nil {
 			c.eng.logger.Warn("delete clean session", "client", c.clientID, "err", err)

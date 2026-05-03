@@ -133,6 +133,14 @@ func Write(w io.Writer, pk *packets.Packet) error {
 
 // Encode returns the wire bytes for pk.
 func Encode(pk *packets.Packet) ([]byte, error) {
+	// mochi gates several v5 PUBLISH properties (ResponseTopic, CorrelationData,
+	// ContentType, ResponseInformation, ServerReference) on Mods.AllowResponseInfo.
+	// Per [MQTT-3.1.2-28] this only applies to CONNACK; on every other packet
+	// the broker forwards client-set properties verbatim.
+	if pk.FixedHeader.Type != packets.Connack {
+		pk.Mods.AllowResponseInfo = true
+	}
+
 	var buf = newBuf()
 	defer buf.Reset()
 

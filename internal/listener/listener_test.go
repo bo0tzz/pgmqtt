@@ -67,9 +67,13 @@ func TestSessionMigratesOnPodLoss(t *testing.T) {
 		p.BrokerID = l.BrokerID()
 	}
 
-	// Persistent client on pod 0 with a subscription, then disconnect cleanly.
-	notClean := func(p *packets.Packet) { p.Connect.Clean = false }
-	c1 := mh.Pods[0].Connect(t, "migrant", notClean)
+	// Persistent v5 client on pod 0 with a subscription, then disconnect cleanly.
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := mh.Pods[0].Connect(t, "migrant", persistent)
 	c1.Subscribe(t, "mig/#", 1)
 	c1.Close()
 
@@ -80,7 +84,7 @@ func TestSessionMigratesOnPodLoss(t *testing.T) {
 	// Reconnect same client_id on pod 1 — it should succeed (the dead pod's
 	// takeover NOTIFY is unobserved but irrelevant) and the subscription must
 	// still be intact.
-	c2 := mh.Pods[1].Connect(t, "migrant", notClean)
+	c2 := mh.Pods[1].Connect(t, "migrant", persistent)
 	defer c2.Close()
 
 	pub := mh.Pods[1].Connect(t, "mig-pub")

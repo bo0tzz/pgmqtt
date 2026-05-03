@@ -22,17 +22,30 @@ Tests in code (run `go test ./... -count=1`):
 - [x] reconciler — BYO Secret path (no auto-generated Secret created)
 - [x] reconciler — deletion removes the DB row
 
-Manual / CI in-cluster (run `bash scripts/smoke.sh` or via the GH Action):
+Manual / CI in-cluster (run via the GH Action `smoke` job, also runnable
+locally — see [docs/CONFORMANCE.md](CONFORMANCE.md)):
 
-- [ ] helm install brings up N replicas; each acquires its own broker
+- [x] helm install brings up N replicas; each acquires its own broker
       advisory lock.
-- [ ] `kubectl apply` a User; auto-generated credentials Secret appears with
-      the expected wire-details; mosquitto round-trip works using the
-      Secret's `uri`.
-- [ ] `kubectl delete user`; the auto-generated Secret is GC'd by Kubernetes
-      via owner-ref; the DB row is gone.
-- [ ] `kubectl delete pod --grace-period=0 --force <one>` repeatedly while a
-      sustained QoS-1 stream is in flight; no message loss.
+- [x] `kubectl apply` a User; auto-generated credentials Secret appears
+      with the expected wire-details; mosquitto round-trip works using the
+      Secret's host/port/username/password.
+- [x] `kubectl delete user`; the auto-generated Secret is GC'd by
+      Kubernetes via owner-ref; the DB row is gone.
+- [ ] `kubectl delete pod --grace-period=0 --force <one>` repeatedly while
+      a sustained QoS-1 stream is in flight; no message loss.
+
+Eclipse Paho conformance suite
+([`paho.mqtt.testing`](https://github.com/eclipse-paho/paho.mqtt.testing)) —
+results recorded in [docs/CONFORMANCE.md](CONFORMANCE.md). Last run:
+
+- v3.1.1: 9/10 pass. Only `test_subscribe_failure` fails (needs ACLs;
+  out of v1 scope).
+- v5: 13/27 pass. Remainder are documented v1 gaps (topic alias, flow
+  control, packet size enforcement, message/session expiry, shared subs,
+  ACLs, will delay, server keepalive override) or Paho test fixtures that
+  reference undefined symbols (`UserProperty`, `topic_prefix`) when invoked
+  outside the original `__main__` block.
 
 Soak (manual):
 

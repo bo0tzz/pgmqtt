@@ -113,9 +113,13 @@ func TestSessionResume(t *testing.T) {
 	t.Parallel()
 	h := enginetest.NewHarness(t)
 
-	// Persistent session subscribes then disconnects.
-	withClean := func(p *packets.Packet) { p.Connect.Clean = false }
-	sub1 := h.Connect(t, "sub-resume", withClean)
+	// v5 clean_start=false + SessionExpiryInterval>0 means resumable.
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	sub1 := h.Connect(t, "sub-resume", persistent)
 	sub1.Subscribe(t, "rx/#", 1)
 	sub1.Close()
 
@@ -124,7 +128,7 @@ func TestSessionResume(t *testing.T) {
 	pub.Close()
 
 	// Reconnect — should drain the queued QoS-1 message.
-	sub2 := h.Connect(t, "sub-resume", withClean)
+	sub2 := h.Connect(t, "sub-resume", persistent)
 	defer sub2.Close()
 	pk := sub2.Read(t, 2*time.Second)
 	if string(pk.Payload) != "queued" {
@@ -240,8 +244,12 @@ func TestGracefulShutdownClearsBrokerID(t *testing.T) {
 	t.Parallel()
 	h := enginetest.NewHarness(t)
 
-	clean := func(p *packets.Packet) { p.Connect.Clean = false }
-	c := h.Connect(t, "shut-1", clean)
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c := h.Connect(t, "shut-1", persistent)
 	c.Subscribe(t, "x/y", 1)
 	c.Close()
 
