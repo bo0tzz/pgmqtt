@@ -220,18 +220,19 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 	for i, w := range wills {
 		clientIDs[i] = w.client
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE sessions SET will_fire_at=NULL,
-		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
-		    will_retain=NULL, will_delay=NULL, will_properties=NULL
-		 WHERE client_id = ANY($1)
-	`, clientIDs); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
 
+	// Publish FIRST, clear will_* SECOND. Previously the order was
+	// reversed: clear committed before PublishWill ran, so a crash
+	// between them silently dropped the will. Inverting the order means
+	// a crash between publish and clear surfaces as a duplicate-will on
+	// the next janitor tick (the SKIP LOCKED query re-finds the row,
+	// re-fires) — duplicate-will is the better failure than lost-will.
+	//
+	// We hold the FOR UPDATE SKIP LOCKED row locks across PublishWill
+	// so concurrent janitors can't fire the same will twice within a
+	// single tick. PublishWill opens its own publishCore tx on a
+	// different conn — the outer lock just gates "who owns these rows
+	// for this round."
 	for _, w := range wills {
 		if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
 			j.logger.Warn("fire delayed will", "client", w.client, "err", err)
@@ -241,7 +242,16 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 			j.metrics.WillsFiredTotal.Inc()
 		}
 	}
-	return nil
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions SET will_fire_at=NULL,
+		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
+		    will_retain=NULL, will_delay=NULL, will_properties=NULL
+		 WHERE client_id = ANY($1)
+	`, clientIDs); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // expireSessions deletes session rows whose v5 SessionExpiryInterval has
