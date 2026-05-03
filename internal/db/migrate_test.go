@@ -136,22 +136,34 @@ func TestMigrateConcurrent(t *testing.T) {
 	}
 }
 
-func TestNextPacketID(t *testing.T) {
+// TestSessionsHasNoNextPacketIDColumn asserts the next_packet_id column was
+// dropped by migration 0009. Outbound packet-id allocation lives in
+// internal/engine/conn.go::AllocPacketID — see TestAllocPacketID* in the
+// engine package for behavioural tests.
+func TestSessionsHasNoNextPacketIDColumn(t *testing.T) {
 	t.Parallel()
 	pool := dbtest.FreshPool(t)
 	ctx := context.Background()
 
-	if _, err := pool.Exec(ctx, `INSERT INTO sessions(client_id, protocol_version, clean_start) VALUES('c', 5, true)`); err != nil {
-		t.Fatalf("seed: %v", err)
+	var exists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS(
+		  SELECT 1 FROM information_schema.columns
+		   WHERE table_name='sessions' AND column_name='next_packet_id'
+		)`).Scan(&exists); err != nil {
+		t.Fatalf("information_schema: %v", err)
+	}
+	if exists {
+		t.Error("sessions.next_packet_id should have been dropped by migration 0009")
 	}
 
-	for i := 2; i <= 5; i++ {
-		var pid int
-		if err := pool.QueryRow(ctx, `SELECT mqtt_next_packet_id('c')`).Scan(&pid); err != nil {
-			t.Fatalf("alloc: %v", err)
-		}
-		if pid != i {
-			t.Errorf("expected %d, got %d", i, pid)
-		}
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS(
+		  SELECT 1 FROM pg_proc WHERE proname='mqtt_next_packet_id'
+		)`).Scan(&exists); err != nil {
+		t.Fatalf("pg_proc: %v", err)
+	}
+	if exists {
+		t.Error("mqtt_next_packet_id() should have been dropped by migration 0009")
 	}
 }

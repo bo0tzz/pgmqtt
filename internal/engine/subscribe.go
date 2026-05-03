@@ -231,20 +231,25 @@ func (c *Conn) persistRetainedDispatch(ctx context.Context, topic string, payloa
 }
 
 // allocPacketID assigns a packet id to a queued delivery (state=0 -> 1).
+// Uses the per-Conn in-memory allocator so the per-delivery UPDATE on
+// sessions.next_packet_id is gone — the only DB mutation is the
+// deliveries row state transition.
 func (c *Conn) allocPacketID(ctx context.Context, msgID int64, _ byte) (uint16, error) {
-	var pid int
-	err := c.eng.pool.QueryRow(ctx, `
-		WITH chosen AS (
-			SELECT mqtt_next_packet_id($1) AS pid
-		)
-		UPDATE deliveries SET packet_id = (SELECT pid FROM chosen), state = 1
-		 WHERE client_id=$1 AND message_id=$2 AND state=0
-		RETURNING packet_id
-	`, c.clientID, msgID).Scan(&pid)
+	pid, err := c.AllocPacketID(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return uint16(pid), nil
+	ct, err := c.eng.pool.Exec(ctx, `
+		UPDATE deliveries SET packet_id=$1, state=1
+		 WHERE client_id=$2 AND message_id=$3 AND state=0
+	`, int(pid), c.clientID, msgID)
+	if err != nil {
+		return 0, err
+	}
+	if ct.RowsAffected() == 0 {
+		return 0, errors.New("retained delivery row missing")
+	}
+	return pid, nil
 }
 
 func nullInt(v int) any {
@@ -253,6 +258,3 @@ func nullInt(v int) any {
 	}
 	return v
 }
-
-// Compile-time guard.
-var _ = errors.New
