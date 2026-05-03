@@ -7,6 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
 	"github.com/bo0tzz/pgmqtt/internal/config"
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
@@ -63,6 +65,11 @@ func main() {
 
 	mtx := metrics.New()
 	mtx.RegisterPgxPool(pool)
+	// Surface controller-runtime's package-global metrics (the User
+	// reconciler's reconcile_total / reconcile_time / workqueue_*) on our
+	// /metrics endpoint. Controller-runtime's manager metrics server is
+	// disabled in operator.Run; we gather its registry alongside ours.
+	mtx.AddGatherer(ctrlmetrics.Registry)
 	eng.SetMetrics(mtx)
 	if cfg.MetricsAddr != "" {
 		go func() {
