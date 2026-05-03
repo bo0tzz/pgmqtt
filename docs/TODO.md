@@ -131,28 +131,20 @@ suggested below. Cross items off in this file as they ship.
 
 ## 6. Docs
 
-- [ ] **Operational runbook** (`docs/OPS.md`):
-        * "Leader stuck": how to find which Pod holds `pg_advisory_lock(42)`,
-          how to force-release.
-        * "Zombie session ownership": if a Pod hard-died and the janitor
-          isn't running, how to manually clear `sessions.broker_id`.
-        * "Stuck delivery row": how to inspect, when to delete.
-        * "Postgres connection limits": pool sizing guidance, what happens
-          when exhausted.
-        * "Schema migrations during rolling restart": what's safe.
-
-- [ ] **Backup/restore guide** (`docs/BACKUP.md`): pg_dump usually fine; if
-      using cnpg, refer to its backup story. Document which tables are
-      essential (sessions + subscriptions + retained) vs. ephemeral
-      (deliveries + messages + inbound_qos2).
-
-- [ ] **Sizing guide** (`docs/SIZING.md`): rough CPU/memory per N
-      connections, postgres connection count needed, when to consider
-      ltree indexes.
-
-- [ ] **Security threat model** (`docs/SECURITY.md`): trust boundaries,
-      what bcrypt cost achieves, recommendation to put TLS terminator in
-      front, secrets handling.
+- [x] **Operational runbook** (`docs/OPS.md`) — leader-stuck flow,
+      zombie ownership, stuck delivery row, postgres pool sizing,
+      schema-migration safety, plus a forced-restart and DB-failover
+      walk-through.
+- [x] **Backup/restore guide** (`docs/BACKUP.md`) — survival-set vs
+      ephemeral table inventory, pg_dump flow, cnpg flow, recovery-drill
+      checklist.
+- [x] **Sizing guide** (`docs/SIZING.md`) — Pod resources per N conns,
+      postgres `max_connections` table by traffic, memory ballpark, when
+      to consider ltree, smoke targets.
+- [x] **Security threat model** (`docs/SECURITY.md`) — trust boundaries
+      diagram, what the broker enforces (auth, per-conn limits, sweeps),
+      what it deliberately doesn't (TLS, ACLs, mTLS), production
+      recommendations, secrets handling.
 
 ## 7. Release engineering
 
