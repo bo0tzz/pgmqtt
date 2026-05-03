@@ -7,16 +7,31 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mochi-mqtt/server/v2/packets"
+
+	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
 
 // Deliver is the receiver side of a publish: assign packet ids to all queued
 // deliveries for messageID owned by this Pod, look up each client's local
 // socket, and send the PUBLISH. Called by the listener's NOTIFY dispatcher.
+//
+// We collect the matching subscription's subscription_id (if set) so v5
+// clients see the SubscriptionIdentifier property on the delivered PUBLISH.
+// When multiple subscriptions match for the same client we pick the smallest
+// non-null id — sufficient for v5 conformance since we already deduplicate
+// to one delivery per client.
 func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	self := e.BrokerID()
 	rows, err := e.pool.Query(ctx, `
 		SELECT d.id, d.client_id, d.qos, d.state, d.packet_id,
-		       m.topic, m.payload, m.properties
+		       m.topic, m.payload, m.properties,
+		       COALESCE(
+		         (SELECT array_agg(s.subscription_id ORDER BY s.subscription_id)
+		            FROM subscriptions s
+		           WHERE s.client_id = d.client_id
+		             AND s.subscription_id IS NOT NULL
+		             AND mqtt_topic_match(s.topic_filter, m.topic)),
+		         '{}'::int[]) AS sub_ids
 		  FROM deliveries d
 		  JOIN sessions s ON s.client_id = d.client_id
 		  JOIN messages m ON m.id = d.message_id
@@ -38,12 +53,13 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		topic      string
 		payload    []byte
 		props      []byte
+		subIDs     []int
 	}
 	var items []item
 	for rows.Next() {
 		var it item
 		if err := rows.Scan(&it.deliveryID, &it.clientID, &it.qos, &it.state, &it.packetID,
-			&it.topic, &it.payload, &it.props); err != nil {
+			&it.topic, &it.payload, &it.props, &it.subIDs); err != nil {
 			return err
 		}
 		items = append(items, it)
@@ -53,7 +69,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	}
 
 	for _, it := range items {
-		if err := e.deliverOne(ctx, it.deliveryID, it.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, false); err != nil {
+		if err := e.deliverOne(ctx, it.deliveryID, it.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, it.subIDs, false); err != nil {
 			e.logger.Warn("deliver", "id", it.deliveryID, "client", it.clientID, "err", err)
 		}
 	}
@@ -64,7 +80,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 // packet id atomically if needed. dup=true sets the DUP flag (used on session
 // resume for state>=1 rows). Errors sending are non-fatal: the client may have
 // just disconnected; the delivery row remains and will be drained on reconnect.
-func (e *Engine) deliverOne(ctx context.Context, deliveryID int64, clientID string, qos, state byte, currentPacketID *int, topic string, payload, props []byte, dup bool) error {
+func (e *Engine) deliverOne(ctx context.Context, deliveryID int64, clientID string, qos, state byte, currentPacketID *int, topic string, payload, props []byte, subIDs []int, dup bool) error {
 	conn, ok := e.ConnFor(clientID)
 	if !ok {
 		// Not currently connected to this Pod (race with disconnect or
@@ -82,6 +98,9 @@ func (e *Engine) deliverOne(ctx context.Context, deliveryID int64, clientID stri
 		if err := json.Unmarshal(props, &p); err == nil {
 			pk.Properties = p
 		}
+	}
+	if len(subIDs) > 0 && conn.protocol == mqttwire.ProtocolMQTT5 {
+		pk.Properties.SubscriptionIdentifier = append([]int(nil), subIDs...)
 	}
 
 	if qos > 0 {
@@ -121,7 +140,14 @@ func (e *Engine) deliverOne(ctx context.Context, deliveryID int64, clientID stri
 func (c *Conn) drainSessionQueue(ctx context.Context) error {
 	rows, err := c.eng.pool.Query(ctx, `
 		SELECT d.id, d.qos, d.state, d.packet_id,
-		       m.topic, m.payload, m.properties
+		       m.topic, m.payload, m.properties,
+		       COALESCE(
+		         (SELECT array_agg(s.subscription_id ORDER BY s.subscription_id)
+		            FROM subscriptions s
+		           WHERE s.client_id = d.client_id
+		             AND s.subscription_id IS NOT NULL
+		             AND mqtt_topic_match(s.topic_filter, m.topic)),
+		         '{}'::int[]) AS sub_ids
 		  FROM deliveries d
 		  JOIN messages m ON m.id = d.message_id
 		 WHERE d.client_id = $1
@@ -141,11 +167,12 @@ func (c *Conn) drainSessionQueue(ctx context.Context) error {
 		topic      string
 		payload    []byte
 		props      []byte
+		subIDs     []int
 	}
 	var items []item
 	for rows.Next() {
 		var it item
-		if err := rows.Scan(&it.deliveryID, &it.qos, &it.state, &it.packetID, &it.topic, &it.payload, &it.props); err != nil {
+		if err := rows.Scan(&it.deliveryID, &it.qos, &it.state, &it.packetID, &it.topic, &it.payload, &it.props, &it.subIDs); err != nil {
 			return err
 		}
 		items = append(items, it)
@@ -168,7 +195,7 @@ func (c *Conn) drainSessionQueue(ctx context.Context) error {
 			}
 		case 0, 1:
 			dup := it.state == 1
-			if err := c.eng.deliverOne(ctx, it.deliveryID, c.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, dup); err != nil {
+			if err := c.eng.deliverOne(ctx, it.deliveryID, c.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, it.subIDs, dup); err != nil {
 				return err
 			}
 		}

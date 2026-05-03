@@ -12,6 +12,9 @@ type Config struct {
 	WSAddr      string
 	PodName     string
 
+	// AllowAnonymous accepts CONNECT without username/password. Off by default.
+	AllowAnonymous bool
+
 	// Operator wire-details for auto-generated User Secrets.
 	ServiceHost string
 	ServicePort int
@@ -24,9 +27,10 @@ func FromEnv() (*Config, error) {
 		TCPAddr:     getenv("PGMQTT_TCP_ADDR", ":1883"),
 		WSAddr:      getenv("PGMQTT_WS_ADDR", ":8083"),
 		PodName:     os.Getenv("POD_NAME"),
-		ServiceHost: os.Getenv("PGMQTT_SERVICE_HOST"),
-		ServicePort: getenvInt("PGMQTT_SERVICE_PORT", 1883),
-		WSPort:      getenvInt("PGMQTT_SERVICE_WS_PORT", 8083),
+		ServiceHost:    os.Getenv("PGMQTT_SERVICE_HOST"),
+		ServicePort:    getenvInt("PGMQTT_SERVICE_PORT", 1883),
+		WSPort:         getenvInt("PGMQTT_SERVICE_WS_PORT", 8083),
+		AllowAnonymous: os.Getenv("PGMQTT_ALLOW_ANONYMOUS") == "true",
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

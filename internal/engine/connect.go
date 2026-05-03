@@ -31,6 +31,13 @@ const (
 )
 
 func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
+	// Reject anything that isn't a well-formed CONNECT (bad protocol name,
+	// reserved bits, will-no-payload, etc.). mochi's ConnectValidate covers
+	// MQTT-3.1.2-{1..N}; we close the socket without CONNACK because the
+	// protocol level is untrusted at this point.
+	if code := pk.ConnectValidate(); code.Code != 0 {
+		return fmt.Errorf("connect validate: %s", code.Reason)
+	}
 	pv := pk.ProtocolVersion
 	if pv != mqttwire.ProtocolMQTT311 && pv != mqttwire.ProtocolMQTT5 {
 		_ = c.writeConnackReject(pv, cackUnsupportedProtocol)
@@ -55,12 +62,15 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		c.keepalive = defaultKeepalive
 	}
 
-	// Authenticate (always required for v1; anonymous opt-in is a follow-up).
+	// Authenticate. PGMQTT_ALLOW_ANONYMOUS=true skips this when no username
+	// is supplied (still validates credentials when one is).
 	username := string(pk.Connect.Username)
 	password := string(pk.Connect.Password)
-	if err := Authenticate(ctx, c.eng.pool, username, password); err != nil {
-		_ = c.writeConnackReject(pv, cackBadCredentials)
-		return err
+	if username != "" || !c.eng.cfg.AllowAnonymous {
+		if err := Authenticate(ctx, c.eng.pool, username, password); err != nil {
+			_ = c.writeConnackReject(pv, cackBadCredentials)
+			return err
+		}
 	}
 
 	// Capture will from the CONNECT (decoded by codec).
