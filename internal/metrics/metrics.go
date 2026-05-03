@@ -49,6 +49,51 @@ type Metrics struct {
 	// Stages: total, qos2_dedup, retain, tx_begin, mqtt_publish_query,
 	// tx_commit, notify, response_write (PUBACK or PUBREC).
 	PublishStageSeconds *prometheus.HistogramVec
+
+	// AuthFailuresTotal counts credential rejections at CONNECT.
+	// Reasons: bad_credentials (CONNACK 0x86), not_authorized (0x87),
+	// banned (0x88), bad_auth_method (0x8C — enhanced auth attempted).
+	AuthFailuresTotal *prometheus.CounterVec
+
+	// SubscribesTotal / UnsubscribesTotal — symmetric to PublishesTotal,
+	// used to bound topic-churn driven load.
+	SubscribesTotal   prometheus.Counter
+	UnsubscribesTotal prometheus.Counter
+
+	// JanitorTickSeconds attributes time across the per-tick sub-jobs of
+	// janitor.Tick (dead_brokers, fire_due_wills, expire_sessions,
+	// expire_retained, sweep_inbound_qos2, sweep_orphan_deliveries,
+	// refresh_deliveries_gauge, refresh_subscriptions_gauge,
+	// refresh_sessions_gauge, refresh_retained_gauge,
+	// refresh_inbound_qos2_gauge, sweep_orphan_messages). One sub-job
+	// blowing past the 1s tick interval would otherwise be invisible —
+	// they all currently swallow into a single Warn log.
+	JanitorTickSeconds *prometheus.HistogramVec
+
+	// JanitorErrorsTotal counts per-sub-job errors so an operator can
+	// alert on a specific job degrading without parsing logs.
+	JanitorErrorsTotal *prometheus.CounterVec
+
+	// Subscriptions / Sessions / RetainedCount / InboundQoS2Pending —
+	// gauges refreshed by janitor each tick. Cardinality detection,
+	// retained-flood detection, QoS-2 stuck detection.
+	Subscriptions     prometheus.Gauge
+	Sessions          prometheus.Gauge
+	RetainedCount     prometheus.Gauge
+	InboundQoS2Pending prometheus.Gauge
+
+	// WillsNotifyFailedTotal counts cross-pod will-publish failures
+	// where the post-commit Notifier hook returned an error. In
+	// production this is a no-op so the counter is normally zero;
+	// surfaces the test-harness InProcessNotifier failure mode.
+	WillsNotifyFailedTotal prometheus.Counter
+
+	// RetainedDispatchFailedTotal counts retained-message dispatch
+	// failures during SUBSCRIBE that arrived after SUBACK was already
+	// sent. Operator-visible since the client cannot otherwise
+	// distinguish "no retained existed" from "retained existed but
+	// failed to deliver."
+	RetainedDispatchFailedTotal prometheus.Counter
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -101,6 +146,54 @@ func New() *Metrics {
 				.01, .02, .05, .1, .25, .5, 1, 2.5, 5,
 			},
 		}, []string{"stage"}),
+		AuthFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_auth_failures_total",
+			Help: "Credential rejections at CONNECT, labelled by reason " +
+				"(bad_credentials, not_authorized, banned, bad_auth_method).",
+		}, []string{"reason"}),
+		SubscribesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgmqtt_subscribes_total",
+			Help: "Inbound MQTT SUBSCRIBE packets accepted by this Pod.",
+		}),
+		UnsubscribesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgmqtt_unsubscribes_total",
+			Help: "Inbound MQTT UNSUBSCRIBE packets accepted by this Pod.",
+		}),
+		JanitorTickSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "pgmqtt_janitor_tick_seconds",
+			Help: "Per-sub-job duration of janitor.Tick. Labels: job.",
+			Buckets: []float64{
+				.0001, .0005, .001, .005, .01, .05, .1, .25, .5, 1, 2.5, 5, 10,
+			},
+		}, []string{"job"}),
+		JanitorErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_janitor_errors_total",
+			Help: "Per-sub-job error counter for janitor.Tick. Labels: job.",
+		}, []string{"job"}),
+		Subscriptions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_subscriptions",
+			Help: "Rows in the subscriptions table (refreshed each janitor tick).",
+		}),
+		Sessions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_sessions",
+			Help: "Rows in the sessions table (refreshed each janitor tick).",
+		}),
+		RetainedCount: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_retained_count",
+			Help: "Rows in the retained table (refreshed each janitor tick).",
+		}),
+		InboundQoS2Pending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_inbound_qos2_pending",
+			Help: "Rows in the inbound_qos2 dedup table (refreshed each janitor tick).",
+		}),
+		WillsNotifyFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgmqtt_wills_notify_failed_total",
+			Help: "Will-publish post-commit Notifier-hook failures (production no-op; surfaces in test rigs).",
+		}),
+		RetainedDispatchFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgmqtt_retained_dispatch_failed_total",
+			Help: "Per-filter retained-message dispatch failures during SUBSCRIBE handling, post-SUBACK.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -114,6 +207,17 @@ func New() *Metrics {
 		m.QuotaExceededTotal,
 		m.RateLimitedTotal,
 		m.PublishStageSeconds,
+		m.AuthFailuresTotal,
+		m.SubscribesTotal,
+		m.UnsubscribesTotal,
+		m.JanitorTickSeconds,
+		m.JanitorErrorsTotal,
+		m.Subscriptions,
+		m.Sessions,
+		m.RetainedCount,
+		m.InboundQoS2Pending,
+		m.WillsNotifyFailedTotal,
+		m.RetainedDispatchFailedTotal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

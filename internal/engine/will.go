@@ -29,8 +29,18 @@ func (e *Engine) PublishWill(ctx context.Context, topic string, payload []byte, 
 		return err
 	}
 	if err := e.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
-		e.logger.Error("will notify failed after retries; cross-pod subs may miss this will until next NOTIFY for this broker",
+		// In production the post-commit Notifier hook is a no-op
+		// (publishCore emits pg_notify in-tx) so this counter normally
+		// stays at zero. In tests using InProcessNotifier it surfaces
+		// rig-level cross-pod deliver failures. Either way: an operator
+		// alert on rate(pgmqtt_wills_notify_failed_total[5m]) > 0 is a
+		// signal worth investigating because at-least-once delivery for
+		// wills is no longer guaranteed for the cross-pod subs.
+		e.logger.Error("will notify failed; cross-pod subs may miss this will until next NOTIFY for this broker",
 			"msg", res.MessageID, "brokers", res.BrokerIDs, "err", err)
+		if e.metrics != nil {
+			e.metrics.WillsNotifyFailedTotal.Inc()
+		}
 	}
 	if len(res.OverflowClients) > 0 {
 		e.dispatchQuotaExceeded(ctx, res.OverflowClients)

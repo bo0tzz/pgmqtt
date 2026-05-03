@@ -235,6 +235,9 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 }
 
 func (c *Conn) writeConnackReject(pv byte, reason byte) error {
+	if c.eng.metrics != nil {
+		c.eng.metrics.AuthFailuresTotal.WithLabelValues(authReasonLabel(reason)).Inc()
+	}
 	pk := &packets.Packet{
 		FixedHeader:     packets.FixedHeader{Type: packets.Connack},
 		ProtocolVersion: pv,
@@ -257,6 +260,23 @@ func (c *Conn) writeConnackReject(pv byte, reason byte) error {
 	}
 	c.protocol = pv
 	return c.write(pk)
+}
+
+func authReasonLabel(reason byte) string {
+	switch reason {
+	case cackBadCredentials:
+		return "bad_credentials"
+	case cackNotAuthorized:
+		return "not_authorized"
+	case cackBadAuthMethod:
+		return "bad_auth_method"
+	case cackClientIDInvalid:
+		return "client_id_invalid"
+	case cackUnsupportedProtocol:
+		return "unsupported_protocol"
+	default:
+		return "other"
+	}
 }
 
 // takeOwnership performs the CONNECT take-over upsert. Returns the previous

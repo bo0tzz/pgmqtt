@@ -114,10 +114,21 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 	if err := c.write(resp); err != nil {
 		return err
 	}
+	if c.eng.metrics != nil {
+		c.eng.metrics.SubscribesTotal.Inc()
+	}
 
 	for _, d := range dispatches {
 		if err := c.dispatchRetainedForFilter(ctx, d.filter, d.opts); err != nil {
-			c.eng.logger.Warn("retained dispatch", "client", c.clientID, "filter", d.filter, "err", err)
+			// SUBACK already left the broker; the client cannot distinguish
+			// "no retained existed" from "retained existed but failed to
+			// deliver." Surface the counter so an operator can alert when
+			// retained-replay is silently broken for a subscriber.
+			c.eng.logger.Error("retained dispatch failed (post-SUBACK)",
+				"client", c.clientID, "filter", d.filter, "err", err)
+			if c.eng.metrics != nil {
+				c.eng.metrics.RetainedDispatchFailedTotal.Inc()
+			}
 		}
 	}
 	return nil

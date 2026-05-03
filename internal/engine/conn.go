@@ -852,7 +852,13 @@ func (c *Conn) handleUnsubscribe(ctx context.Context, pk *packets.Packet) error 
 		PacketID:    pk.PacketID,
 		ReasonCodes: codes,
 	}
-	return c.write(resp)
+	if err := c.write(resp); err != nil {
+		return err
+	}
+	if c.eng.metrics != nil {
+		c.eng.metrics.UnsubscribesTotal.Inc()
+	}
+	return nil
 }
 
 // jsonOrNil returns nil for an empty Properties to avoid storing empty JSONB.

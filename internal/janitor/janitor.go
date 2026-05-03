@@ -134,14 +134,22 @@ func (j *Janitor) tickWithRecover(ctx context.Context) (err error) {
 	return j.Tick(ctx)
 }
 
-// Tick runs one full scan cycle: dead-Pod detection + sweep.
+// Tick runs one full scan cycle: dead-Pod detection + sweep. Each sub-job
+// is timed and any error is counted on the per-job metrics, so an operator
+// can alert on a specific job degrading without parsing logs.
 func (j *Janitor) Tick(ctx context.Context) error {
-	dead, err := j.findDeadBrokers(ctx)
-	if err != nil {
+	var dead []uuid.UUID
+	if err := j.timed("find_dead_brokers", func() error {
+		var err error
+		dead, err = j.findDeadBrokers(ctx)
+		return err
+	}); err != nil {
 		return err
 	}
 	for _, id := range dead {
-		if err := j.handleDeadBroker(ctx, id); err != nil {
+		if err := j.timed("handle_dead_broker", func() error {
+			return j.handleDeadBroker(ctx, id)
+		}); err != nil {
 			j.logger.Warn("dead broker handling", "broker", id, "err", err)
 			continue
 		}
@@ -149,25 +157,58 @@ func (j *Janitor) Tick(ctx context.Context) error {
 			j.metrics.DeadBrokersTotal.Inc()
 		}
 	}
-	if err := j.fireDueWills(ctx); err != nil {
-		j.logger.Warn("fire due wills", "err", err)
+	_ = j.timed("fire_due_wills", func() error { return j.fireDueWills(ctx) })
+	_ = j.timed("expire_sessions", func() error { return j.expireSessions(ctx) })
+	_ = j.timed("expire_retained", func() error { return j.expireRetained(ctx) })
+	_ = j.timed("sweep_inbound_qos2", func() error { return j.sweepInboundQoS2(ctx) })
+	_ = j.timed("sweep_orphan_deliveries", func() error { return j.sweepOrphanDeliveries(ctx) })
+	_ = j.timed("refresh_deliveries_gauge", func() error { return j.refreshDeliveriesGauge(ctx) })
+	_ = j.timed("refresh_state_gauges", func() error { return j.refreshStateGauges(ctx) })
+	return j.timed("sweep_orphan_messages", func() error { return j.sweepOrphanMessages(ctx) })
+}
+
+// timed runs f and records its duration + error on the per-job metrics.
+// A nil j.metrics is fine — pre-metrics test cases still work.
+func (j *Janitor) timed(job string, f func() error) error {
+	start := time.Now()
+	err := f()
+	if j.metrics != nil {
+		j.metrics.JanitorTickSeconds.WithLabelValues(job).Observe(time.Since(start).Seconds())
+		if err != nil {
+			j.metrics.JanitorErrorsTotal.WithLabelValues(job).Inc()
+			j.logger.Warn("janitor sub-job", "job", job, "err", err)
+		}
+	} else if err != nil {
+		j.logger.Warn("janitor sub-job", "job", job, "err", err)
 	}
-	if err := j.expireSessions(ctx); err != nil {
-		j.logger.Warn("expire sessions", "err", err)
+	return err
+}
+
+// refreshStateGauges populates the per-table cardinality gauges
+// (subscriptions, sessions, retained, inbound_qos2). Cheap (one
+// indexed COUNT each) and gives operators a continuous view of
+// session/topic accumulation without touching the broker hot path.
+func (j *Janitor) refreshStateGauges(ctx context.Context) error {
+	if j.metrics == nil {
+		return nil
 	}
-	if err := j.expireRetained(ctx); err != nil {
-		j.logger.Warn("expire retained", "err", err)
+	queries := []struct {
+		sql   string
+		gauge interface{ Set(float64) }
+	}{
+		{`SELECT count(*) FROM subscriptions`, j.metrics.Subscriptions},
+		{`SELECT count(*) FROM sessions`, j.metrics.Sessions},
+		{`SELECT count(*) FROM retained`, j.metrics.RetainedCount},
+		{`SELECT count(*) FROM inbound_qos2`, j.metrics.InboundQoS2Pending},
 	}
-	if err := j.sweepInboundQoS2(ctx); err != nil {
-		j.logger.Warn("sweep inbound qos2", "err", err)
+	for _, q := range queries {
+		var n int64
+		if err := j.pool.QueryRow(ctx, q.sql).Scan(&n); err != nil {
+			return err
+		}
+		q.gauge.Set(float64(n))
 	}
-	if err := j.sweepOrphanDeliveries(ctx); err != nil {
-		j.logger.Warn("sweep orphan deliveries", "err", err)
-	}
-	if err := j.refreshDeliveriesGauge(ctx); err != nil {
-		j.logger.Warn("refresh deliveries gauge", "err", err)
-	}
-	return j.sweepOrphanMessages(ctx)
+	return nil
 }
 
 // refreshDeliveriesGauge re-populates pgmqtt_deliveries_inflight{state} once
