@@ -57,7 +57,10 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 			RetainHandling:    f.RetainHandling,
 			SubscriptionID:    subID,
 		}
-		if _, err := tx.Exec(ctx, `
+		// xmax=0 marks an INSERT; non-zero marks an UPDATE. We need this for
+		// retain handling option 1 ("send retained only on new subscription").
+		var subWasNew bool
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO subscriptions
 			    (client_id, topic_filter, qos, no_local, retain_as_published, retain_handling, subscription_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -67,7 +70,8 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 			    retain_as_published=EXCLUDED.retain_as_published,
 			    retain_handling=EXCLUDED.retain_handling,
 			    subscription_id=EXCLUDED.subscription_id
-		`, c.clientID, filter, f.Qos, f.NoLocal, f.RetainAsPublished, f.RetainHandling, nullInt(opts.SubscriptionID)); err != nil {
+			RETURNING (xmax = 0) AS new_row
+		`, c.clientID, filter, f.Qos, f.NoLocal, f.RetainAsPublished, f.RetainHandling, nullInt(opts.SubscriptionID)).Scan(&subWasNew); err != nil {
 			return err
 		}
 		switch f.Qos {
@@ -80,10 +84,20 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 		default:
 			codes = append(codes, subackUnspec)
 		}
-		// Retain handling: 0 = send retained on subscribe; 1 = send only on new sub; 2 = never.
-		// Without per-row "was this sub new?" bookkeeping in this v1 we treat
-		// 0 and 1 the same and skip retained on 2.
-		if f.RetainHandling != 2 {
+		// Retain handling:
+		//   0 = send retained on subscribe (always)
+		//   1 = send retained only on a new subscription
+		//   2 = never send retained on subscribe
+		shouldDispatchRetained := false
+		switch f.RetainHandling {
+		case 0:
+			shouldDispatchRetained = true
+		case 1:
+			shouldDispatchRetained = subWasNew
+		case 2:
+			shouldDispatchRetained = false
+		}
+		if shouldDispatchRetained {
 			dispatches = append(dispatches, retainedDispatch{filter: filter, opts: opts})
 		}
 	}

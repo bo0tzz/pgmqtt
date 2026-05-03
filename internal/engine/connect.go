@@ -57,9 +57,17 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 	c.clientID = clientID
 	c.cleanStart = pk.Connect.Clean
-	c.keepalive = time.Duration(pk.Connect.Keepalive) * time.Second
+	clientKeepalive := time.Duration(pk.Connect.Keepalive) * time.Second
+	c.keepalive = clientKeepalive
 	if c.keepalive == 0 {
 		c.keepalive = defaultKeepalive
+	}
+	// Server policy cap — for v5 we advertise the override via ServerKeepAlive.
+	const maxAllowedKeepalive = 60 * time.Second
+	keepaliveOverridden := false
+	if c.keepalive > maxAllowedKeepalive {
+		c.keepalive = maxAllowedKeepalive
+		keepaliveOverridden = true
 	}
 
 	// Authenticate. PGMQTT_ALLOW_ANONYMOUS=true skips this when no username
@@ -88,11 +96,22 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			c.willDelay = &d
 		}
 	}
-	// SessionExpiryInterval (v5). nil for v3.1.1.
+	// SessionExpiryInterval / ReceiveMaximum / MaximumPacketSize / TopicAliasMaximum (v5).
 	if pv == mqttwire.ProtocolMQTT5 {
 		v := int32(pk.Properties.SessionExpiryInterval)
 		c.sessionExpiry = &v
+		c.maxPacketSize = pk.Properties.MaximumPacketSize
+		c.receiveMaximum = pk.Properties.ReceiveMaximum
+		c.topicAliasMaximumOut = pk.Properties.TopicAliasMaximum
+		if c.topicAliasMaximumOut > 0 {
+			c.aliasOut = make(map[string]uint16)
+		}
 	}
+	if c.receiveMaximum == 0 {
+		c.receiveMaximum = 65535 // [MQTT-3.1.2-26] default
+	}
+	c.inflight = make(chan struct{}, c.receiveMaximum)
+	c.drainKick = make(chan struct{}, 1)
 
 	// Take ownership in a single transaction.
 	prevBroker, newSession, err := c.takeOwnership(ctx, pk)
@@ -153,6 +172,12 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		if pk.Connect.ClientIdentifier == "" {
 			cack.Properties.AssignedClientID = c.clientID
 		}
+		if keepaliveOverridden {
+			cack.Properties.ServerKeepAlive = uint16(c.keepalive / time.Second)
+			cack.Properties.ServerKeepAliveFlag = true
+		}
+		cack.Properties.ReceiveMaximum = serverReceiveMaximum
+		cack.Properties.TopicAliasMaximum = serverTopicAliasMaximum
 	}
 	if err := c.write(cack); err != nil {
 		return err
@@ -164,6 +189,10 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			c.eng.logger.Warn("drain queue", "client", c.clientID, "err", err)
 		}
 	}
+
+	// Background drain loop: when PUBACK/PUBCOMP frees an in-flight slot it
+	// kicks drainKick; we re-scan state=0 deliveries and send what fits.
+	go c.runDrainLoop(ctx)
 	return nil
 }
 

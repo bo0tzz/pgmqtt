@@ -35,15 +35,30 @@ type Conn struct {
 
 	writeMu sync.Mutex
 
-	keepalive     time.Duration
-	cleanStart    bool
-	willTopic     string
-	willPayload   []byte
-	willQoS       byte
-	willRetain    bool
-	willProps     []byte // jsonb-serialised v5 will properties
-	willDelay     *int32 // v5 WillDelayInterval (seconds); nil for v3.1.1
-	sessionExpiry *int32 // v5 SessionExpiryInterval (seconds); nil = "no value sent"
+	keepalive       time.Duration
+	cleanStart      bool
+	willTopic       string
+	willPayload     []byte
+	willQoS         byte
+	willRetain      bool
+	willProps       []byte // jsonb-serialised v5 will properties
+	willDelay       *int32 // v5 WillDelayInterval (seconds); nil for v3.1.1
+	sessionExpiry   *int32 // v5 SessionExpiryInterval (seconds); nil = "no value sent"
+	maxPacketSize   uint32 // v5 MaximumPacketSize the client will accept; 0 = no limit
+	receiveMaximum  uint16 // v5 ReceiveMaximum the client will accept; 65535 if unset
+	inflight        chan struct{} // token-bucket; capacity = receiveMaximum
+	drainKick       chan struct{} // single-slot signal to wake the drain loop
+
+	inboundInflight atomic.Int32 // QoS>0 PUBLISHes received, pre-PUBACK/PUBCOMP
+
+	// v5 topic alias maps. Outbound (server→client) aliases are allocated per
+	// connection up to the client-advertised topicAliasMaximumOut. Inbound
+	// (client→server) aliases are *not* accepted: serverTopicAliasMaximum=0,
+	// so the broker advertises 0 in CONNACK and rejects any inbound alias>0.
+	topicAliasMaximumOut uint16
+	aliasOutMu           sync.Mutex
+	aliasOut             map[string]uint16 // topic -> alias
+	aliasOutNext         uint16
 
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool
@@ -145,12 +160,185 @@ func (c *Conn) write(pk *packets.Packet) error {
 		return errors.New("conn closing")
 	}
 	pk.ProtocolVersion = c.protocol
+	if c.maxPacketSize > 0 {
+		// Encode once to size-check; mochi's MaxSize gating in WritePacket
+		// uses a similar approach.
+		buf, err := mqttwire.Encode(pk)
+		if err != nil {
+			return err
+		}
+		if uint32(len(buf)) > c.maxPacketSize {
+			return errPacketTooLarge
+		}
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		if err := c.nc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			return err
+		}
+		_, err = c.nc.Write(buf)
+		return err
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if err := c.nc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
 	return mqttwire.Write(c.nc, pk)
+}
+
+// serverReceiveMaximum is the limit we advertise to v5 clients. Clients that
+// exceed this with un-ACKed QoS>0 PUBLISHes get DISCONNECT 0x93. Tunable via
+// PGMQTT_RECEIVE_MAXIMUM later; 100 is plenty for a homelab broker.
+const serverReceiveMaximum uint16 = 100
+
+// serverTopicAliasMaximum is the value advertised to v5 clients in CONNACK.
+// 0 means the broker won't accept inbound topic aliases — clients that send a
+// PUBLISH with TopicAlias>0 get DISCONNECT 0x94. We don't currently maintain
+// inbound alias maps; outbound aliases (server→client) are supported when the
+// client advertises TopicAliasMaximum>0 in CONNECT.
+const serverTopicAliasMaximum uint16 = 0
+
+// resolveAliasForOutbound returns (alias, isNew). If the client advertised
+// TopicAliasMaximum=0, returns (0,false). Otherwise looks up an existing
+// alias or allocates a new one when capacity remains.
+func (c *Conn) resolveAliasForOutbound(topic string) (alias uint16, fresh bool) {
+	if c.topicAliasMaximumOut == 0 || c.aliasOut == nil {
+		return 0, false
+	}
+	c.aliasOutMu.Lock()
+	defer c.aliasOutMu.Unlock()
+	if a, ok := c.aliasOut[topic]; ok {
+		return a, false
+	}
+	if c.aliasOutNext >= c.topicAliasMaximumOut {
+		return 0, false
+	}
+	c.aliasOutNext++
+	c.aliasOut[topic] = c.aliasOutNext
+	return c.aliasOutNext, true
+}
+
+// errPacketTooLarge is returned by write when the encoded packet would
+// exceed the v5 MaximumPacketSize the receiver advertised. Caller should
+// drop the message and (for QoS>0) clean up the delivery row.
+var errPacketTooLarge = errors.New("encoded packet exceeds receiver's MaximumPacketSize")
+
+// tryAcquireInflight reserves a v5 ReceiveMaximum slot. Returns true if a
+// slot was taken; the caller must call returnInflight when the corresponding
+// PUBACK/PUBCOMP arrives. v3.1.1 connections always succeed (no flow ctrl).
+func (c *Conn) tryAcquireInflight() bool {
+	if c.protocol != mqttwire.ProtocolMQTT5 || c.inflight == nil {
+		return true
+	}
+	select {
+	case c.inflight <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// returnInflight releases a flow-control slot and kicks the drain loop.
+func (c *Conn) returnInflight() {
+	if c.inflight == nil {
+		return
+	}
+	select {
+	case <-c.inflight:
+	default:
+	}
+	if c.drainKick != nil {
+		select {
+		case c.drainKick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// runDrainLoop wakes on drainKick and tries to send any state=0 deliveries
+// for this client up to the in-flight cap.
+func (c *Conn) runDrainLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.closed:
+			return
+		case <-c.drainKick:
+			// Drain deliveries until we hit the cap or run out of queued rows.
+			for {
+				if c.closing.Load() {
+					return
+				}
+				done, err := c.drainOnce(ctx)
+				if err != nil {
+					c.eng.logger.Warn("drain", "client", c.clientID, "err", err)
+					break
+				}
+				if done {
+					break
+				}
+			}
+		}
+	}
+}
+
+// drainOnce sends a single queued delivery if a slot is available. Returns
+// done=true when there's nothing to send or no slot. The slot accounting is
+// done inside deliverOne — drainOnce just selects + dispatches.
+func (c *Conn) drainOnce(ctx context.Context) (done bool, err error) {
+	row := c.eng.pool.QueryRow(ctx, `
+		SELECT d.id, d.qos, d.state, d.packet_id,
+		       m.topic, m.payload, m.properties, m.retain, m.expires_at,
+		       COALESCE(
+		         (SELECT array_agg(s.subscription_id ORDER BY s.subscription_id)
+		            FROM subscriptions s
+		           WHERE s.client_id = d.client_id
+		             AND s.subscription_id IS NOT NULL
+		             AND mqtt_topic_match(s.topic_filter, m.topic)),
+		         '{}'::int[]) AS sub_ids,
+		       COALESCE(
+		         (SELECT bool_or(s.retain_as_published)
+		            FROM subscriptions s
+		           WHERE s.client_id = d.client_id
+		             AND mqtt_topic_match(s.topic_filter, m.topic)),
+		         false) AS retain_as_published
+		  FROM deliveries d JOIN messages m ON m.id = d.message_id
+		 WHERE d.client_id = $1 AND d.state = 0 AND d.qos > 0
+		   AND (m.expires_at IS NULL OR m.expires_at > now())
+		 ORDER BY d.id LIMIT 1
+	`, c.clientID)
+	var (
+		deliveryID        int64
+		qos, state        byte
+		packetID          *int
+		topic             string
+		payload           []byte
+		props             []byte
+		retain            bool
+		expiresAt         *time.Time
+		subIDs            []int
+		retainAsPublished bool
+	)
+	if err := row.Scan(&deliveryID, &qos, &state, &packetID, &topic, &payload, &props, &retain, &expiresAt, &subIDs, &retainAsPublished); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return true, err
+	}
+	wireRetain := false
+	if retainAsPublished {
+		wireRetain = retain
+	}
+	sent, err := c.eng.deliverOneTracked(ctx, deliveryID, c.clientID, qos, state, packetID, topic, payload, props, expiresAt, subIDs, wireRetain, false)
+	if err != nil {
+		return true, err
+	}
+	if !sent {
+		// No slot available; leave queued, runDrainLoop wakes again on PUBACK.
+		return true, nil
+	}
+	return false, nil
 }
 
 func (c *Conn) shutdown() {
@@ -307,6 +495,7 @@ func (c *Conn) handlePuback(ctx context.Context, pk *packets.Packet) error {
 	_, err := c.eng.pool.Exec(ctx,
 		`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=1`,
 		c.clientID, pk.PacketID)
+	c.returnInflight()
 	return err
 }
 
@@ -322,11 +511,12 @@ func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
 	})
 }
 
-// handlePubrel processes a publisher-side QoS-2 acknowledgement: the publisher
-// sent PUBLISH (state=publisher unfinished), got back PUBREC, sent PUBREL.
-// We respond with PUBCOMP. (We don't currently track inbound QoS-2 dedup —
-// noted as a gap in v1.)
-func (c *Conn) handlePubrel(_ context.Context, pk *packets.Packet) error {
+// handlePubrel completes the QoS-2 publisher-side handshake. The matching
+// row in inbound_qos2 is removed so the same packet_id may be reused.
+func (c *Conn) handlePubrel(ctx context.Context, pk *packets.Packet) error {
+	_, _ = c.eng.pool.Exec(ctx,
+		`DELETE FROM inbound_qos2 WHERE client_id=$1 AND packet_id=$2`,
+		c.clientID, pk.PacketID)
 	return c.write(&packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Pubcomp},
 		PacketID:    pk.PacketID,
@@ -337,6 +527,7 @@ func (c *Conn) handlePubcomp(ctx context.Context, pk *packets.Packet) error {
 	_, err := c.eng.pool.Exec(ctx,
 		`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=2`,
 		c.clientID, pk.PacketID)
+	c.returnInflight()
 	return err
 }
 
