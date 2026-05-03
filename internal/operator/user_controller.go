@@ -46,6 +46,10 @@ type UserReconciler struct {
 	ServiceHost string // e.g. "pgmqtt.mqtt.svc.cluster.local"
 	ServicePort int    // e.g. 1883
 	WSPort      int    // e.g. 8083
+
+	// BcryptCost overrides the cost used when hashing the User's password.
+	// 0 falls back to bcrypt.DefaultCost (10).
+	BcryptCost int
 }
 
 // SetupWithManager wires the controller for User into the manager.
@@ -106,7 +110,11 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, r.Status().Update(ctx, &user)
 	}
 
-	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	cost := r.BcryptCost
+	if cost == 0 {
+		cost = bcrypt.DefaultCost
+	}
+	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("bcrypt: %w", err)
 	}

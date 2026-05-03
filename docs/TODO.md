@@ -42,16 +42,19 @@ suggested below. Cross items off in this file as they ship.
         * Postgres pool stats from pgxpool.
       Add `metricsPort` in Helm + ServiceMonitor template.
 
-- [ ] **Configurable v5 server policy.** Hardcoded constants today:
-        * `serverReceiveMaximum = 100`
-        * `serverTopicAliasMaximum = 0`
-        * `maxAllowedKeepalive = 60s`
-      Move to env vars (`PGMQTT_RECEIVE_MAXIMUM`, `PGMQTT_TOPIC_ALIAS_MAXIMUM`,
-      `PGMQTT_KEEPALIVE_MAX_SEC`) and Helm values.
+- [x] **Configurable v5 server policy.** `PGMQTT_RECEIVE_MAXIMUM`,
+      `PGMQTT_TOPIC_ALIAS_MAXIMUM`, `PGMQTT_KEEPALIVE_MAX_SEC` and Helm
+      `v5.{receiveMaximum,topicAliasMaximum,keepaliveMaxSec}` plumb to
+      engine/conn/connect/publish via `Engine.serverReceiveMaximum()`
+      etc. Defaults preserve historical 100/0/60s.
 
-- [ ] **Bcrypt cost configurable.** Reconciler uses `bcrypt.DefaultCost`.
-      Add `PGMQTT_BCRYPT_COST` (default 10). Add a CLI flag in cmd to allow
-      one-off rotation if cost increases.
+- [x] **Bcrypt cost configurable.** `PGMQTT_BCRYPT_COST` (default 10),
+      validated 4..31 in `config.FromEnv`, plumbed through
+      `operator.Options.BcryptCost` to `UserReconciler.BcryptCost`. To
+      rehash an existing user at a new cost: bump the CR (e.g.
+      `kubectl annotate user/<name> pgmqtt.io/rotated-at=now --overwrite`)
+      to force reconcile; bcrypt verifies any cost embedded in the hash,
+      so existing rows continue to authenticate during the rollout.
 
 ## 2. Helm / k8s
 

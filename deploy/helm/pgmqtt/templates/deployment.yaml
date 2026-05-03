@@ -61,6 +61,14 @@ spec:
               value: {{ .Values.listeners.tcp.port | quote }}
             - name: PGMQTT_SERVICE_WS_PORT
               value: {{ .Values.listeners.ws.port | quote }}
+            - name: PGMQTT_RECEIVE_MAXIMUM
+              value: {{ .Values.v5.receiveMaximum | quote }}
+            - name: PGMQTT_TOPIC_ALIAS_MAXIMUM
+              value: {{ .Values.v5.topicAliasMaximum | quote }}
+            - name: PGMQTT_KEEPALIVE_MAX_SEC
+              value: {{ .Values.v5.keepaliveMaxSec | quote }}
+            - name: PGMQTT_BCRYPT_COST
+              value: {{ .Values.operator.bcryptCost | quote }}
           ports:
             {{- if .Values.listeners.tcp.enabled }}
             - name: mqtt

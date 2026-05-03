@@ -76,6 +76,7 @@ func main() {
 			ServiceHost: cfg.ServiceHost,
 			ServicePort: cfg.ServicePort,
 			WSPort:      cfg.WSPort,
+			BcryptCost:  cfg.BcryptCost,
 		}
 		if err := operator.Run(ctx, ld, pool, logger, opts); err != nil {
 			logger.Error("operator", "err", err)

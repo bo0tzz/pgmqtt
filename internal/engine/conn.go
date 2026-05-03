@@ -186,17 +186,34 @@ func (c *Conn) write(pk *packets.Packet) error {
 	return mqttwire.Write(c.nc, pk)
 }
 
-// serverReceiveMaximum is the limit we advertise to v5 clients. Clients that
-// exceed this with un-ACKed QoS>0 PUBLISHes get DISCONNECT 0x93. Tunable via
-// PGMQTT_RECEIVE_MAXIMUM later; 100 is plenty for a homelab broker.
-const serverReceiveMaximum uint16 = 100
+// V5 server policy. The broker advertises these in CONNACK and enforces them
+// during the session. Driven by config (see PGMQTT_RECEIVE_MAXIMUM /
+// PGMQTT_TOPIC_ALIAS_MAXIMUM / PGMQTT_KEEPALIVE_MAX_SEC). The defaults here
+// match the historical hardcoded values used pre-config plumbing.
 
-// serverTopicAliasMaximum is the value advertised to v5 clients in CONNACK.
-// 0 means the broker won't accept inbound topic aliases — clients that send a
-// PUBLISH with TopicAlias>0 get DISCONNECT 0x94. We don't currently maintain
-// inbound alias maps; outbound aliases (server→client) are supported when the
-// client advertises TopicAliasMaximum>0 in CONNECT.
-const serverTopicAliasMaximum uint16 = 0
+func (e *Engine) serverReceiveMaximum() uint16 {
+	if e.cfg != nil && e.cfg.V5ReceiveMaximum > 0 {
+		return e.cfg.V5ReceiveMaximum
+	}
+	return 100
+}
+
+// serverTopicAliasMaximum: 0 means we don't accept client-side aliases —
+// PUBLISH with TopicAlias>0 → DISCONNECT 0x94. Outbound aliases (server→
+// client) are supported when the client advertises TopicAliasMaximum>0.
+func (e *Engine) serverTopicAliasMaximum() uint16 {
+	if e.cfg != nil {
+		return e.cfg.V5TopicAliasMaximum
+	}
+	return 0
+}
+
+func (e *Engine) maxAllowedKeepalive() time.Duration {
+	if e.cfg != nil && e.cfg.V5KeepaliveMax > 0 {
+		return e.cfg.V5KeepaliveMax
+	}
+	return 60 * time.Second
+}
 
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised
 // TopicAliasMaximum=0, returns (0,false). Otherwise looks up an existing

@@ -27,7 +27,7 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	// effectively mean "always 1" so flow control would never trip.
 	if pk.FixedHeader.Qos > 0 && c.protocol == mqttwire.ProtocolMQTT5 {
 		current := c.inboundInflight.Add(1)
-		if uint16(current) > serverReceiveMaximum {
+		if uint16(current) > c.eng.serverReceiveMaximum() {
 			_ = c.write(&packets.Packet{
 				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
 				ReasonCode:  0x93, // Receive Maximum exceeded
@@ -40,7 +40,7 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	// so any client-side alias is a protocol violation per [MQTT-3.3.2-12].
 	if c.protocol == mqttwire.ProtocolMQTT5 && pk.Properties.TopicAliasFlag {
 		alias := pk.Properties.TopicAlias
-		if alias == 0 || alias > serverTopicAliasMaximum {
+		if alias == 0 || alias > c.eng.serverTopicAliasMaximum() {
 			_ = c.write(&packets.Packet{
 				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
 				ReasonCode:  0x94, // Topic Alias invalid

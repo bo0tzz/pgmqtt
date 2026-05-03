@@ -63,7 +63,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		c.keepalive = defaultKeepalive
 	}
 	// Server policy cap — for v5 we advertise the override via ServerKeepAlive.
-	const maxAllowedKeepalive = 60 * time.Second
+	maxAllowedKeepalive := c.eng.maxAllowedKeepalive()
 	keepaliveOverridden := false
 	if c.keepalive > maxAllowedKeepalive {
 		c.keepalive = maxAllowedKeepalive
@@ -176,8 +176,8 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			cack.Properties.ServerKeepAlive = uint16(c.keepalive / time.Second)
 			cack.Properties.ServerKeepAliveFlag = true
 		}
-		cack.Properties.ReceiveMaximum = serverReceiveMaximum
-		cack.Properties.TopicAliasMaximum = serverTopicAliasMaximum
+		cack.Properties.ReceiveMaximum = c.eng.serverReceiveMaximum()
+		cack.Properties.TopicAliasMaximum = c.eng.serverTopicAliasMaximum()
 	}
 	if err := c.write(cack); err != nil {
 		return err

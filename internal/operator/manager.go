@@ -25,6 +25,7 @@ type Options struct {
 	ServiceHost string
 	ServicePort int
 	WSPort      int
+	BcryptCost  int
 }
 
 // LeaderSignal is the subset of leader.Leader the operator depends on.
@@ -98,6 +99,7 @@ func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.L
 		ServiceHost: opts.ServiceHost,
 		ServicePort: opts.ServicePort,
 		WSPort:      opts.WSPort,
+		BcryptCost:  opts.BcryptCost,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup: %w", err)

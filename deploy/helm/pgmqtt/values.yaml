@@ -75,3 +75,16 @@ crds:
 ## to <release-name>.<namespace>.svc.cluster.local.
 operator:
   serviceHost: ""
+  ## Bcrypt cost used by the User reconciler when hashing passwords for the
+  ## broker's `users` table. Library default is 10.
+  bcryptCost: 10
+
+## v5 server policy. See protocol-spec links in docs/CONFORMANCE.md.
+##   receiveMaximum: cap on un-ACKed inbound QoS>0 PUBLISHes per conn.
+##   topicAliasMaximum: 0 means we reject inbound topic aliases entirely.
+##   keepaliveMaxSec: server cap on the negotiated keepalive interval; v5
+##                    clients are notified via the ServerKeepAlive property.
+v5:
+  receiveMaximum: 100
+  topicAliasMaximum: 0
+  keepaliveMaxSec: 60
