@@ -58,3 +58,60 @@ func TestFromEnvBcryptOutOfRange(t *testing.T) {
 		t.Fatal("expected error for bcrypt cost 3")
 	}
 }
+
+// TestFromEnvLogFormat covers the slog-handler selector. Unset / empty must
+// default to "text"; "text" and "json" are the only accepted values; any
+// other string is rejected with an error so misconfigured aggregators fail
+// fast instead of silently emitting the wrong format.
+func TestFromEnvLogFormat(t *testing.T) {
+	t.Run("default is text when unset", func(t *testing.T) {
+		t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+		c, err := FromEnv()
+		if err != nil {
+			t.Fatalf("FromEnv: %v", err)
+		}
+		if c.LogFormat != "text" {
+			t.Errorf("LogFormat default: got %q want \"text\"", c.LogFormat)
+		}
+	})
+	t.Run("empty string defaults to text", func(t *testing.T) {
+		t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+		t.Setenv("PGMQTT_LOG_FORMAT", "")
+		c, err := FromEnv()
+		if err != nil {
+			t.Fatalf("FromEnv: %v", err)
+		}
+		if c.LogFormat != "text" {
+			t.Errorf("LogFormat: got %q want \"text\"", c.LogFormat)
+		}
+	})
+	t.Run("text accepted", func(t *testing.T) {
+		t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+		t.Setenv("PGMQTT_LOG_FORMAT", "text")
+		c, err := FromEnv()
+		if err != nil {
+			t.Fatalf("FromEnv: %v", err)
+		}
+		if c.LogFormat != "text" {
+			t.Errorf("LogFormat: got %q want \"text\"", c.LogFormat)
+		}
+	})
+	t.Run("json accepted", func(t *testing.T) {
+		t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+		t.Setenv("PGMQTT_LOG_FORMAT", "json")
+		c, err := FromEnv()
+		if err != nil {
+			t.Fatalf("FromEnv: %v", err)
+		}
+		if c.LogFormat != "json" {
+			t.Errorf("LogFormat: got %q want \"json\"", c.LogFormat)
+		}
+	})
+	t.Run("yaml rejected", func(t *testing.T) {
+		t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+		t.Setenv("PGMQTT_LOG_FORMAT", "yaml")
+		if _, err := FromEnv(); err == nil {
+			t.Fatal("expected error for PGMQTT_LOG_FORMAT=yaml")
+		}
+	})
+}

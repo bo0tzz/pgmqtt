@@ -85,6 +85,8 @@ spec:
               value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
             - name: PGMQTT_PG_STATEMENT_TIMEOUT_MS
               value: {{ .Values.database.statementTimeoutMs | quote }}
+            - name: PGMQTT_LOG_FORMAT
+              value: {{ .Values.logging.format | quote }}
             {{- if .Values.auth.allowAnonymous }}
             - name: PGMQTT_ALLOW_ANONYMOUS
               value: "true"
