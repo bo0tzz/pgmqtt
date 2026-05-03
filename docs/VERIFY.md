@@ -58,9 +58,17 @@ results recorded in [docs/CONFORMANCE.md](CONFORMANCE.md). Last run:
 
 Soak (manual):
 
-- [x] 1k msg/s while killing a random Pod every 30 s; QoS-1 shows zero
-      loss; QoS-2 dedup holds. Implemented as `cmd/soak` plus
-      `scripts/soak.sh`; the latter wires the chaos loop and runs the
-      generator. See also `scripts/paho-multi-broker.sh` (3-Pod
-      conformance) and `scripts/ha-z2m-soak.sh` (HA + synthetic Z2M
-      under chaos).
+- [x] sustained QoS-1 / QoS-2 traffic while a chaos loop kills a random
+      broker Pod every 30 s; zero loss, dups in `[0, chaos × pubs]`
+      range as expected for at-least-once. Implemented as `cmd/soak`
+      plus `scripts/soak.sh` (chaos loop + generator). See also
+      `scripts/paho-multi-broker.sh` (3-Pod Paho conformance via
+      Service VIP).
+- [x] **rig cross-validation against Mosquitto.** Same `cmd/soak`
+      binary + same chaos shape, run against Mosquitto 2.x in
+      Docker. With `persistence true`, Mosquitto produces 0 lost / 0
+      dups across 5 broker restarts; with default config (no
+      persistence) the rig correctly reports the genuine Mosquitto
+      session loss rather than falsely attributing it to itself.
+      This hardens the claim that the rig's pgmqtt results are
+      broker-attributable, not rig-attributable.
