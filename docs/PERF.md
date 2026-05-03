@@ -143,6 +143,43 @@ unaffected.
   Postgres on dedicated WAL volumes will look different. Re-run on
   your shape before treating any of these numbers as a baseline.
 
+### Shape B, again, after the FK drop + partial index
+
+Same 5-publisher × `inflight=50` × 3-sub × 5000 msg/s shape on a
+fresh kind cluster, with migrations 0006 (drop
+`deliveries.client_id` FK) and 0007 (partial inflight-delivery index)
+applied:
+
+| Metric                       | Pre-fix    | Post-fix       | Δ          |
+| ---                          | ---        | ---            | ---        |
+| Total publishes / 90 s       | 9,242      | **25,820**     | **2.79×**  |
+| `mqtt_publish` mean          | 39.9 ms    | 16.1 ms        | 2.5×       |
+| `mqtt_next_packet_id` mean   | 6.1 ms     | 0.65 ms        | **9.4×**   |
+| `MultiXactMember` blks_read  | 2.4 M      | 0              | gone       |
+| `MultiXactOffset` blks_read  | 2.8 M      | 3              | gone       |
+| FK-trigger time (% of total) | 10.6%      | 0%             | gone       |
+
+The MultiXact SLRU thrash is **completely eliminated** as the
+deep-dive predicted. `mqtt_next_packet_id` got the full ~10× because
+its cost was wholly contention-bound. `mqtt_publish` only got 2.5×
+because the multixact path was one component — the
+`WITH matches AS (...) INSERT INTO deliveries` body itself takes
+~14.9 ms (now 19.8% of total PG time).
+
+After the fix, the new dominant hot path is `drainSessionQueue`'s
+resume scan in `internal/engine/deliver.go` (~36% of PG time at 501 ms
+mean). The query filters on `state IN (0,1,2)` which doesn't match
+the `state=0 AND qos>0` partial index, so it falls back to the
+broader `(client_id, state, id)` index and walks dead-tuple chains.
+Two follow-ups for that path:
+
+1. A second partial index `deliveries(client_id, id) WHERE state ≤ 2`
+   to cover the resume predicate.
+2. Investigate why subscribers are reconnecting ~5×/sec/sub under
+   load — likely chaos from rig DISCONNECTs, but if the production
+   shape sees the same churn, the resume query becomes a real
+   bottleneck.
+
 ## Common patterns
 
 **`tx_commit` dominates.** This is fsync. Either your disk is slow,
