@@ -165,7 +165,12 @@ resources:
   limits:
     memory: 512Mi
 
+## Annotations applied to every broker Pod template. Useful for things like
+## Prometheus scrape hints, Vault sidecar injection, or operator-required keys.
 podAnnotations: {}
+## Extra labels applied to every broker Pod (in addition to chart selector
+## labels). Selector labels are NOT extended by this — keep selector stability.
+podLabels: {}
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
@@ -180,9 +185,63 @@ securityContext:
     drop:
       - ALL
 
+## Image pull secrets referenced by the broker Pod spec. Pass a list of objects
+## with a `name` field, e.g. `[{name: my-registry-creds}]`.
+imagePullSecrets: []
+
+## Convenience knob that renders a soft (preferredDuringSchedulingIgnoredDuringExecution)
+## podAntiAffinity rule keyed on `kubernetes.io/hostname`, so replicas spread
+## across nodes when capacity allows but still schedule on a single node when
+## that's the only choice. Disabled by default; set `enabled: true` to opt in.
+##
+## For a hard rule (requiredDuringSchedulingIgnoredDuringExecution) or any
+## other non-trivial topology shape, leave this off and use `affinity` below.
+podAntiAffinity:
+  enabled: false
+  ## Weight applied to the preferred rule. Higher values bias the scheduler
+  ## more strongly toward spreading; 100 is the K8s convention for "this is
+  ## the only preference I'm expressing".
+  weight: 100
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
+## Pod-level topology spread constraints. Use to spread replicas across zones,
+## racks, or other topology keys. Each entry follows the standard K8s schema:
+##   topologySpreadConstraints:
+##     - maxSkew: 1
+##       topologyKey: topology.kubernetes.io/zone
+##       whenUnsatisfiable: ScheduleAnyway
+##       labelSelector:
+##         matchLabels:
+##           app.kubernetes.io/name: pgmqtt
+topologySpreadConstraints: []
+
+## PriorityClass for broker Pods. Empty string uses the cluster default
+## (typically zero priority). Set to `system-cluster-critical` or a custom
+## class to protect the broker during node pressure / preemption.
+priorityClassName: ""
+
+## Extra volumes attached to the broker Pod. Combined with extraVolumeMounts
+## below for things like CA bundles, additional credentials, or scratch tmpfs.
+##   extraVolumes:
+##     - name: ca-bundle
+##       configMap:
+##         name: my-ca-bundle
+extraVolumes: []
+
+## Extra volume mounts for the broker container. Pair with extraVolumes.
+##   extraVolumeMounts:
+##     - name: ca-bundle
+##       mountPath: /etc/ssl/certs/ca-bundle.crt
+##       subPath: ca-bundle.crt
+##       readOnly: true
+extraVolumeMounts: []
+
+## Grace period the kubelet honors after sending SIGTERM before SIGKILL.
+## The broker drains in-flight CONNACK/PUBLISH/SUBSCRIBE handlers and closes
+## connections cleanly during this window — bump for very large fan-outs.
+terminationGracePeriodSeconds: 30
 
 ## Liveness/readiness probe is a TCP connect to the MQTT port.
 probes:
