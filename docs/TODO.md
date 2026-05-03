@@ -152,8 +152,13 @@ suggested below. Cross items off in this file as they ship.
       (gh-pages branch, helm-charts repo) is for the human — the AI
       assistant doesn't perform external writes (push, gh-pages publish).
 
-- [ ] **Goreleaser** (or a hand-rolled `release.yml`) to push static
-      binaries on tag push.
+- [x] **Goreleaser** + matching workflow. `.goreleaser.yaml` produces
+      `pgmqttd_<version>_<os>_<arch>.tar.gz` for `linux/{amd64,arm64}`
+      and `darwin/{amd64,arm64}` plus a sha256 checksum file. The
+      `release` workflow runs on tag push with auto-publish disabled
+      so the maintainer reviews `dist/` before flipping `release.disable`
+      to false. Manual `workflow_dispatch` runs `--snapshot` for
+      dry-runs.
 
 - [ ] **Semver policy** + CHANGELOG discipline: docs/CHANGELOG.md exists,
       keep it up to date.
