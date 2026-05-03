@@ -6,7 +6,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
@@ -182,44 +181,35 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 	}
 
 	if qos > 0 {
-		var pid int
+		var pid uint16
 		if currentPacketID != nil && state >= 1 {
-			pid = *currentPacketID
+			pid = uint16(*currentPacketID)
 		} else {
-			// Race-safe state transition: only one caller may flip state=0→1.
-			// If RowsAffected==0 someone else already claimed the delivery —
-			// release the slot and skip.
-			tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
+			// Allocate a packet id from the per-Conn in-memory counter
+			// (replaces the per-delivery UPDATE on sessions.next_packet_id).
+			// The state=0→1 UPDATE below remains the race-safe claim — if
+			// RowsAffected==0 someone else already claimed the delivery,
+			// so we release the slot and skip.
+			allocated, err := conn.AllocPacketID(ctx)
 			if err != nil {
 				conn.returnInflight()
 				return false, err
 			}
-			row := tx.QueryRow(ctx, `SELECT mqtt_next_packet_id($1)`, clientID)
-			if err := row.Scan(&pid); err != nil {
-				_ = tx.Rollback(ctx)
-				conn.returnInflight()
-				return false, err
-			}
-			ct, err := tx.Exec(ctx, `
+			ct, err := e.pool.Exec(ctx, `
 				UPDATE deliveries SET packet_id=$1, state=1
 				 WHERE id=$2 AND state=0
-			`, pid, deliveryID)
+			`, int(allocated), deliveryID)
 			if err != nil {
-				_ = tx.Rollback(ctx)
 				conn.returnInflight()
 				return false, err
 			}
 			if ct.RowsAffected() == 0 {
-				_ = tx.Rollback(ctx)
 				conn.returnInflight()
 				return false, nil
 			}
-			if err := tx.Commit(ctx); err != nil {
-				conn.returnInflight()
-				return false, err
-			}
+			pid = allocated
 		}
-		pk.PacketID = uint16(pid)
+		pk.PacketID = pid
 	}
 
 	if err := conn.write(pk); err != nil {

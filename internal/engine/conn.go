@@ -72,6 +72,25 @@ type Conn struct {
 	rateMu     sync.Mutex
 	rateTokens int
 	rateLast   time.Time
+
+	// Outbound packet-id allocator. Per-Conn in-memory counter; replaces the
+	// per-delivery UPDATE on sessions.next_packet_id (which caused HOT-update
+	// bloat over hours of operation). MQTT requires uniqueness only across
+	// in-flight packets — durability across crashes is not required, so a
+	// per-Conn counter seeded from MAX(packet_id) on takeover is sufficient.
+	// Seeded lazily on first use under packetIDSeedMu so the seeding query
+	// runs AFTER any clean-session DELETE has been committed. Transient
+	// seed-time errors don't latch — the next AllocPacketID call retries the
+	// seed. Once seeded successfully, packetIDSeeded is set and the lock is
+	// no longer entered on the hot path.
+	//
+	// packetIDState holds the last *raw* counter value; AllocPacketID does
+	// Add(1) and maps the result to 1..65535 via ((v-1)%65535)+1, which
+	// skips 0 (reserved per spec) and wraps cleanly. Seed-on-takeover
+	// stores MAX(packet_id) so the first allocation is MAX+1.
+	packetIDSeedMu sync.Mutex
+	packetIDSeeded atomic.Bool
+	packetIDState  atomic.Uint32
 }
 
 func newConn(e *Engine, nc net.Conn) *Conn {
@@ -328,6 +347,109 @@ func (c *Conn) resolveAliasForOutbound(topic string) (alias uint16, fresh bool) 
 // exceed the v5 MaximumPacketSize the receiver advertised. Caller should
 // drop the message and (for QoS>0) clean up the delivery row.
 var errPacketTooLarge = errors.New("encoded packet exceeds receiver's MaximumPacketSize")
+
+// allocPacketIDMaxRetries bounds the collision-retry loop in AllocPacketID.
+// Collisions only occur when an existing un-acked delivery already holds the
+// candidate id — they should be vanishingly rare given the seed comes from
+// MAX(packet_id) on takeover, but we still need a bound so a fully-saturated
+// in-flight space (65k un-acked) returns an error rather than spinning.
+const allocPacketIDMaxRetries = 8
+
+// errNoPacketID is returned when AllocPacketID can't find a free id within
+// allocPacketIDMaxRetries attempts. Callers should fail the delivery — the
+// in-flight space for the client is effectively exhausted.
+var errNoPacketID = errors.New("no free packet id (in-flight space exhausted)")
+
+// ensurePacketIDSeeded runs the one-shot MAX(packet_id) lookup if not yet
+// done. Returns the previous error so callers can distinguish "seed failed,
+// retry next call" from "seed already done, proceed". Transient seed errors
+// (context cancelled, DB hiccup) leave packetIDSeeded=false so the next
+// AllocPacketID call retries.
+func (c *Conn) ensurePacketIDSeeded(ctx context.Context) error {
+	if c.packetIDSeeded.Load() {
+		return nil
+	}
+	c.packetIDSeedMu.Lock()
+	defer c.packetIDSeedMu.Unlock()
+	if c.packetIDSeeded.Load() {
+		return nil
+	}
+	var seed *int
+	if err := c.eng.pool.QueryRow(ctx, `
+		SELECT MAX(packet_id) FROM deliveries
+		 WHERE client_id=$1 AND packet_id IS NOT NULL
+	`, c.clientID).Scan(&seed); err != nil {
+		return err
+	}
+	v := uint32(0)
+	if seed != nil {
+		s := *seed
+		if s < 0 {
+			s = 0
+		}
+		if s > 65535 {
+			s = 65535
+		}
+		v = uint32(s)
+	}
+	c.packetIDState.Store(v)
+	c.packetIDSeeded.Store(true)
+	return nil
+}
+
+// nextPacketIDCandidate returns the next id in the wrap-modulo-65535 cycle
+// (1..65535, skipping 0). Atomic increment; safe under concurrent callers.
+func (c *Conn) nextPacketIDCandidate() uint16 {
+	v := c.packetIDState.Add(1)
+	// Map to 1..65535. ((v-1) mod 65535) + 1 avoids 0 (reserved per spec)
+	// and wraps cleanly when v exceeds uint32 range — though uint32 won't
+	// realistically wrap (~136 years at 1G allocs/s).
+	return uint16(((v-1)%65535)+1)
+}
+
+// AllocPacketID returns the next packet id for an outbound QoS>0 delivery on
+// this Conn. Lazy-seeds from MAX(deliveries.packet_id) on first use, so a
+// resumed session never hands out an id that's still in flight from a prior
+// connection. On collision (rare), the candidate is incremented and retried
+// up to allocPacketIDMaxRetries times before returning errNoPacketID.
+//
+// The pid is reserved in the same caller's UPDATE deliveries WHERE state=0
+// transaction — collisions surface there as a unique-violation, not here.
+// This method only screens against *currently-known* un-acked rows; the SQL
+// transition is the source of truth.
+func (c *Conn) AllocPacketID(ctx context.Context) (uint16, error) {
+	if err := c.ensurePacketIDSeeded(ctx); err != nil {
+		return 0, err
+	}
+	for i := 0; i < allocPacketIDMaxRetries; i++ {
+		pid := c.nextPacketIDCandidate()
+		taken, err := c.packetIDInUse(ctx, pid)
+		if err != nil {
+			return 0, err
+		}
+		if !taken {
+			return pid, nil
+		}
+	}
+	return 0, errNoPacketID
+}
+
+// packetIDInUse reports whether (clientID, pid) already exists in deliveries.
+// Used by AllocPacketID's collision-retry loop. Cheap: covered by the
+// (client_id, packet_id) unique partial index.
+func (c *Conn) packetIDInUse(ctx context.Context, pid uint16) (bool, error) {
+	var exists bool
+	err := c.eng.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+		  SELECT 1 FROM deliveries
+		   WHERE client_id=$1 AND packet_id=$2
+		)
+	`, c.clientID, int(pid)).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
 
 // tryAcquireInflight reserves a v5 ReceiveMaximum slot. Returns true if a
 // slot was taken; the caller must call returnInflight when the corresponding
