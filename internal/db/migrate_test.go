@@ -64,6 +64,31 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigrateConcurrent(t *testing.T) {
+	t.Parallel()
+	// Two pods racing to migrate the same fresh database — neither should fail.
+	url := dbtest.FreshURL(t)
+	ctx := context.Background()
+	const n = 4
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			pool, err := db.Open(ctx, url)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer pool.Close()
+			errs <- db.Migrate(ctx, pool)
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migrate: %v", err)
+		}
+	}
+}
+
 func TestNextPacketID(t *testing.T) {
 	t.Parallel()
 	pool := dbtest.FreshPool(t)

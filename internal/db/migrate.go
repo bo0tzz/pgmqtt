@@ -15,11 +15,31 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+// migrateLockKey is a stable bigint distinct from leader.LeaderKey. It is held
+// for the duration of a Migrate call so that concurrent Pods don't double-apply
+// (and double-fail with unique-constraint races on `CREATE TABLE`).
+const migrateLockKey int64 = 0x70676d717474_0001
+
 // Migrate applies any unapplied migrations from the embedded `migrations` directory
 // in lexical order. Each migration runs in a single transaction and the version is
-// recorded in `schema_migrations`.
+// recorded in `schema_migrations`. Safe to call concurrently from multiple Pods —
+// callers serialise on a session-scoped Postgres advisory lock.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migrate conn: %w", err)
+	}
+	defer conn.Release()
+
+	// pg_advisory_lock serialises on a session — held until the connection is
+	// released. We use a dedicated conn from the pool so the lock doesn't
+	// linger past Migrate returning.
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
+		return fmt.Errorf("acquire migrate lock: %w", err)
+	}
+	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrateLockKey)
+
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
@@ -30,13 +50,13 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, f := range files {
 		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, f.version).Scan(&exists); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, f.version).Scan(&exists); err != nil {
 			return fmt.Errorf("check %s: %w", f.version, err)
 		}
 		if exists {
 			continue
 		}
-		if err := applyMigration(ctx, pool, f); err != nil {
+		if err := applyMigrationOnConn(ctx, conn.Conn(), f); err != nil {
 			return err
 		}
 	}
@@ -71,8 +91,8 @@ func readMigrations() ([]migration, error) {
 	return out, nil
 }
 
-func applyMigration(ctx context.Context, pool *pgxpool.Pool, m migration) error {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+func applyMigrationOnConn(ctx context.Context, conn *pgx.Conn, m migration) error {
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin %s: %w", m.version, err)
 	}

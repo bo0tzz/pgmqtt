@@ -99,5 +99,3 @@ spec:
                     - name
                 observedSecretHash:
                   type: string
-          required:
-            - spec
