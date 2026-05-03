@@ -33,6 +33,9 @@ Keys to look for in `/metrics`:
 - `pgmqtt_pgx_in_use_conns` near `pgmqtt_pgx_total_conns` for sustained periods → pool exhausted.
 - `pgmqtt_deliveries_inflight{state="queued"}` climbing over many scrapes → slow-consumer / dead-broker scenario.
 - `pgmqtt_rate_limited_total` increasing → review `PGMQTT_MAX_INBOUND_MSGS_PER_SEC`.
+- `pgmqtt_publish_seconds{stage}` — per-stage latency for the inbound
+  PUBLISH path. See [`PERF.md`](PERF.md) for what each stage covers and
+  how to read the breakdown when PUBACK latency creeps up.
 
 ## "Leader stuck" — janitor + reconciler stop running
 
