@@ -89,7 +89,7 @@ func FreshPool(t *testing.T) *pgxpool.Pool {
 	admin.Close()
 
 	url := replaceDBName(s.URL, dbName)
-	pool, err := db.Open(ctx, url)
+	pool, err := db.Open(ctx, url, db.Options{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -131,7 +131,7 @@ func FreshURL(t *testing.T) string {
 	admin.Close()
 
 	url := replaceDBName(s.URL, dbName)
-	pool, err := db.Open(ctx, url)
+	pool, err := db.Open(ctx, url, db.Options{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

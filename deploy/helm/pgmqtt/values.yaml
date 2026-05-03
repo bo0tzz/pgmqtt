@@ -15,6 +15,10 @@ database:
   url: ""
   existingSecret: ""
   existingSecretKey: "url"
+  ## Per-statement timeout (ms) applied to every connection from the
+  ## broker's pgxpool. Bounds wedged Postgres so publisher dispatch
+  ## can't hang past keepalive. 0 disables (PG default).
+  statementTimeoutMs: 30000
 
 ## TCP / WS listener configuration.
 listeners:

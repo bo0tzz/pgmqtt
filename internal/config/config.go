@@ -61,6 +61,16 @@ type Config struct {
 	// MetricsAddr is the bind address for the Prometheus /metrics endpoint.
 	// Empty disables metrics serving entirely.
 	MetricsAddr string
+
+	// PGStatementTimeout bounds individual SQL statements on connections
+	// from the broker's pgxpool. Wedged Postgres (network blip, replica
+	// catch-up, lock storm) would otherwise hang publisher dispatch
+	// indefinitely — keepalive only re-arms between dispatch iterations,
+	// so a stuck COMMIT bypasses it. 0 disables the timeout (matches PG
+	// default). The dedicated listener and leader connections take the
+	// same setting; LISTEN itself is instant, so WaitForNotification is
+	// unaffected.
+	PGStatementTimeout time.Duration
 }
 
 func FromEnv() (*Config, error) {
@@ -81,6 +91,7 @@ func FromEnv() (*Config, error) {
 		MaxConnections:               getenvInt("PGMQTT_MAX_CONNECTIONS", 5000),
 		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
 		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
+		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")
@@ -93,6 +104,9 @@ func FromEnv() (*Config, error) {
 	}
 	if c.BcryptCost < 4 || c.BcryptCost > 31 {
 		return nil, fmt.Errorf("PGMQTT_BCRYPT_COST must be between 4 and 31")
+	}
+	if c.PGStatementTimeout < 0 {
+		return nil, fmt.Errorf("PGMQTT_PG_STATEMENT_TIMEOUT_MS must be >= 0")
 	}
 	return c, nil
 }

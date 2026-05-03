@@ -2,7 +2,9 @@ package db_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/db/dbtest"
@@ -64,6 +66,51 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestStatementTimeoutFires(t *testing.T) {
+	t.Parallel()
+	url := dbtest.FreshURL(t)
+	ctx := context.Background()
+	pool, err := db.Open(ctx, url, db.Options{StatementTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer pool.Close()
+
+	// pg_sleep(1) should be cancelled by the 100ms statement_timeout.
+	// The exact error message comes from PG ("canceling statement due to
+	// statement timeout") via SQLSTATE 57014.
+	start := time.Now()
+	_, err = pool.Exec(ctx, `SELECT pg_sleep(1)`)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected statement_timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "57014") && !strings.Contains(err.Error(), "statement timeout") {
+		t.Fatalf("expected statement_timeout error, got %T: %v", err, err)
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("statement ran for %v, expected ~100ms", elapsed)
+	}
+}
+
+func TestStatementTimeoutZeroDoesNotSet(t *testing.T) {
+	t.Parallel()
+	url := dbtest.FreshURL(t)
+	ctx := context.Background()
+	pool, err := db.Open(ctx, url, db.Options{StatementTimeout: 0})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer pool.Close()
+
+	// With timeout=0, statement_timeout falls back to PG's default (0 = no
+	// limit) — a quick query that would otherwise be killed by a tiny
+	// timeout should complete cleanly.
+	if _, err := pool.Exec(ctx, `SELECT pg_sleep(0.05)`); err != nil {
+		t.Fatalf("sleep with no timeout: %v", err)
+	}
+}
+
 func TestMigrateConcurrent(t *testing.T) {
 	t.Parallel()
 	// Two pods racing to migrate the same fresh database — neither should fail.
@@ -73,7 +120,7 @@ func TestMigrateConcurrent(t *testing.T) {
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			pool, err := db.Open(ctx, url)
+			pool, err := db.Open(ctx, url, db.Options{})
 			if err != nil {
 				errs <- err
 				return

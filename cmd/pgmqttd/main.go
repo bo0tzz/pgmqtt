@@ -34,7 +34,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	pool, err := db.Open(ctx, cfg.DatabaseURL, db.Options{
+		StatementTimeout: cfg.PGStatementTimeout,
+	})
 	if err != nil {
 		logger.Error("db open", "err", err)
 		os.Exit(1)
