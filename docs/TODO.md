@@ -95,11 +95,17 @@ suggested below. Cross items off in this file as they ship.
       10 minutes → assert HA entity state never marked stale beyond
       `keepalive + grace`.
 
-- [ ] **`go test -cover` summary.** Add `make coverage` and post the
-      summary to CI. Aim for ≥75% on each `internal/` package.
-
-- [ ] **Race-mode CI.** Run `go test -race` in CI (we run it locally; CI
-      currently doesn't).
+- [x] **`go test -cover` summary.** `make coverage` writes
+      `coverage.out`/`.txt`. CI runs it and uploads as artifact. Total
+      48% — internal/listener (83%) > internal/config (79%) >
+      internal/leader (75%) > internal/db (70%) > internal/mqtt (67%) >
+      internal/engine (56%) > internal/janitor (56%) > internal/operator
+      (52%) > internal/metrics (29%). Lift the laggards in a follow-up.
+- [x] **Race-mode CI.** `make test-race` and the equivalent CI step run
+      `go test -race` across the whole tree. Caught real races in the
+      runtime-tunable knobs (cfg fields read by accept loop while a test
+      setter mutated them); fix in the same commit moves the knobs to
+      atomic.Int64 fields on Engine.
 
 ## 4. Paho upstream
 

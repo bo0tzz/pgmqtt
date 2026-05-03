@@ -28,6 +28,25 @@ jobs:
       - name: go test
         run: go test ./... -count=1 -timeout 5m
 
+      - name: go test -race
+        # Race detector caught a real listener bug (concurrent listeners map
+        # access) during development; we keep it in CI on a separate run so
+        # signal stays clear. Slower (~2x) and slightly higher-mem; fine for CI.
+        run: go test ./... -count=1 -race -timeout 10m
+
+      - name: coverage report
+        run: |
+          go test ./... -count=1 -coverprofile=coverage.out -covermode=atomic -timeout 10m
+          go tool cover -func=coverage.out | tee coverage.txt
+
+      - name: upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+
   helm:
     name: helm-lint
     runs-on: ubuntu-latest

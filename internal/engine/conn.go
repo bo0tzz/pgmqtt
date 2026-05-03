@@ -91,10 +91,7 @@ func newConn(e *Engine, nc net.Conn) *Conn {
 // maxInboundRate returns the per-conn rate-limit (msgs/s) for inbound
 // PUBLISH/SUBSCRIBE. 0 disables the limit.
 func (e *Engine) maxInboundRate() int {
-	if e.cfg == nil {
-		return 0
-	}
-	return e.cfg.MaxInboundMsgsPerSec
+	return int(e.maxInboundRateAtomic.Load())
 }
 
 func (c *Conn) run(ctx context.Context) {
@@ -258,12 +255,13 @@ func (c *Conn) write(pk *packets.Packet) error {
 
 // V5 server policy. The broker advertises these in CONNACK and enforces them
 // during the session. Driven by config (see PGMQTT_RECEIVE_MAXIMUM /
-// PGMQTT_TOPIC_ALIAS_MAXIMUM / PGMQTT_KEEPALIVE_MAX_SEC). The defaults here
-// match the historical hardcoded values used pre-config plumbing.
+// PGMQTT_TOPIC_ALIAS_MAXIMUM / PGMQTT_KEEPALIVE_MAX_SEC). Stored as atomics
+// so the test setters don't race the accept loop. The defaults here match
+// the historical hardcoded values used pre-config plumbing.
 
 func (e *Engine) serverReceiveMaximum() uint16 {
-	if e.cfg != nil && e.cfg.V5ReceiveMaximum > 0 {
-		return e.cfg.V5ReceiveMaximum
+	if v := e.receiveMaxV5Atomic.Load(); v > 0 {
+		return uint16(v)
 	}
 	return 100
 }
@@ -272,15 +270,12 @@ func (e *Engine) serverReceiveMaximum() uint16 {
 // PUBLISH with TopicAlias>0 → DISCONNECT 0x94. Outbound aliases (server→
 // client) are supported when the client advertises TopicAliasMaximum>0.
 func (e *Engine) serverTopicAliasMaximum() uint16 {
-	if e.cfg != nil {
-		return e.cfg.V5TopicAliasMaximum
-	}
-	return 0
+	return uint16(e.topicAliasMaxV5Atomic.Load())
 }
 
 func (e *Engine) maxAllowedKeepalive() time.Duration {
-	if e.cfg != nil && e.cfg.V5KeepaliveMax > 0 {
-		return e.cfg.V5KeepaliveMax
+	if v := e.keepaliveMaxV5Atomic.Load(); v > 0 {
+		return time.Duration(v)
 	}
 	return 60 * time.Second
 }
@@ -288,36 +283,24 @@ func (e *Engine) maxAllowedKeepalive() time.Duration {
 // maxQueuedDeliveries is the per-client cap on the deliveries table. 0 means
 // no cap (the SQL function treats 0 as unlimited).
 func (e *Engine) maxQueuedDeliveries() int {
-	if e.cfg != nil {
-		return e.cfg.MaxQueuedDeliveriesPerClient
-	}
-	return 0
+	return int(e.maxQueuedAtomic.Load())
 }
 
 // SetMaxQueuedDeliveriesForTest overrides the per-client deliveries cap.
 // Test-only; production code reads from config.
 func (e *Engine) SetMaxQueuedDeliveriesForTest(n int) {
-	if e.cfg == nil {
-		return
-	}
-	e.cfg.MaxQueuedDeliveriesPerClient = n
+	e.maxQueuedAtomic.Store(int64(n))
 }
 
 // SetMaxConnectionsForTest overrides the per-Pod connection cap. Test-only.
 func (e *Engine) SetMaxConnectionsForTest(n int) {
-	if e.cfg == nil {
-		return
-	}
-	e.cfg.MaxConnections = n
+	e.maxConnsAtomic.Store(int64(n))
 }
 
 // SetMaxInboundRateForTest overrides the per-conn inbound msgs/s rate.
 // Test-only.
 func (e *Engine) SetMaxInboundRateForTest(n int) {
-	if e.cfg == nil {
-		return
-	}
-	e.cfg.MaxInboundMsgsPerSec = n
+	e.maxInboundRateAtomic.Store(int64(n))
 }
 
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised

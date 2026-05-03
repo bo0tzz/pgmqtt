@@ -68,6 +68,15 @@ type Engine struct {
 	conns       map[string]*Conn // client_id -> *Conn
 	openConns   atomic.Int64     // accepted-but-not-yet-closed sockets, regardless of CONNECT state
 
+	// Runtime-tunable knobs. Stored as atomics so test setters don't race
+	// with the accept loop / dispatch path. Populated from cfg in New().
+	maxConnsAtomic        atomic.Int64
+	maxQueuedAtomic       atomic.Int64
+	maxInboundRateAtomic  atomic.Int64
+	receiveMaxV5Atomic    atomic.Int64
+	topicAliasMaxV5Atomic atomic.Int64
+	keepaliveMaxV5Atomic  atomic.Int64 // nanoseconds
+
 	listenersMu  sync.RWMutex
 	tcpListener  net.Listener
 	wsListener   net.Listener
@@ -83,7 +92,7 @@ type Engine struct {
 // New constructs an Engine. SetBrokerID must be called before Serve so
 // publishes know who they are.
 func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*Engine, error) {
-	return &Engine{
+	e := &Engine{
 		cfg:            cfg,
 		pool:           pool,
 		logger:         logger,
@@ -93,7 +102,16 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		notify:         &localNotifier{},
 		takeover:       noopTakeover{},
 		quota:          noopQuota{},
-	}, nil
+	}
+	if cfg != nil {
+		e.maxConnsAtomic.Store(int64(cfg.MaxConnections))
+		e.maxQueuedAtomic.Store(int64(cfg.MaxQueuedDeliveriesPerClient))
+		e.maxInboundRateAtomic.Store(int64(cfg.MaxInboundMsgsPerSec))
+		e.receiveMaxV5Atomic.Store(int64(cfg.V5ReceiveMaximum))
+		e.topicAliasMaxV5Atomic.Store(int64(cfg.V5TopicAliasMaximum))
+		e.keepaliveMaxV5Atomic.Store(int64(cfg.V5KeepaliveMax))
+	}
+	return e, nil
 }
 
 // SetBrokerID is called by the listener after the Pod's UUID is assigned.
@@ -344,13 +362,14 @@ func isClosedNetErr(err error) bool {
 // tryReserveConn atomically reserves a slot if under cap. Returns false when
 // MaxConnections is configured and at-cap.
 func (e *Engine) tryReserveConn() bool {
-	if e.cfg == nil || e.cfg.MaxConnections <= 0 {
+	cap := e.maxConnsAtomic.Load()
+	if cap <= 0 {
 		e.openConns.Add(1)
 		return true
 	}
 	for {
 		cur := e.openConns.Load()
-		if int(cur) >= e.cfg.MaxConnections {
+		if cur >= cap {
 			return false
 		}
 		if e.openConns.CompareAndSwap(cur, cur+1) {

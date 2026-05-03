@@ -1,4 +1,4 @@
-.PHONY: build test vet lint helm-lint docker docker-multi smoke clean
+.PHONY: build test test-race coverage vet lint helm-lint docker docker-multi smoke clean
 
 BINARY := pgmqttd
 PKG := github.com/bo0tzz/pgmqtt
@@ -11,6 +11,15 @@ build:
 
 test:
 	go test ./... -count=1 -timeout 5m
+
+test-race:
+	go test ./... -count=1 -race -timeout 10m
+
+# Outputs a per-package summary (`coverage.txt`) plus the raw profile
+# (`coverage.out`). CI uploads both as a build artifact.
+coverage:
+	go test ./... -count=1 -coverprofile=coverage.out -covermode=atomic -timeout 10m
+	go tool cover -func=coverage.out | tee coverage.txt
 
 vet:
 	go vet ./...
