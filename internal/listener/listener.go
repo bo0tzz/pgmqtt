@@ -83,6 +83,10 @@ func Start(parentCtx context.Context, url string, eng *engine.Engine, logger *sl
 		_ = conn.Close(parentCtx)
 		return nil, fmt.Errorf("listen takeover: %w", err)
 	}
+	if _, err := conn.Exec(parentCtx, `LISTEN `+quotaChannel(id)); err != nil {
+		_ = conn.Close(parentCtx)
+		return nil, fmt.Errorf("listen quota: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	l := &Listener{
@@ -117,6 +121,7 @@ func (l *Listener) run(ctx context.Context) {
 	defer close(l.doneCh)
 	pubCh := unquotedPub(l.uuid)
 	takeoverCh := unquotedTakeover(l.uuid)
+	quotaCh := unquotedQuota(l.uuid)
 
 	for {
 		notif, err := l.conn.WaitForNotification(ctx)
@@ -145,6 +150,8 @@ func (l *Listener) run(ctx context.Context) {
 				l.logger.Info("takeover from peer", "client", notif.Payload)
 				c.Shutdown()
 			}
+		case quotaCh:
+			l.eng.QuotaExceededLocally(notif.Payload)
 		}
 	}
 }
@@ -156,9 +163,13 @@ func (l *Listener) run(ctx context.Context) {
 
 func pubChannel(id uuid.UUID) string      { return `"` + unquotedPub(id) + `"` }
 func takeoverChannel(id uuid.UUID) string { return `"` + unquotedTakeover(id) + `"` }
+func quotaChannel(id uuid.UUID) string    { return `"` + unquotedQuota(id) + `"` }
 func unquotedPub(id uuid.UUID) string     { return "pgmqtt_" + id.String() }
 func unquotedTakeover(id uuid.UUID) string {
 	return "pgmqtt_takeover_" + id.String()
+}
+func unquotedQuota(id uuid.UUID) string {
+	return "pgmqtt_quota_" + id.String()
 }
 
 func acquireBrokerLock(ctx context.Context, conn *pgx.Conn, id uuid.UUID) error {

@@ -215,6 +215,24 @@ func (e *Engine) maxAllowedKeepalive() time.Duration {
 	return 60 * time.Second
 }
 
+// maxQueuedDeliveries is the per-client cap on the deliveries table. 0 means
+// no cap (the SQL function treats 0 as unlimited).
+func (e *Engine) maxQueuedDeliveries() int {
+	if e.cfg != nil {
+		return e.cfg.MaxQueuedDeliveriesPerClient
+	}
+	return 0
+}
+
+// SetMaxQueuedDeliveriesForTest overrides the per-client deliveries cap.
+// Test-only; production code reads from config.
+func (e *Engine) SetMaxQueuedDeliveriesForTest(n int) {
+	if e.cfg == nil {
+		return
+	}
+	e.cfg.MaxQueuedDeliveriesPerClient = n
+}
+
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised
 // TopicAliasMaximum=0, returns (0,false). Otherwise looks up an existing
 // alias or allocates a new one when capacity remains.

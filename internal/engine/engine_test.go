@@ -293,3 +293,55 @@ func TestWillSuppressedOnGraceful(t *testing.T) {
 		t.Fatalf("graceful disconnect must suppress will, got publish %q", pk.Payload)
 	}
 }
+
+// TestSlowSubscriberQuotaExceeded forces a subscriber's pending-deliveries
+// queue past the cap and asserts the broker DISCONNECTs them with reason
+// 0x97 (Quota Exceeded). The QoS-0 drop branch is exercised in the same
+// scenario by separately publishing a QoS-0 message past the cap.
+func TestSlowSubscriberQuotaExceeded(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetMaxQueuedDeliveriesForTest(2)
+
+	sub := h.Connect(t, "slow-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "bp/#", 1)
+
+	// Pre-fill the deliveries table so the next publish overflows. Insert two
+	// dummy messages and two delivery rows pointing at them.
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		var msgID int64
+		if err := h.Pool.QueryRow(ctx, `
+			INSERT INTO messages(topic, payload, qos, retain) VALUES ('bp/x', $1, 1, false)
+			RETURNING id`, []byte("seed")).Scan(&msgID); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+		if _, err := h.Pool.Exec(ctx, `
+			INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ($1, $2, 1, 0)
+		`, "slow-sub", msgID); err != nil {
+			t.Fatalf("seed delivery: %v", err)
+		}
+	}
+
+	// Publish QoS-1 on a different conn — fanout sees existing 2 ≥ cap=2,
+	// skips insert, returns slow-sub in overflow_clients. Engine writes
+	// DISCONNECT 0x97 to the local conn and tears it down.
+	pub := h.Connect(t, "pub-bp")
+	defer pub.Close()
+	pub.Publish(t, "bp/y", []byte("overflow"), 1, false)
+
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	pk, err := sub.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT, got read err: %v", err)
+	}
+	if pk.FixedHeader.Type != packets.Disconnect {
+		t.Fatalf("expected DISCONNECT, got type=%d", pk.FixedHeader.Type)
+	}
+	if pk.ReasonCode != 0x97 {
+		t.Fatalf("expected reason 0x97 (Quota Exceeded), got 0x%X", pk.ReasonCode)
+	}
+}

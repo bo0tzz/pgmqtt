@@ -74,7 +74,7 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		return err
 	}
 
-	msgID, brokerIDs, err := c.eng.publishCore(ctx, publishCore{
+	res, err := c.eng.publishCore(ctx, publishCore{
 		Topic:      pk.TopicName,
 		Payload:    pk.Payload,
 		QoS:        pk.FixedHeader.Qos,
@@ -86,10 +86,13 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		return err
 	}
 	c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
-		"qos", pk.FixedHeader.Qos, "msg", msgID, "brokers", len(brokerIDs))
+		"qos", pk.FixedHeader.Qos, "msg", res.MessageID, "brokers", len(res.BrokerIDs))
 
-	if err := c.eng.notify.Notify(ctx, brokerIDs, msgID); err != nil {
-		c.eng.logger.Warn("publish notify", "msg", msgID, "err", err)
+	if err := c.eng.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
+		c.eng.logger.Warn("publish notify", "msg", res.MessageID, "err", err)
+	}
+	if len(res.OverflowClients) > 0 {
+		c.eng.dispatchQuotaExceeded(ctx, res.OverflowClients)
 	}
 
 	switch pk.FixedHeader.Qos {
@@ -125,14 +128,25 @@ type publishCore struct {
 	Publisher  string // empty for synthesized (will, retained-fanout, etc.)
 }
 
+// publishResult bundles fanout outputs that publishCore returns to the
+// caller. overflowClients are subscribers with QoS>0 deliveries dropped
+// because their per-client deliveries depth is at the configured cap; the
+// caller dispatches DISCONNECT 0x97 (Quota Exceeded) to each.
+type publishResult struct {
+	MessageID       int64
+	BrokerIDs       []uuid.UUID
+	OverflowClients []string
+}
+
 // publishCore performs the SQL portion of the publisher path. Retained writes
 // run before the fanout transaction (so retain updates are durable even if
 // nobody currently subscribes). The caller is responsible for emitting NOTIFY.
-func (e *Engine) publishCore(ctx context.Context, p publishCore) (msgID int64, brokerIDs []uuid.UUID, err error) {
+func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult, error) {
+	var res publishResult
 	if p.Retain {
 		if len(p.Payload) == 0 {
 			if _, err := e.pool.Exec(ctx, `DELETE FROM retained WHERE topic=$1`, p.Topic); err != nil {
-				return 0, nil, err
+				return res, err
 			}
 		} else {
 			if _, err := e.pool.Exec(ctx, `
@@ -145,14 +159,14 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (msgID int64, b
 					expires_at=EXCLUDED.expires_at,
 					updated_at=now()
 			`, p.Topic, p.Payload, p.QoS, jsonOrNil(p.Properties)); err != nil {
-				return 0, nil, err
+				return res, err
 			}
 		}
 	}
 
 	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return 0, nil, err
+		return res, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -162,18 +176,76 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (msgID int64, b
 	}
 
 	row := tx.QueryRow(ctx, `
-		SELECT msg_id, broker_ids
-		  FROM mqtt_publish($1, $2, $3::smallint, $4, $5::jsonb, $6)
-	`, p.Topic, p.Payload, p.QoS, p.Retain, jsonOrNil(p.Properties), publisher)
+		SELECT msg_id, broker_ids, overflow_clients
+		  FROM mqtt_publish($1, $2, $3::smallint, $4, $5::jsonb, $6, $7::int)
+	`, p.Topic, p.Payload, p.QoS, p.Retain, jsonOrNil(p.Properties), publisher, e.maxQueuedDeliveries())
 
 	var brokers []uuid.UUID
-	if err := row.Scan(&msgID, &brokers); err != nil {
-		return 0, nil, err
+	var overflow []string
+	if err := row.Scan(&res.MessageID, &brokers, &overflow); err != nil {
+		return res, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, nil, err
+		return res, err
 	}
-	return msgID, brokers, nil
+	res.BrokerIDs = brokers
+	res.OverflowClients = overflow
+	return res, nil
+}
+
+// QuotaExceededLocally writes DISCONNECT 0x97 (Quota Exceeded) to the named
+// client's currently-attached socket and tears it down. Called by the
+// listener when a peer Pod NOTIFYs us that a publish overflowed this client's
+// per-conn deliveries cap. Safe to call when the client isn't local — no-op.
+func (e *Engine) QuotaExceededLocally(clientID string) {
+	conn, ok := e.ConnFor(clientID)
+	if !ok {
+		return
+	}
+	e.logger.Info("quota exceeded — disconnecting", "client", clientID)
+	if conn.protocol == mqttwire.ProtocolMQTT5 {
+		_ = conn.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  0x97, // Quota Exceeded
+		})
+	}
+	conn.Shutdown()
+}
+
+// dispatchQuotaExceeded resolves each over-cap client's owning broker via
+// the sessions table and emits the appropriate signal — local Disconnect
+// for our own clients, NOTIFY pgmqtt_quota_<broker_id> for peers.
+func (e *Engine) dispatchQuotaExceeded(ctx context.Context, clientIDs []string) {
+	if len(clientIDs) == 0 {
+		return
+	}
+	rows, err := e.pool.Query(ctx, `
+		SELECT client_id, broker_id
+		  FROM sessions
+		 WHERE client_id = ANY($1) AND connected = true AND broker_id IS NOT NULL
+	`, clientIDs)
+	if err != nil {
+		e.logger.Warn("quota lookup", "err", err)
+		return
+	}
+	defer rows.Close()
+
+	self := e.BrokerID()
+	for rows.Next() {
+		var cid string
+		var bid uuid.UUID
+		if err := rows.Scan(&cid, &bid); err != nil {
+			e.logger.Warn("quota scan", "err", err)
+			continue
+		}
+		if bid == self {
+			e.QuotaExceededLocally(cid)
+			continue
+		}
+		if err := e.quota.NotifyQuota(ctx, bid, cid); err != nil {
+			e.logger.Warn("quota notify", "broker", bid, "client", cid, "err", err)
+		}
+	}
 }
 
 func jsonOrNil(b []byte) any {

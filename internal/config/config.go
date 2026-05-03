@@ -35,6 +35,14 @@ type Config struct {
 	// Bcrypt cost used by the User-CR reconciler when hashing passwords for
 	// the broker's `users` table. 10 is bcrypt's library default.
 	BcryptCost int
+
+	// MaxQueuedDeliveriesPerClient bounds the per-conn outbound queue depth
+	// in the deliveries table. When a slow subscriber is at the cap:
+	//   * QoS-0 messages targeted at them are silently dropped (spec-OK).
+	//   * QoS>0 messages targeted at them are dropped AND the subscriber is
+	//     DISCONNECTed with reason 0x97 (Quota Exceeded).
+	// 0 disables the cap entirely.
+	MaxQueuedDeliveriesPerClient int
 }
 
 func FromEnv() (*Config, error) {
@@ -48,10 +56,11 @@ func FromEnv() (*Config, error) {
 		WSPort:         getenvInt("PGMQTT_SERVICE_WS_PORT", 8083),
 		AllowAnonymous: os.Getenv("PGMQTT_ALLOW_ANONYMOUS") == "true",
 
-		V5ReceiveMaximum:    uint16(getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)),
-		V5TopicAliasMaximum: uint16(getenvInt("PGMQTT_TOPIC_ALIAS_MAXIMUM", 0)),
-		V5KeepaliveMax:      time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
-		BcryptCost:          getenvInt("PGMQTT_BCRYPT_COST", 10),
+		V5ReceiveMaximum:             uint16(getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)),
+		V5TopicAliasMaximum:          uint16(getenvInt("PGMQTT_TOPIC_ALIAS_MAXIMUM", 0)),
+		V5KeepaliveMax:               time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
+		BcryptCost:                   getenvInt("PGMQTT_BCRYPT_COST", 10),
+		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

@@ -12,13 +12,16 @@ suggested below. Cross items off in this file as they ship.
       left alone — those rows are still in-flight. Test in
       `janitor_test.go::TestJanitorInboundQoS2Sweep`.
 
-- [ ] **Slow-subscriber backpressure.** Today the drain loop will keep
-      writing to a slow client without bound; deliveries pile up in Postgres.
-      Cap the per-conn outbound queue depth (in the deliveries table) and
-      either (a) drop QoS 0 messages past the cap, (b) drop the conn with
-      DISCONNECT 0x97 (Quota Exceeded). Wire a configurable
-      `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` (default ~10000).
-      Tests: feed a TCP-paused subscriber until cap hits, assert behaviour.
+- [x] **Slow-subscriber backpressure.** `mqtt_publish` SQL takes
+      `p_max_queued`; matching subscribers at/over cap have their delivery
+      insert skipped. QoS-0 drops are silent (spec-OK); QoS>0 drops surface
+      in `overflow_clients` so the engine can DISCONNECT 0x97 the conn
+      (`Engine.dispatchQuotaExceeded`). Cross-Pod path uses a new
+      `pgmqtt_quota_<broker_id>` LISTEN channel + `PgQuotaNotifier`. Cap is
+      `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` (default 10000) and
+      `Values.limits.maxQueuedDeliveriesPerClient`. Test:
+      `TestSlowSubscriberQuotaExceeded` seeds the deliveries table at the
+      cap and asserts DISCONNECT 0x97 lands.
 
 - [ ] **Connection limits + rate limiting.** No max concurrent conns per
       Pod, no per-conn inbound publish rate limit. DoS surface today. Add:

@@ -88,3 +88,10 @@ v5:
   receiveMaximum: 100
   topicAliasMaximum: 0
   keepaliveMaxSec: 60
+
+## Slow-subscriber backpressure. When a subscriber has this many rows in the
+## deliveries table, new QoS-0 messages are silently dropped and new QoS>0
+## messages cause that subscriber to be DISCONNECTed with reason 0x97
+## (Quota Exceeded). 0 disables the cap entirely.
+limits:
+  maxQueuedDeliveriesPerClient: 10000

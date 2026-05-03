@@ -17,7 +17,7 @@ func (c *Conn) fireWill(ctx context.Context) error {
 // janitor's dead-broker scan. It runs the publisher path with no publisher
 // client id (so no_local-blocking subscribers still receive the will).
 func (e *Engine) PublishWill(ctx context.Context, topic string, payload []byte, qos byte, retain bool, props []byte) error {
-	msgID, brokerIDs, err := e.publishCore(ctx, publishCore{
+	res, err := e.publishCore(ctx, publishCore{
 		Topic:      topic,
 		Payload:    payload,
 		QoS:        qos,
@@ -28,8 +28,11 @@ func (e *Engine) PublishWill(ctx context.Context, topic string, payload []byte, 
 	if err != nil {
 		return err
 	}
-	if err := e.notify.Notify(ctx, brokerIDs, msgID); err != nil {
-		e.logger.Warn("will notify", "msg", msgID, "err", err)
+	if err := e.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
+		e.logger.Warn("will notify", "msg", res.MessageID, "err", err)
+	}
+	if len(res.OverflowClients) > 0 {
+		e.dispatchQuotaExceeded(ctx, res.OverflowClients)
 	}
 	return nil
 }

@@ -38,6 +38,15 @@ type TakeoverNotifier interface {
 	NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string) error
 }
 
+// QuotaNotifier emits a "quota exceeded" signal for a client_id whose
+// pending-deliveries depth is at the configured cap. The signal targets a
+// specific broker UUID — the Pod that currently owns the slow client. The
+// receiving Pod writes DISCONNECT 0x97 to that client and tears down the
+// socket.
+type QuotaNotifier interface {
+	NotifyQuota(ctx context.Context, brokerID uuid.UUID, clientID string) error
+}
+
 // Engine is the per-Pod broker.
 type Engine struct {
 	cfg    *config.Config
@@ -49,6 +58,7 @@ type Engine struct {
 
 	notify   Notifier
 	takeover TakeoverNotifier
+	quota    QuotaNotifier
 
 	connsMu sync.RWMutex
 	conns   map[string]*Conn // client_id -> *Conn
@@ -77,6 +87,7 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		KeepAliveGrace: 1500 * time.Millisecond,
 		notify:         &localNotifier{},
 		takeover:       noopTakeover{},
+		quota:          noopQuota{},
 	}, nil
 }
 
@@ -102,6 +113,11 @@ func (e *Engine) SetNotifier(n Notifier) {
 // SetTakeoverNotifier swaps the takeover notifier. Call before Serve.
 func (e *Engine) SetTakeoverNotifier(t TakeoverNotifier) {
 	e.takeover = t
+}
+
+// SetQuotaNotifier swaps the quota-exceeded notifier. Call before Serve.
+func (e *Engine) SetQuotaNotifier(q QuotaNotifier) {
+	e.quota = q
 }
 
 // Serve runs the accept loops until ctx is cancelled or a fatal accept error.
@@ -318,3 +334,7 @@ func (n *inProcNotifier) Notify(ctx context.Context, brokerIDs []uuid.UUID, msgI
 type noopTakeover struct{}
 
 func (noopTakeover) NotifyTakeover(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+
+type noopQuota struct{}
+
+func (noopQuota) NotifyQuota(_ context.Context, _ uuid.UUID, _ string) error { return nil }

@@ -60,6 +60,7 @@ func main() {
 	eng.SetBrokerID(lst.BrokerID())
 	eng.SetNotifier(listener.NewNotifier(pool))
 	eng.SetTakeoverNotifier(listener.NewTakeoverNotifier(pool))
+	eng.SetQuotaNotifier(listener.NewQuotaNotifier(pool))
 
 	ld, err := leader.Start(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
