@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -158,6 +159,15 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 			FixedHeader: packets.FixedHeader{Type: packets.Publish, Retain: true, Qos: effectiveQoS},
 			TopicName:   r.topic,
 			Payload:     r.payload,
+		}
+		if len(r.props) > 0 {
+			var p packets.Properties
+			if err := json.Unmarshal(r.props, &p); err == nil {
+				pk.Properties = p
+			}
+		}
+		if opts.SubscriptionID != 0 && c.protocol == mqttwire.ProtocolMQTT5 {
+			pk.Properties.SubscriptionIdentifier = []int{opts.SubscriptionID}
 		}
 		if effectiveQoS > 0 {
 			// Need a packet id and a deliveries row so PUBACK/PUBREC can be tracked.
