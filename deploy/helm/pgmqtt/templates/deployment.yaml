@@ -75,6 +75,13 @@ spec:
               value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
             - name: PGMQTT_PG_STATEMENT_TIMEOUT_MS
               value: {{ .Values.database.statementTimeoutMs | quote }}
+            {{- if .Values.auth.allowAnonymous }}
+            - name: PGMQTT_ALLOW_ANONYMOUS
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             - name: PGMQTT_METRICS_ADDR
               value: {{ if .Values.metrics.enabled }}":{{ .Values.metrics.port }}"{{ else }}""{{ end }}
           ports:

@@ -20,6 +20,20 @@ database:
   ## can't hang past keepalive. 0 disables (PG default).
   statementTimeoutMs: 30000
 
+## Authentication. The broker reads `users` from Postgres (seeded by the
+## operator's User CR or by you directly).
+auth:
+  ## Accept CONNECT without username/password. Leave false in production.
+  ## Useful for test rigs and conformance suites that don't seed users.
+  allowAnonymous: false
+
+## Extra env vars injected into the broker container. Use for ad-hoc tuning
+## or any PGMQTT_* knob the chart doesn't expose explicitly.
+##   extraEnv:
+##     - name: PGMQTT_LOG_LEVEL
+##       value: debug
+extraEnv: []
+
 ## TCP / WS listener configuration.
 listeners:
   tcp:
