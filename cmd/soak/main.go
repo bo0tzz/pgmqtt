@@ -380,11 +380,18 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 // runPublisherPipelined is the QoS-1 pipelined variant. A reader
 // goroutine pulls PUBACKs off the wire and increments `published`
 // when each in-flight pid's ACK arrives. The writer fires PUBLISHes
-// up to `inflight` ahead. On any I/O error or connection drop, both
-// goroutines tear down the conn; the outer loop reconnects and
-// resumes from the next seq (un-ACKed messages get re-sent on the
-// new conn — broker treats them as fresh inserts, so subscriber dups
-// can occur exactly when chaos hits, same as the strict-serial path).
+// up to `inflight` ahead.
+//
+// Crash recovery: on every PUBLISH the writer records (pid → seq) in
+// `outstanding`; the reader removes entries on PUBACK. When the conn
+// dies, anything still in `outstanding` plus any un-consumed prior
+// `replay` entries are folded into the next iteration's replay queue
+// and resent on the new conn before fresh seqs are issued. Without
+// this, in-flight seqs at the time of disconnect would be skipped
+// (writer had already advanced `seq`) and the subscriber would see
+// gaps. Replayed seqs the broker had already committed surface as
+// dups at the subscriber — that's the correct QoS-1 at-least-once
+// trade-off.
 func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, topic string,
 	rate, inflight int, endAt time.Time, pubID uint16, published *atomic.Int64) {
 	tick := time.NewTicker(time.Second / time.Duration(rate))
@@ -392,17 +399,20 @@ func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, to
 
 	var seq int64
 	pid := uint16(0)
+	var replay []int64
 	for {
 		c, r, err := connectWithBackoff(ctx, broker, clientID, user, pass, false)
 		if err != nil {
 			return
 		}
-		// Reader goroutine: read packets, signal completion via slot
-		// channel, signal disconnect via stop channel.
 		slot := make(chan struct{}, inflight)
 		stop := make(chan struct{})
 		var once sync.Once
 		killWriter := func() { once.Do(func() { close(stop) }) }
+
+		var outstandingMu sync.Mutex
+		outstanding := make(map[uint16]int64)
+
 		go func() {
 			defer killWriter()
 			for {
@@ -416,29 +426,51 @@ func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, to
 						pubID, ack.FixedHeader.Type)
 					return
 				}
+				outstandingMu.Lock()
+				delete(outstanding, ack.PacketID)
+				outstandingMu.Unlock()
 				published.Add(1)
 				select {
 				case <-slot:
 				default:
-					// Slot already free: extra ack? shouldn't happen.
 				}
 			}
 		}()
 
+		replayIdx := 0
+		exit := false
 	writer:
 		for {
 			select {
 			case <-ctx.Done():
 				_ = c.Close()
-				return
+				exit = true
+				break writer
 			case <-stop:
 				_ = c.Close()
 				break writer
 			case slot <- struct{}{}:
 			}
 			if time.Now().After(endAt) {
+				// End of run: give the reader a moment to drain any
+				// PUBACKs queued in the kernel recv buffer before closing
+				// the conn. Without this, `published` can under-report by
+				// the in-flight window at end-of-run (sub still sees those
+				// messages — they were committed and delivered — so this
+				// is purely a metric correctness fix).
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					outstandingMu.Lock()
+					n := len(outstanding)
+					outstandingMu.Unlock()
+					if n == 0 || time.Now().After(deadline) {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 				_ = c.Close()
-				return
+				exit = true
+				break writer
 			}
 			select {
 			case <-tick.C:
@@ -447,13 +479,25 @@ func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, to
 				break writer
 			case <-ctx.Done():
 				_ = c.Close()
-				return
+				exit = true
+				break writer
 			}
-			payload := encodePayload(pubID, seq)
+			var seqToSend int64
+			if replayIdx < len(replay) {
+				seqToSend = replay[replayIdx]
+				replayIdx++
+			} else {
+				seqToSend = seq
+				seq++
+			}
+			payload := encodePayload(pubID, seqToSend)
 			pid++
 			if pid == 0 {
 				pid = 1
 			}
+			outstandingMu.Lock()
+			outstanding[pid] = seqToSend
+			outstandingMu.Unlock()
 			pk := &packets.Packet{
 				FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 1},
 				ProtocolVersion: mqttwire.ProtocolMQTT5,
@@ -462,14 +506,23 @@ func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, to
 				PacketID:        pid,
 			}
 			if err := mqttwire.Write(c, pk); err != nil {
-				log.Printf("publish[pid=%d] write (seq=%d): %v — reconnecting", pubID, seq, err)
+				log.Printf("publish[pid=%d] write (seq=%d): %v — reconnecting", pubID, seqToSend, err)
 				_ = c.Close()
 				break writer
 			}
-			seq++
 		}
-		// Wait for reader to drain & exit, then loop and reconnect.
 		<-stop
+		if exit {
+			return
+		}
+		next := make([]int64, 0, len(outstanding)+(len(replay)-replayIdx))
+		for _, s := range outstanding {
+			next = append(next, s)
+		}
+		for i := replayIdx; i < len(replay); i++ {
+			next = append(next, replay[i])
+		}
+		replay = next
 	}
 }
 
