@@ -117,10 +117,11 @@ tests:
 ui:
   enabled: false
   image:
-    # MQTTX Web's docker image. Tag pinned by the operator; latest works
-    # too. We don't pin here because we don't proactively follow upstream.
+    # MQTTX Web — EMQX's open-source MQTT 5 browser client. Multi-arch
+    # (amd64 + arm64), ~53 MB, exposes port 80, pure static (no backend).
+    # Pinned for reproducibility; bump as new stable tags ship.
     repository: emqx/mqttx-web
-    tag: latest
+    tag: v1.13.0
     pullPolicy: IfNotPresent
   containerPort: 80
   service:

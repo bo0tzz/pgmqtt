@@ -1,13 +1,21 @@
 # Web UI
 
 `pgmqtt` does not ship its own web UI. The chart can optionally install
-**MQTTX Web** (EMQX's open-source MQTT 5 client) as a sibling Deployment
-in the same namespace, behind its own ClusterIP Service.
+**[MQTTX Web](https://mqttx.app/web)** (EMQX's open-source MQTT 5 client)
+as a sibling Deployment in the same namespace, behind its own ClusterIP
+Service.
 
 This document covers the install + access pattern. The UI is a static SPA
 that runs entirely in the user's browser and connects to the broker over
 the broker's WebSocket port (default 8083); the chart does not auto-mount
 broker credentials into the page (browsers can't read Kubernetes Secrets).
+
+What we verified about the image (used to pick the default values):
+
+- Image: `emqx/mqttx-web:v1.13.0` (latest stable as of 2026-01-23).
+- Multi-arch: `linux/amd64`, `linux/arm64` — runs on both x86 and Apple Silicon nodes.
+- ~53 MB, exposes port 80, served by nginx; **no backend required**.
+- Supports MQTT 3.1.1 and 5.0 natively, including WebSocket connections.
 
 ## Install
 
