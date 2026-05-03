@@ -1,7 +1,15 @@
+{{- if .Values.crds.install -}}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: users.pgmqtt.io
+  annotations:
+    # Templated CRDs apply on `helm upgrade`. Helm v3's crds/ directory
+    # was install-only; templating them gives operators control via the
+    # `crds.install` value but loses Helm's "create before render" guard.
+    # In practice the broker doesn't reference the CRD until the operator
+    # leader's first reconcile, so render-order isn't a problem here.
+    "helm.sh/resource-policy": keep
 spec:
   group: pgmqtt.io
   names:
@@ -99,3 +107,4 @@ spec:
                     - name
                 observedSecretHash:
                   type: string
+{{- end }}
