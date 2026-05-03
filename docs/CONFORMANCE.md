@@ -114,3 +114,34 @@ bash .github/ci/smoke-in-cluster.sh   # apply User CR, mosquitto round-trip, del
 
 End-to-end pass — both pods Running, User CR → Secret → mosquitto round-trip
 → Secret GC on User delete.
+
+## Multi-broker via Service VIP (kind, 3 replicas)
+
+Same Paho suite, but driven from inside a 3-replica kind cluster against
+the broker `Service` VIP (`pgmqtt.mqtt.svc.cluster.local:1883`). Each
+test's clients land on whichever Pod kube-proxy picks; subscribers and
+publishers therefore routinely sit on different brokers, exercising the
+Postgres-coordinated handoff path.
+
+The runner is a Pod (`paho-runner` image: Python + Paho test repo) so the
+clients connect via in-cluster DNS and stable VIP rather than a flaky
+`kubectl port-forward`.
+
+| Suite | Single-broker | Multi-broker |
+| - | - | - |
+| v3.1.1 (`client_test.py`) | 9/10 | 9/10 |
+| v5 (`client_test5.py`)    | 23/27 deterministic | 23/27 deterministic |
+
+Same deterministic result. The two `waitfor` flakes
+(`test_request_response`, `test_subscribe_options`) each land on the
+favourable side roughly half the time; on the recorded multi-broker run
+`test_request_response` passed and `test_subscribe_options` failed for a
+24/27 raw score, but both flakes can flip in either direction on either
+deployment. The deterministic 23/27 — and the two genuine fails on
+out-of-scope features (shared subs, ACLs) — are what's reproducible.
+
+What this verifies that single-broker doesn't: every test that involves
+two clients (basically all of them) is exercising the Postgres-coordinated
+handoff path between Pods, since kube-proxy's per-connection round-robin
+puts pub and sub on different brokers most of the time. Single-broker
+runs in-process, so the broker→broker handoff never fires.
