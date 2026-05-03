@@ -19,12 +19,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Metrics bundles all pgmqtt_* collectors + the registry that hands them to
 // promhttp. One Metrics is shared across the engine, listener, janitor.
 type Metrics struct {
 	Reg *prometheus.Registry
+
+	// extraGatherers are additional Prometheus gatherers merged into the
+	// /metrics response alongside Reg. Used to surface metrics that own
+	// their own registry — notably controller-runtime's metrics.Registry,
+	// which is package-global and can't be redirected at our Reg.
+	extraGatherers []prometheus.Gatherer
 
 	Connections        prometheus.Gauge
 	PublishesTotal     *prometheus.CounterVec
@@ -130,10 +137,64 @@ func (m *Metrics) RegisterPgxPool(pool *pgxpool.Pool) {
 	m.Reg.MustRegister(c)
 }
 
-// Handler returns an http.Handler serving /metrics from this registry. Use
-// with the metrics-listener helper in cmd/pgmqttd.
+// AddGatherer attaches an additional prometheus.Gatherer whose metrics will
+// be merged into the /metrics response. Used to surface metrics owned by
+// third-party packages that bind to their own registry — e.g. controller-
+// runtime, whose package-global metrics.Registry cannot be redirected.
+//
+// Call before Handler / Serve. Safe to call with a nil gatherer (no-op).
+func (m *Metrics) AddGatherer(g prometheus.Gatherer) {
+	if m == nil || g == nil {
+		return
+	}
+	m.extraGatherers = append(m.extraGatherers, g)
+}
+
+// Handler returns an http.Handler serving /metrics from this registry plus
+// any extra gatherers registered via AddGatherer. Use with the metrics-
+// listener helper in cmd/pgmqttd.
+//
+// Extra gatherers may carry metric families whose names collide with our
+// own (notably go_* and process_* — controller-runtime's metrics.Registry
+// registers its own copies). dedupeGatherer drops the duplicates from the
+// extras side so prometheus.Gatherers doesn't fail the whole scrape.
 func (m *Metrics) Handler() http.Handler {
-	return promhttp.HandlerFor(m.Reg, promhttp.HandlerOpts{Registry: m.Reg})
+	g := &dedupeGatherer{primary: m.Reg, extras: m.extraGatherers}
+	return promhttp.HandlerFor(g, promhttp.HandlerOpts{Registry: m.Reg})
+}
+
+// dedupeGatherer merges metric families from primary + extras, taking the
+// primary's family when names collide. This keeps go_* / process_* coming
+// from our registry (where we registered them) rather than from any extra
+// registry that also shipped them.
+type dedupeGatherer struct {
+	primary prometheus.Gatherer
+	extras  []prometheus.Gatherer
+}
+
+func (d *dedupeGatherer) Gather() ([]*dto.MetricFamily, error) {
+	out, err := d.primary.Gather()
+	if err != nil {
+		return out, err
+	}
+	seen := make(map[string]struct{}, len(out))
+	for _, mf := range out {
+		seen[mf.GetName()] = struct{}{}
+	}
+	for _, g := range d.extras {
+		mfs, err := g.Gather()
+		if err != nil {
+			return out, err
+		}
+		for _, mf := range mfs {
+			if _, dup := seen[mf.GetName()]; dup {
+				continue
+			}
+			seen[mf.GetName()] = struct{}{}
+			out = append(out, mf)
+		}
+	}
+	return out, nil
 }
 
 // Serve starts an HTTP server on addr with /metrics handled. Blocks until

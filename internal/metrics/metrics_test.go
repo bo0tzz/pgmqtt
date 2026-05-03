@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TestHandlerRendersExpectedSeries asserts the registry exports each
@@ -57,6 +59,44 @@ func TestHandlerRendersExpectedSeries(t *testing.T) {
 	}
 	if !strings.Contains(out, `pgmqtt_publishes_total{qos="1"} 1`) {
 		t.Errorf("publishes_total{qos=1} not rendered: %s", out)
+	}
+}
+
+// TestHandlerMergesExtraGatherers asserts AddGatherer surfaces metrics from
+// a foreign registry (the controller-runtime use case) on /metrics. We use
+// a stand-in registry rather than depending on controller-runtime here so
+// the metrics package stays free of that import.
+func TestHandlerMergesExtraGatherers(t *testing.T) {
+	m := New()
+
+	extra := prometheus.NewRegistry()
+	foreign := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "controller_runtime_reconcile_total_test",
+		Help: "Stand-in for a metric owned by an external registry.",
+	})
+	extra.MustRegister(foreign)
+	foreign.Inc()
+	m.AddGatherer(extra)
+
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("scrape: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	out := string(body)
+
+	// Both our pgmqtt_* series and the merged-in foreign metric must render.
+	if !strings.Contains(out, "pgmqtt_connections") {
+		t.Errorf("local series missing: %s", out)
+	}
+	if !strings.Contains(out, "controller_runtime_reconcile_total_test") {
+		t.Errorf("merged gatherer series missing: %s", out)
+	}
+	if !strings.Contains(out, "controller_runtime_reconcile_total_test 1") {
+		t.Errorf("merged gatherer value missing: %s", out)
 	}
 }
 
