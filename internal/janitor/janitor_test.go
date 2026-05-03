@@ -35,7 +35,6 @@ func TestJanitorFiresWillFromDeadBroker(t *testing.T) {
 	}
 	t.Cleanup(l.Stop)
 	pod.Engine.SetBrokerID(l.BrokerID())
-	pod.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
 	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
 	pod.BrokerID = l.BrokerID()
 
@@ -88,7 +87,6 @@ func TestJanitorOrphanSweep(t *testing.T) {
 	}
 	t.Cleanup(l.Stop)
 	pod.Engine.SetBrokerID(l.BrokerID())
-	pod.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
 
 	// Insert an orphan message older than the grace.
 	_, err = mh.Pool.Exec(context.Background(), `

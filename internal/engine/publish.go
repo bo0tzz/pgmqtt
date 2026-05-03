@@ -101,11 +101,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		"brokers", len(res.BrokerIDs), "broker_ids", res.BrokerIDs,
 		"overflow", len(res.OverflowClients))
 
-	startNotify := time.Now()
 	if err := c.eng.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
-		c.eng.logger.Warn("publish notify", "msg", res.MessageID, "err", err)
+		c.eng.logger.Warn("post-commit notify hook", "msg", res.MessageID, "err", err)
 	}
-	c.eng.metrics.ObservePublishStage("notify", time.Since(startNotify))
 	if len(res.OverflowClients) > 0 {
 		c.eng.dispatchQuotaExceeded(ctx, res.OverflowClients)
 	}
@@ -211,6 +209,26 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 		return res, err
 	}
 	e.metrics.ObservePublishStage("mqtt_publish_query", time.Since(startQuery))
+
+	// pg_notify INSIDE the publish tx, not after commit. Postgres queues
+	// notifications during the tx and delivers them on COMMIT, so peer
+	// notification is atomic with message durability — either both happen
+	// or neither does. The post-commit Notifier hook stays in place for
+	// the in-process test harness's same-pod Deliver short-circuit; in
+	// production it's wired to a no-op since pg_notify is already done.
+	if len(brokers) > 0 {
+		startNotify := time.Now()
+		channels := make([]string, len(brokers))
+		for i, id := range brokers {
+			channels[i] = "pgmqtt_" + id.String()
+		}
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_notify(c, $2) FROM unnest($1::text[]) AS c`,
+			channels, strconv.FormatInt(res.MessageID, 10)); err != nil {
+			return res, err
+		}
+		e.metrics.ObservePublishStage("notify", time.Since(startNotify))
+	}
 
 	startCommit := time.Now()
 	if err := tx.Commit(ctx); err != nil {

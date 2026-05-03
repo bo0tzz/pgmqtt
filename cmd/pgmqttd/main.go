@@ -73,7 +73,9 @@ func main() {
 	}
 	defer lst.Stop()
 	eng.SetBrokerID(lst.BrokerID())
-	eng.SetNotifier(listener.NewNotifier(pool))
+	// Publish-side pg_notify is emitted inside publishCore's tx for atomic
+	// durability; no SetNotifier call is needed for cross-pod fanout.
+	// The default no-op localNotifier is correct in production.
 	eng.SetTakeoverNotifier(listener.NewTakeoverNotifier(pool))
 	eng.SetQuotaNotifier(listener.NewQuotaNotifier(pool))
 

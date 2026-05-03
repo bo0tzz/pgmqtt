@@ -23,15 +23,15 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
-// Notifier emits cross-Pod publish notifications. The default
-// (`localNotifier`) is a no-op for tests; production wires
-// `listener.NewNotifier`, which fires `pg_notify` on
-// `pgmqtt_<broker_id>` for each owning Pod.
+// Notifier is a post-commit hook for additional, optional delivery
+// mechanisms. Production fires the cross-Pod `pg_notify` *inside* the
+// publishCore tx (atomic with message durability) so this hook is a no-op
+// in production. Single-Pod tests wire `NewInProcessNotifier` to short-
+// circuit the LISTEN→Deliver round-trip with an in-process Deliver call.
 type Notifier interface {
-	// Notify is called after a successful publish. brokerIDs are the unique
-	// broker UUIDs that own currently-connected subscribers; messageID is the
-	// row id in the messages table. Implementations decide whether to fan out
-	// via pg_notify, in-process delivery, or both.
+	// Notify is called after a successful publish commit. brokerIDs are
+	// the broker UUIDs owning currently-connected subscribers; messageID
+	// is the messages.id row id.
 	Notify(ctx context.Context, brokerIDs []uuid.UUID, messageID int64) error
 }
 

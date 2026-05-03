@@ -27,7 +27,6 @@ func TestCrossPodFanout(t *testing.T) {
 		}
 		t.Cleanup(l.Stop)
 		p.Engine.SetBrokerID(l.BrokerID())
-		p.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
 		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
 		p.BrokerID = l.BrokerID()
 	}
@@ -62,7 +61,6 @@ func TestSessionMigratesOnPodLoss(t *testing.T) {
 		listeners[i] = l
 		t.Cleanup(l.Stop)
 		p.Engine.SetBrokerID(l.BrokerID())
-		p.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
 		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
 		p.BrokerID = l.BrokerID()
 	}
@@ -107,7 +105,6 @@ func TestTakeoverClosesPriorPodSocket(t *testing.T) {
 		}
 		t.Cleanup(l.Stop)
 		p.Engine.SetBrokerID(l.BrokerID())
-		p.Engine.SetNotifier(listener.NewNotifier(mh.Pool))
 		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
 		p.BrokerID = l.BrokerID()
 	}

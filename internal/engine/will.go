@@ -29,7 +29,8 @@ func (e *Engine) PublishWill(ctx context.Context, topic string, payload []byte, 
 		return err
 	}
 	if err := e.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
-		e.logger.Warn("will notify", "msg", res.MessageID, "err", err)
+		e.logger.Error("will notify failed after retries; cross-pod subs may miss this will until next NOTIFY for this broker",
+			"msg", res.MessageID, "brokers", res.BrokerIDs, "err", err)
 	}
 	if len(res.OverflowClients) > 0 {
 		e.dispatchQuotaExceeded(ctx, res.OverflowClients)

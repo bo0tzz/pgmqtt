@@ -2,41 +2,12 @@ package listener
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine"
 )
-
-// PgNotifier emits pg_notify on pgmqtt_<broker_id> for cross-Pod publish
-// fanout. Uses the shared pool (notify is fire-and-forget; doesn't need the
-// dedicated LISTEN connection).
-type PgNotifier struct {
-	pool *pgxpool.Pool
-}
-
-// NewNotifier returns a Notifier that emits pg_notify per broker id.
-func NewNotifier(pool *pgxpool.Pool) engine.Notifier {
-	return &PgNotifier{pool: pool}
-}
-
-func (n *PgNotifier) Notify(ctx context.Context, brokerIDs []uuid.UUID, messageID int64) error {
-	if len(brokerIDs) == 0 {
-		return nil
-	}
-	payload := strconv.FormatInt(messageID, 10)
-	// One round-trip; SELECT pg_notify(channel, payload) FROM unnest(...).
-	channels := make([]string, len(brokerIDs))
-	for i, id := range brokerIDs {
-		channels[i] = "pgmqtt_" + id.String()
-	}
-	_, err := n.pool.Exec(ctx,
-		`SELECT pg_notify(c, $2) FROM unnest($1::text[]) AS c`,
-		channels, payload)
-	return err
-}
 
 // PgTakeoverNotifier emits the takeover signal on pgmqtt_takeover_<broker_id>.
 type PgTakeoverNotifier struct {
