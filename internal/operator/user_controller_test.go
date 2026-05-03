@@ -2,6 +2,7 @@ package operator_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
@@ -9,11 +10,15 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	pgmqttv1alpha1 "github.com/bo0tzz/pgmqtt/api/v1alpha1"
 	"github.com/bo0tzz/pgmqtt/internal/db/dbtest"
@@ -338,4 +343,866 @@ func TestReconcile_DeletionRemovesUser(t *testing.T) {
 	if n != 0 {
 		t.Errorf("user still in DB: %d rows", n)
 	}
+}
+
+// TestReconcile_BYOSecret_NotFound exercises the error path where
+// spec.PasswordSecretRef points at a Secret that does not exist. The
+// reconciler must surface the error and set Ready=False with reason
+// SecretError on the User status.
+func TestReconcile_BYOSecret_NotFound(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "ghost-byo",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "missing"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ghost-byo"}})
+	if err == nil {
+		t.Fatalf("expected error from missing BYO secret, got result %+v", res)
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected NotFound error, got: %v", err)
+	}
+
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ghost-byo"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
+		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestReconcile_BYOSecret_MissingKey exercises the error path where the
+// referenced Secret exists but the named key is absent.
+func TestReconcile_BYOSecret_MissingKey(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	byoSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "mqtt"},
+		Data:       map[string][]byte{"some-other-key": []byte("nope")},
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "no-key",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, byoSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "no-key"}})
+	if err == nil {
+		t.Fatal("expected error for BYO secret with missing key")
+	}
+	if !strings.Contains(err.Error(), "missing key") {
+		t.Errorf("expected 'missing key' error, got: %v", err)
+	}
+
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "no-key"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
+		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestReconcile_BYOSecret_DefaultKey verifies the fallback when
+// spec.PasswordSecretRef.Key is empty. The reconciler uses "password" as
+// the implicit key.
+func TestReconcile_BYOSecret_DefaultKey(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	byoSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-key", Namespace: "mqtt"},
+		Data:       map[string][]byte{"password": []byte("implicit-key")},
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "byo-default", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "default-key"},
+				// Key intentionally left empty; reconciler must default to "password".
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, byoSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "byo-default"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='byo-default'`).Scan(&hash); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("implicit-key")); err != nil {
+		t.Errorf("password mismatch with default key fallback: %v", err)
+	}
+}
+
+// TestReconcile_DefaultsServiceWireDetails verifies the fallbacks when
+// the reconciler's ServiceHost / ServicePort / WSPort are zero-valued.
+// The auto-generated Secret should still contain valid wire fields.
+func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "defaults", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	// All wire defaults left at zero so the reconciler picks its fallbacks.
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "defaults"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "defaults-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if string(sec.Data["host"]) != "pgmqtt" {
+		t.Errorf("default host: got %q, want %q", sec.Data["host"], "pgmqtt")
+	}
+	if string(sec.Data["port"]) != "1883" {
+		t.Errorf("default port: got %q, want %q", sec.Data["port"], "1883")
+	}
+	if string(sec.Data["ws-port"]) != "8083" {
+		t.Errorf("default ws-port: got %q, want %q", sec.Data["ws-port"], "8083")
+	}
+	if !strings.HasPrefix(string(sec.Data["uri"]), "mqtt://") {
+		t.Errorf("uri default scheme: %q", sec.Data["uri"])
+	}
+	if !strings.HasPrefix(string(sec.Data["ws-uri"]), "ws://") {
+		t.Errorf("ws-uri default scheme: %q", sec.Data["ws-uri"])
+	}
+}
+
+// TestReconcile_AutoGenSecretPasswordPreservedAcrossReconciles verifies
+// the existing-secret branch in resolveCredentialSecret: when the
+// auto-generated Secret already exists, its password must be reused —
+// not replaced with a fresh random one. This protects clients that have
+// already cached the value.
+func TestReconcile_AutoGenSecretPasswordPreservedAcrossReconciles(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "preserve", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "preserve"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var sec1 corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "preserve-mqtt-credentials"}, &sec1); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	pwBefore := string(sec1.Data["password"])
+	if pwBefore == "" {
+		t.Fatal("first-pass password is empty")
+	}
+
+	// Wipe the observed-hash status so the reconciler is forced through the
+	// existing-secret password-preservation branch on the next pass.
+	var u pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "preserve"}, &u); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	u.Status.ObservedSecretHash = ""
+	u.Status.CredentialsSecretRef = nil
+	if err := cli.Status().Update(context.Background(), &u); err != nil {
+		t.Fatalf("status update: %v", err)
+	}
+
+	// Reconcile again — must reuse the existing Secret's password rather
+	// than rolling a fresh random one.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "preserve"}}); err != nil {
+		t.Fatalf("reconcile rerun: %v", err)
+	}
+	var sec2 corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "preserve-mqtt-credentials"}, &sec2); err != nil {
+		t.Fatalf("get secret 2: %v", err)
+	}
+	if string(sec2.Data["password"]) != pwBefore {
+		t.Errorf("password rotated unexpectedly: before=%q after=%q", pwBefore, sec2.Data["password"])
+	}
+}
+
+// TestReconcile_BYOSecretPasswordRotation simulates the documented
+// rotation flow: the user updates the BYO Secret data (or, equivalently,
+// annotates the User CR with pgmqtt.io/rotated-at — the controller
+// doesn't read the annotation, only the Secret). The next reconcile
+// must compute a new bcrypt hash and update the DB row.
+func TestReconcile_BYOSecretPasswordRotation(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	byoSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "rot-creds", Namespace: "mqtt"},
+		Data:       map[string][]byte{"password": []byte("v1-password")},
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "rot", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "rot-creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, byoSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rot"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hashV1 string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='rot'`).Scan(&hashV1); err != nil {
+		t.Fatalf("query v1: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hashV1), []byte("v1-password")); err != nil {
+		t.Errorf("v1 password mismatch: %v", err)
+	}
+
+	// Rotate the BYO secret's password.
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "rot-creds"}, &sec); err != nil {
+		t.Fatalf("get byo: %v", err)
+	}
+	sec.Data["password"] = []byte("v2-password")
+	if err := cli.Update(context.Background(), &sec); err != nil {
+		t.Fatalf("update byo: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rot"}}); err != nil {
+		t.Fatalf("reconcile after rotation: %v", err)
+	}
+	var hashV2 string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='rot'`).Scan(&hashV2); err != nil {
+		t.Fatalf("query v2: %v", err)
+	}
+	if hashV2 == hashV1 {
+		t.Error("expected password_hash to change after rotation")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hashV2), []byte("v2-password")); err != nil {
+		t.Errorf("v2 password mismatch: %v", err)
+	}
+	// Old password must no longer authenticate.
+	if err := bcrypt.CompareHashAndPassword([]byte(hashV2), []byte("v1-password")); err == nil {
+		t.Error("v1 password still verifies against rotated hash")
+	}
+}
+
+// TestReconcile_UpdateRequeuesOnFinalizerAddFailure exercises the
+// transient-failure path on the finalizer-add Update. A failed Update
+// must propagate as a non-nil error so controller-runtime requeues.
+func TestReconcile_UpdateRequeuesOnFinalizerAddFailure(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "transient", Namespace: "mqtt"},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	want := errors.New("simulated etcd failure")
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*pgmqttv1alpha1.User); ok {
+				return want
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "transient"}})
+	if err == nil {
+		t.Fatal("expected error from finalizer-add Update failure")
+	}
+	if !errors.Is(err, want) {
+		t.Errorf("error = %v, want wraps %v", err, want)
+	}
+}
+
+// TestReconcile_SecretCreateFailure exercises the transient-failure
+// path on auto-gen Secret creation. The reconciler must surface the
+// error and set Ready=False with reason SecretError.
+func TestReconcile_SecretCreateFailure(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "create-fail",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	want := errors.New("etcd write quota")
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				return want
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "create-fail"}})
+	if err == nil {
+		t.Fatal("expected error from Secret create failure")
+	}
+	if !errors.Is(err, want) {
+		t.Errorf("error = %v, want wraps %v", err, want)
+	}
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "create-fail"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
+		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestReconcile_DBExecFailureSetsDBErrorCondition exercises the
+// transient-failure path on the users INSERT/UPDATE. The reconciler
+// must surface the error and set Ready=False with reason DBError.
+func TestReconcile_DBExecFailureSetsDBErrorCondition(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	// Drop the users table to make Pool.Exec fail with a known error.
+	if _, err := pool.Exec(context.Background(), `DROP TABLE users`); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "db-broken",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "db-broken"}})
+	if err == nil {
+		t.Fatal("expected error when users table is missing")
+	}
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "db-broken"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionFalse, "DBError") {
+		t.Errorf("expected Ready=False with reason DBError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestReconcile_DeletionDBExecFailure exercises the transient-failure
+// path in reconcileDelete. The DB DELETE must surface as an error and
+// the finalizer must remain on the User so a retry has another shot.
+func TestReconcile_DeletionDBExecFailure(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "del-broken",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	// Trigger Delete to set DeletionTimestamp; finalizer keeps the object.
+	if err := cli.Delete(context.Background(), user); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// Drop the users table to force the DB exec to fail.
+	if _, err := pool.Exec(context.Background(), `DROP TABLE users`); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "del-broken"}}); err == nil {
+		t.Fatal("expected error from DELETE on missing users table")
+	}
+	// Finalizer must still be present so K8s won't reap the User.
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "del-broken"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	found := false
+	for _, f := range got.Finalizers {
+		if f == "pgmqtt.io/user" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("finalizer prematurely removed despite DB failure: %+v", got.Finalizers)
+	}
+}
+
+// TestReconcile_DeletionWithoutFinalizerNoOp exercises the early
+// return in reconcileDelete when our finalizer was somehow already
+// removed (e.g. force-deleted user) but a stray event still triggers
+// reconcile. The reconciler must not touch the DB and must not error.
+//
+// We seed the object with only a sentinel finalizer (NOT the operator's)
+// and call cli.Delete to set the DeletionTimestamp — because the
+// sentinel finalizer keeps the object visible, this exercises the
+// reconcileDelete entry path while ContainsFinalizer returns false.
+func TestReconcile_DeletionWithoutFinalizerNoOp(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	// Pre-seed a user row in the DB so we can verify it isn't deleted.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users(username, password_hash) VALUES('untouched', 'whatever')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "untouched",
+			Namespace:  "mqtt",
+			Finalizers: []string{"some.other.controller/keepalive"},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	// Now delete to set DeletionTimestamp; sentinel finalizer keeps it visible.
+	if err := cli.Delete(context.Background(), user); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "untouched"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.Requeue {
+		t.Errorf("unexpected requeue: %+v", res)
+	}
+	// Row must still be present.
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE username='untouched'`).Scan(&n); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("user row touched despite missing finalizer: %d rows", n)
+	}
+}
+
+// TestReconcile_BcryptCostInvalid exercises the validation boundary
+// where r.BcryptCost is below bcrypt.MinCost (>0 — cost=0 is treated
+// as DefaultCost). bcrypt.GenerateFromPassword returns InvalidCostError;
+// the reconciler must wrap it as "bcrypt: ..." and propagate.
+func TestReconcile_BcryptCostInvalid(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "bad-cost",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost: 32, // > bcrypt.MaxCost (31) — InvalidCostError
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "bad-cost"}})
+	if err == nil {
+		t.Fatal("expected error for cost > bcrypt.MaxCost")
+	}
+	if !strings.Contains(err.Error(), "bcrypt:") {
+		t.Errorf("expected wrapped bcrypt error, got: %v", err)
+	}
+}
+
+// TestReconcile_BcryptCostZeroFallsBackToDefault verifies the
+// boundary where BcryptCost == 0 falls back to bcrypt.DefaultCost (10).
+// This is the implicit-default path most operators will hit.
+func TestReconcile_BcryptCostZeroFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "zero-cost", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		// BcryptCost intentionally left at 0.
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "zero-cost"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='zero-cost'`).Scan(&hash); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	// bcrypt.DefaultCost = 10 → "$2a$10$..."
+	if !strings.HasPrefix(hash, "$2a$10$") {
+		t.Errorf("expected default cost 10, got prefix %q", hash[:7])
+	}
+}
+
+// TestReconcile_SpecUsernameDefaultsToObjectName verifies the
+// fallback when spec.Username is empty: the controller uses
+// metadata.name as the MQTT username.
+func TestReconcile_SpecUsernameDefaultsToObjectName(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "metaonly", Namespace: "mqtt"},
+		// Spec.Username left empty.
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "metaonly"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE username='metaonly'`).Scan(&n); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 user row for username=metaonly, got %d", n)
+	}
+}
+
+// TestReconcile_GetUserTransientError exercises the error path from
+// the initial Get when the API returns something other than NotFound.
+// The reconciler must propagate the error so controller-runtime backs
+// off and retries.
+func TestReconcile_GetUserTransientError(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	want := errors.New("api server unreachable")
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*pgmqttv1alpha1.User); ok {
+				return want
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "anything"}})
+	if !errors.Is(err, want) {
+		t.Errorf("expected wrapped %v, got %v", want, err)
+	}
+}
+
+// TestReconcile_TwoUsersSeparateSecrets verifies the per-User Secret
+// naming convention prevents collisions when two User CRs coexist in
+// the same namespace. Each User must get its own Secret named
+// `<user.Name>-mqtt-credentials` and its own DB row.
+func TestReconcile_TwoUsersSeparateSecrets(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	a := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "mqtt"},
+	}
+	b := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "bob", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(a, b).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for _, name := range []string{"alice", "bob"} {
+		for i := 0; i < 2; i++ {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: name}}); err != nil {
+				t.Fatalf("reconcile %s %d: %v", name, i, err)
+			}
+		}
+	}
+	var aSec, bSec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "alice-mqtt-credentials"}, &aSec); err != nil {
+		t.Fatalf("get alice secret: %v", err)
+	}
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "bob-mqtt-credentials"}, &bSec); err != nil {
+		t.Fatalf("get bob secret: %v", err)
+	}
+	if string(aSec.Data["username"]) != "alice" || string(bSec.Data["username"]) != "bob" {
+		t.Errorf("usernames wrong: alice=%q bob=%q",
+			aSec.Data["username"], bSec.Data["username"])
+	}
+	// Passwords must be independently generated, not shared.
+	if string(aSec.Data["password"]) == string(bSec.Data["password"]) {
+		t.Error("alice and bob got the same password — independent randomness expected")
+	}
+	// Both rows in DB.
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE username IN ('alice', 'bob')`).Scan(&n); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 db rows, got %d", n)
+	}
+}
+
+// TestReconcile_OwnerRefOnAutoGenSecret confirms the OwnerReference
+// is set correctly for K8s garbage-collection on User deletion. We
+// don't test the GC itself (that's the K8s control plane), only the
+// owner ref encoding the reconciler is responsible for.
+func TestReconcile_OwnerRefOnAutoGenSecret(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "owns", Namespace: "mqtt", UID: "u-1"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "owns"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "owns-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if len(sec.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 owner ref, got %d: %+v", len(sec.OwnerReferences), sec.OwnerReferences)
+	}
+	or := sec.OwnerReferences[0]
+	if or.Name != "owns" || or.UID != "u-1" {
+		t.Errorf("owner ref name/uid wrong: %+v", or)
+	}
+	if or.Controller == nil || !*or.Controller {
+		t.Errorf("owner ref must be controller=true: %+v", or)
+	}
+	if or.BlockOwnerDeletion == nil || !*or.BlockOwnerDeletion {
+		t.Errorf("owner ref must block-owner-deletion: %+v", or)
+	}
+	// Schema GVK on the owner ref should resolve to the User CR.
+	gvk := schema.GroupVersionKind{Group: "pgmqtt.io", Version: "v1alpha1", Kind: "User"}
+	if or.APIVersion != gvk.GroupVersion().String() || or.Kind != gvk.Kind {
+		t.Errorf("owner ref GVK wrong: %s/%s vs %s/%s", or.APIVersion, or.Kind, gvk.GroupVersion(), gvk.Kind)
+	}
+}
+
+// TestReconcile_AutoGenSecretExistsWithoutPasswordKey exercises the
+// edge case where the auto-generated Secret name is occupied by a
+// pre-existing Secret that lacks the "password" key. The reconciler
+// must fall through to generating a fresh password rather than
+// stalling with empty-string credentials.
+func TestReconcile_AutoGenSecretExistsWithoutPasswordKey(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "nokey", Namespace: "mqtt"},
+	}
+	preexisting := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nokey-mqtt-credentials",
+			Namespace: "mqtt",
+		},
+		Data: map[string][]byte{"some-other-key": []byte("ignored")},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, preexisting).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "nokey"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "nokey-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if len(sec.Data["password"]) == 0 {
+		t.Error("password not generated when pre-existing secret lacked password key")
+	}
+}
+
+// TestReconcile_AutoGenSecretGetTransientError exercises the
+// pass-through branch where Get on the auto-generated Secret name
+// returns a non-NotFound error (e.g. API connectivity blip). The
+// reconciler must propagate the error so a retry occurs.
+func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "get-fail",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	want := errors.New("api server flake")
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			// Only fail Secret Gets; let User Gets through so we
+			// reach the resolveCredentialSecret branch.
+			if _, ok := obj.(*corev1.Secret); ok {
+				return want
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "get-fail"}})
+	if err == nil {
+		t.Fatal("expected error from Secret Get failure")
+	}
+	if !errors.Is(err, want) {
+		t.Errorf("error = %v, want wraps %v", err, want)
+	}
+	var got pgmqttv1alpha1.User
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "get-fail"}, &got); err != nil {
+		t.Fatalf("get user via base: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
+		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// hasReadyCondition returns true if the User has a Ready condition
+// matching the given status and reason.
+func hasReadyCondition(u pgmqttv1alpha1.User, status metav1.ConditionStatus, reason string) bool {
+	for _, c := range u.Status.Conditions {
+		if c.Type == "Ready" && c.Status == status && c.Reason == reason {
+			return true
+		}
+	}
+	return false
 }
