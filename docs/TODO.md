@@ -23,13 +23,16 @@ suggested below. Cross items off in this file as they ship.
       `TestSlowSubscriberQuotaExceeded` seeds the deliveries table at the
       cap and asserts DISCONNECT 0x97 lands.
 
-- [ ] **Connection limits + rate limiting.** No max concurrent conns per
-      Pod, no per-conn inbound publish rate limit. DoS surface today. Add:
-      - `PGMQTT_MAX_CONNECTIONS` (per Pod) — reject CONNACK with 0x9F
-        (Connection Rate Exceeded) when at limit.
-      - Token-bucket per conn for inbound PUBLISH/SUBSCRIBE — drop with
-        DISCONNECT 0x96 (Message Rate Too High) when sustained over.
-      Defaults reasonable for a homelab: 5000 conns, 1000 pps per conn.
+- [x] **Connection limits + rate limiting.**
+        * `PGMQTT_MAX_CONNECTIONS` (default 5000) — atomic reservation in
+          `Engine.tryReserveConn`; over-cap accept emits a v5-shaped
+          CONNACK 0x9F and closes the socket before CONNECT processing.
+        * `PGMQTT_MAX_INBOUND_MSGS_PER_SEC` (default 1000) — token-bucket
+          on PUBLISH/SUBSCRIBE only (acks/PING are protocol-required and
+          not metered). Bucket capacity == rate; refill rate-per-second.
+          Trip → DISCONNECT 0x96. Helm exposes both as
+          `Values.limits.{maxConnections,maxInboundMsgsPerSec}`.
+        Tests: `TestMaxConnectionsRejects`, `TestRateLimitDisconnects`.
 
 - [ ] **Prometheus metrics.** Helm `serviceMonitor.enabled` exists but the
       broker doesn't expose `/metrics`. Implement (`prometheus/client_golang`

@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -291,6 +292,70 @@ func TestWillSuppressedOnGraceful(t *testing.T) {
 	pk, err := observer.NextRaw()
 	if err == nil && pk.FixedHeader.Type == packets.Publish {
 		t.Fatalf("graceful disconnect must suppress will, got publish %q", pk.Payload)
+	}
+}
+
+// TestMaxConnectionsRejects asserts that a Pod at the connection cap rejects
+// new sockets with CONNACK reason 0x9F.
+func TestMaxConnectionsRejects(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetMaxConnectionsForTest(1)
+
+	c1 := h.Connect(t, "ml-1")
+	defer c1.Close()
+
+	// Direct TCP dial — write a CONNECT, expect CONNACK 0x9F + close.
+	d, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer d.Close()
+	if err := d.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	// Read whatever the broker sends and assert CONNACK with 0x9F.
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(d, buf); err != nil {
+		t.Fatalf("read connack: %v", err)
+	}
+	// 0x20 = CONNACK fixed header. buf[3] is the reason code.
+	if buf[0] != 0x20 || buf[3] != 0x9F {
+		t.Fatalf("expected CONNACK 0x9F, got % x", buf)
+	}
+}
+
+// TestRateLimitDisconnects asserts that exceeding the per-conn inbound rate
+// triggers DISCONNECT 0x96.
+func TestRateLimitDisconnects(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetMaxInboundRateForTest(1) // 1 msg/sec
+
+	c := h.Connect(t, "rl-1")
+	defer c.Close()
+
+	// First publish consumes the only token; second publish in the same tick
+	// must trip the limit.
+	c.Publish(t, "rl/x", []byte("a"), 0, false)
+	// Send a raw QoS-0 PUBLISH so we don't wait for an ack.
+	pk := &packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		TopicName:   "rl/x",
+		Payload:     []byte("b"),
+	}
+	if err := c.WritePacket(pk); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := c.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	got, err := c.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT, got read err: %v", err)
+	}
+	if got.FixedHeader.Type != packets.Disconnect || got.ReasonCode != 0x96 {
+		t.Fatalf("expected DISCONNECT 0x96, got type=%d reason=0x%X", got.FixedHeader.Type, got.ReasonCode)
 	}
 }
 

@@ -71,6 +71,10 @@ spec:
               value: {{ .Values.operator.bcryptCost | quote }}
             - name: PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT
               value: {{ .Values.limits.maxQueuedDeliveriesPerClient | quote }}
+            - name: PGMQTT_MAX_CONNECTIONS
+              value: {{ .Values.limits.maxConnections | quote }}
+            - name: PGMQTT_MAX_INBOUND_MSGS_PER_SEC
+              value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
           ports:
             {{- if .Values.listeners.tcp.enabled }}
             - name: mqtt

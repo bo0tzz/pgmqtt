@@ -93,5 +93,14 @@ v5:
 ## deliveries table, new QoS-0 messages are silently dropped and new QoS>0
 ## messages cause that subscriber to be DISCONNECTed with reason 0x97
 ## (Quota Exceeded). 0 disables the cap entirely.
+##
+## maxConnections is a per-Pod cap on accepted TCP/WS sockets — at the cap,
+## CONNACK is rejected with 0x9F and the socket closed.
+##
+## maxInboundMsgsPerSec is a per-conn token-bucket rate on inbound
+## PUBLISH/SUBSCRIBE. Sustained over-rate triggers DISCONNECT 0x96
+## (Message Rate Too High). 0 disables both knobs.
 limits:
   maxQueuedDeliveriesPerClient: 10000
+  maxConnections: 5000
+  maxInboundMsgsPerSec: 1000

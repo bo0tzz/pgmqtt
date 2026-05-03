@@ -43,6 +43,16 @@ type Config struct {
 	//     DISCONNECTed with reason 0x97 (Quota Exceeded).
 	// 0 disables the cap entirely.
 	MaxQueuedDeliveriesPerClient int
+
+	// MaxConnections caps concurrent client connections this Pod will accept.
+	// Above the cap, CONNACK is rejected with reason 0x9F (Connection Rate
+	// Exceeded) and the socket is closed. 0 disables the cap.
+	MaxConnections int
+
+	// MaxInboundMsgsPerSec is the per-connection token-bucket rate for
+	// inbound PUBLISH/SUBSCRIBE. Sustained over-rate triggers a DISCONNECT
+	// 0x96 (Message Rate Too High). 0 disables the limit.
+	MaxInboundMsgsPerSec int
 }
 
 func FromEnv() (*Config, error) {
@@ -61,6 +71,8 @@ func FromEnv() (*Config, error) {
 		V5KeepaliveMax:               time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
 		BcryptCost:                   getenvInt("PGMQTT_BCRYPT_COST", 10),
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
+		MaxConnections:               getenvInt("PGMQTT_MAX_CONNECTIONS", 5000),
+		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

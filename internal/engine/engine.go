@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,8 +61,9 @@ type Engine struct {
 	takeover TakeoverNotifier
 	quota    QuotaNotifier
 
-	connsMu sync.RWMutex
-	conns   map[string]*Conn // client_id -> *Conn
+	connsMu     sync.RWMutex
+	conns       map[string]*Conn // client_id -> *Conn
+	openConns   atomic.Int64     // accepted-but-not-yet-closed sockets, regardless of CONNECT state
 
 	listenersMu  sync.RWMutex
 	tcpListener  net.Listener
@@ -189,9 +191,15 @@ func (e *Engine) acceptTCP(ctx context.Context, ln net.Listener) {
 			e.logger.Warn("accept", "err", err)
 			continue
 		}
+		if !e.tryReserveConn() {
+			e.logger.Warn("max connections reached; rejecting", "addr", nc.RemoteAddr())
+			e.rejectConnAtCap(nc)
+			continue
+		}
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
+			defer e.releaseConn()
 			c := newConn(e, nc)
 			c.run(ctx)
 		}()
@@ -212,9 +220,15 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 			return
 		}
 		nc := &wsConnAdapter{ws: ws}
+		if !e.tryReserveConn() {
+			e.logger.Warn("max connections reached; rejecting WS", "remote", r.RemoteAddr)
+			e.rejectConnAtCap(nc)
+			return
+		}
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
+			defer e.releaseConn()
 			c := newConn(e, nc)
 			c.run(ctx)
 		}()
@@ -305,6 +319,43 @@ func isClosedNetErr(err error) bool {
 		return false
 	}
 	return errors.Is(err, net.ErrClosed)
+}
+
+// tryReserveConn atomically reserves a slot if under cap. Returns false when
+// MaxConnections is configured and at-cap.
+func (e *Engine) tryReserveConn() bool {
+	if e.cfg == nil || e.cfg.MaxConnections <= 0 {
+		e.openConns.Add(1)
+		return true
+	}
+	for {
+		cur := e.openConns.Load()
+		if int(cur) >= e.cfg.MaxConnections {
+			return false
+		}
+		if e.openConns.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (e *Engine) releaseConn() { e.openConns.Add(-1) }
+
+// OpenConnections returns the current accepted-but-not-yet-closed socket
+// count. Exported for /metrics and tests.
+func (e *Engine) OpenConnections() int64 { return e.openConns.Load() }
+
+// rejectConnAtCap writes an MQTT-shaped CONNACK rejection (best effort) and
+// closes the socket. We don't know the client's protocol version yet, so we
+// emit a v5-style CONNACK with reason 0x9F (Connection Rate Exceeded) — v3.1.1
+// clients will see a malformed-CONNACK followed by close, which is the same
+// outcome they'd see for any other early-reject.
+func (e *Engine) rejectConnAtCap(nc net.Conn) {
+	defer nc.Close()
+	_ = nc.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	// Minimal v5 CONNACK: fixed header (0x20 0x03), session present (0x00),
+	// reason code 0x9F, properties length 0x00.
+	_, _ = nc.Write([]byte{0x20, 0x03, 0x00, 0x9F, 0x00})
 }
 
 // localNotifier is the default — no-op. Wires M5's Postgres-LISTEN-backed

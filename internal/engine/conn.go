@@ -64,15 +64,37 @@ type Conn struct {
 	gracefulRequested atomic.Bool
 	closed            chan struct{}
 	once              sync.Once
+
+	// Inbound rate limit (PUBLISH/SUBSCRIBE). Token-bucket: capacity equals
+	// MaxInboundMsgsPerSec; refills at 1/cap each tick, capped at the
+	// configured rate. 0 disables the limit. Burst=cap means a fully-filled
+	// bucket can absorb a burst of `cap` messages, then steady-state at rate.
+	rateMu     sync.Mutex
+	rateTokens int
+	rateLast   time.Time
 }
 
 func newConn(e *Engine, nc net.Conn) *Conn {
-	return &Conn{
+	c := &Conn{
 		eng:    e,
 		nc:     nc,
 		reader: mqttwire.NewReader(nc),
 		closed: make(chan struct{}),
 	}
+	if r := e.maxInboundRate(); r > 0 {
+		c.rateTokens = r
+		c.rateLast = time.Now()
+	}
+	return c
+}
+
+// maxInboundRate returns the per-conn rate-limit (msgs/s) for inbound
+// PUBLISH/SUBSCRIBE. 0 disables the limit.
+func (e *Engine) maxInboundRate() int {
+	if e.cfg == nil {
+		return 0
+	}
+	return e.cfg.MaxInboundMsgsPerSec
 }
 
 func (c *Conn) run(ctx context.Context) {
@@ -132,6 +154,20 @@ func (c *Conn) armReadDeadline() error {
 
 func (c *Conn) dispatch(ctx context.Context, pk *packets.Packet) error {
 	switch pk.FixedHeader.Type {
+	case packets.Publish, packets.Subscribe:
+		// Per-conn rate limit only applies to PUBLISH/SUBSCRIBE — the cost
+		// drivers. Acks (PUBACK/PUBREC/PUBREL/PUBCOMP) and PINGREQ are
+		// not metered: they're protocol-required responses to packets we
+		// already counted, and rate-limiting them would deadlock QoS flows.
+		if !c.tryConsumeRateToken() {
+			_ = c.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x96, // Message rate too high
+			})
+			return fmt.Errorf("inbound rate limit exceeded")
+		}
+	}
+	switch pk.FixedHeader.Type {
 	case packets.Publish:
 		return c.handlePublish(ctx, pk)
 	case packets.Puback:
@@ -153,6 +189,37 @@ func (c *Conn) dispatch(ctx context.Context, pk *packets.Packet) error {
 	default:
 		return fmt.Errorf("unsupported packet type: %d", pk.FixedHeader.Type)
 	}
+}
+
+// tryConsumeRateToken refills the bucket up to `cap` based on elapsed time
+// (cap tokens per second) and consumes one. Returns false when the bucket is
+// empty after refill.
+func (c *Conn) tryConsumeRateToken() bool {
+	cap := c.eng.maxInboundRate()
+	if cap <= 0 {
+		return true
+	}
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	now := time.Now()
+	if !c.rateLast.IsZero() {
+		add := int(now.Sub(c.rateLast).Seconds() * float64(cap))
+		if add > 0 {
+			c.rateTokens += add
+			if c.rateTokens > cap {
+				c.rateTokens = cap
+			}
+			c.rateLast = now
+		}
+	} else {
+		c.rateLast = now
+		c.rateTokens = cap
+	}
+	if c.rateTokens <= 0 {
+		return false
+	}
+	c.rateTokens--
+	return true
 }
 
 func (c *Conn) write(pk *packets.Packet) error {
@@ -231,6 +298,23 @@ func (e *Engine) SetMaxQueuedDeliveriesForTest(n int) {
 		return
 	}
 	e.cfg.MaxQueuedDeliveriesPerClient = n
+}
+
+// SetMaxConnectionsForTest overrides the per-Pod connection cap. Test-only.
+func (e *Engine) SetMaxConnectionsForTest(n int) {
+	if e.cfg == nil {
+		return
+	}
+	e.cfg.MaxConnections = n
+}
+
+// SetMaxInboundRateForTest overrides the per-conn inbound msgs/s rate.
+// Test-only.
+func (e *Engine) SetMaxInboundRateForTest(n int) {
+	if e.cfg == nil {
+		return
+	}
+	e.cfg.MaxInboundMsgsPerSec = n
 }
 
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised
