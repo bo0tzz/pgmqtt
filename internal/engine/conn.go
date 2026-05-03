@@ -164,6 +164,9 @@ func (c *Conn) dispatch(ctx context.Context, pk *packets.Packet) error {
 				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
 				ReasonCode:  0x96, // Message rate too high
 			})
+			if c.eng.metrics != nil {
+				c.eng.metrics.RateLimitedTotal.Inc()
+			}
 			return fmt.Errorf("inbound rate limit exceeded")
 		}
 	}

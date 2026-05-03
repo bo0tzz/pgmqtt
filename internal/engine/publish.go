@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -84,6 +85,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	})
 	if err != nil {
 		return err
+	}
+	if c.eng.metrics != nil {
+		c.eng.metrics.PublishesTotal.WithLabelValues(strconv.Itoa(int(pk.FixedHeader.Qos))).Inc()
 	}
 	c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
 		"qos", pk.FixedHeader.Qos, "msg", res.MessageID, "brokers", len(res.BrokerIDs))
@@ -208,6 +212,9 @@ func (e *Engine) QuotaExceededLocally(clientID string) {
 			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
 			ReasonCode:  0x97, // Quota Exceeded
 		})
+	}
+	if e.metrics != nil {
+		e.metrics.QuotaExceededTotal.Inc()
 	}
 	conn.Shutdown()
 }

@@ -75,6 +75,8 @@ spec:
               value: {{ .Values.limits.maxConnections | quote }}
             - name: PGMQTT_MAX_INBOUND_MSGS_PER_SEC
               value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
+            - name: PGMQTT_METRICS_ADDR
+              value: {{ if .Values.metrics.enabled }}":{{ .Values.metrics.port }}"{{ else }}""{{ end }}
           ports:
             {{- if .Values.listeners.tcp.enabled }}
             - name: mqtt
@@ -84,6 +86,11 @@ spec:
             {{- if .Values.listeners.ws.enabled }}
             - name: mqtt-ws
               containerPort: {{ .Values.listeners.ws.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
               protocol: TCP
             {{- end }}
           {{- if .Values.probes.enabled }}

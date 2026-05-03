@@ -13,6 +13,7 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/janitor"
 	"github.com/bo0tzz/pgmqtt/internal/leader"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 	"github.com/bo0tzz/pgmqtt/internal/operator"
 )
 
@@ -51,6 +52,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	mtx := metrics.New()
+	mtx.RegisterPgxPool(pool)
+	eng.SetMetrics(mtx)
+	if cfg.MetricsAddr != "" {
+		go func() {
+			logger.Info("metrics listening", "addr", cfg.MetricsAddr)
+			if err := mtx.Serve(ctx, cfg.MetricsAddr); err != nil && err.Error() != "http: Server closed" {
+				logger.Warn("metrics serve", "err", err)
+			}
+		}()
+	}
+
 	lst, err := listener.Start(ctx, cfg.DatabaseURL, eng, logger)
 	if err != nil {
 		logger.Error("listener", "err", err)
@@ -70,6 +83,7 @@ func main() {
 	defer ld.Stop()
 
 	jt := janitor.New(pool, eng, logger)
+	jt.SetMetrics(mtx)
 	go jt.RunWith(ctx, ld)
 
 	go func() {

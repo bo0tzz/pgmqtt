@@ -33,9 +33,19 @@ service:
   annotations: {}
 
 ## Optional ServiceMonitor for prometheus-operator. Disabled by default; set
-## to true if you have prometheus-operator installed.
+## to true if you have prometheus-operator installed. The metrics endpoint
+## listens on metricsPort (defaults below) and exports pgmqtt_* counters
+## plus Go runtime metrics + pgxpool stats.
 serviceMonitor:
   enabled: false
+  ## Scrape interval; passed straight through to the ServiceMonitor spec.
+  interval: 30s
+  ## Optional path; default /metrics matches the broker's exposed handler.
+  path: /metrics
+
+metrics:
+  enabled: true
+  port: 9090
 
 resources:
   requests:

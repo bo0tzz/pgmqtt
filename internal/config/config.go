@@ -53,6 +53,10 @@ type Config struct {
 	// inbound PUBLISH/SUBSCRIBE. Sustained over-rate triggers a DISCONNECT
 	// 0x96 (Message Rate Too High). 0 disables the limit.
 	MaxInboundMsgsPerSec int
+
+	// MetricsAddr is the bind address for the Prometheus /metrics endpoint.
+	// Empty disables metrics serving entirely.
+	MetricsAddr string
 }
 
 func FromEnv() (*Config, error) {
@@ -73,6 +77,7 @@ func FromEnv() (*Config, error) {
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
 		MaxConnections:               getenvInt("PGMQTT_MAX_CONNECTIONS", 5000),
 		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
+		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

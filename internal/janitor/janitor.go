@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
 // Run loops until ctx is cancelled. While leader.IsLeader is true (gated by
@@ -31,6 +32,8 @@ type Janitor struct {
 	// sweep evicts it for sessions that are currently disconnected. Protects
 	// against pathological clients that send PUBLISH but never PUBREL.
 	inboundQoS2Grace time.Duration
+
+	metrics *metrics.Metrics
 }
 
 // New constructs a Janitor.
@@ -57,6 +60,9 @@ func (j *Janitor) SetOrphanGrace(d time.Duration) { j.orphanGrace = d }
 
 // SetInboundQoS2Grace overrides the inbound_qos2 grace period.
 func (j *Janitor) SetInboundQoS2Grace(d time.Duration) { j.inboundQoS2Grace = d }
+
+// SetMetrics installs a Metrics instance for janitor counters. Optional.
+func (j *Janitor) SetMetrics(m *metrics.Metrics) { j.metrics = m }
 
 // Leader is the subset of leader.Leader the janitor depends on.
 type Leader interface {
@@ -100,6 +106,10 @@ func (j *Janitor) Tick(ctx context.Context) error {
 	for _, id := range dead {
 		if err := j.handleDeadBroker(ctx, id); err != nil {
 			j.logger.Warn("dead broker handling", "broker", id, "err", err)
+			continue
+		}
+		if j.metrics != nil {
+			j.metrics.DeadBrokersTotal.Inc()
 		}
 	}
 	if err := j.fireDueWills(ctx); err != nil {
@@ -114,7 +124,51 @@ func (j *Janitor) Tick(ctx context.Context) error {
 	if err := j.sweepInboundQoS2(ctx); err != nil {
 		j.logger.Warn("sweep inbound qos2", "err", err)
 	}
+	if err := j.refreshDeliveriesGauge(ctx); err != nil {
+		j.logger.Warn("refresh deliveries gauge", "err", err)
+	}
 	return j.sweepOrphanMessages(ctx)
+}
+
+// refreshDeliveriesGauge re-populates pgmqtt_deliveries_inflight{state} once
+// per tick. Cheap (one indexed COUNT GROUP BY query) and gives operators a
+// continuous view of broker queue depth without touching the broker hot
+// path.
+func (j *Janitor) refreshDeliveriesGauge(ctx context.Context) error {
+	if j.metrics == nil {
+		return nil
+	}
+	rows, err := j.pool.Query(ctx, `SELECT state, count(*) FROM deliveries GROUP BY state`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	seen := map[int]int{0: 0, 1: 0, 2: 0}
+	for rows.Next() {
+		var state int
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return err
+		}
+		seen[state] = n
+	}
+	for state, n := range seen {
+		j.metrics.DeliveriesInflight.WithLabelValues(stateLabel(state)).Set(float64(n))
+	}
+	return rows.Err()
+}
+
+func stateLabel(state int) string {
+	switch state {
+	case 0:
+		return "queued"
+	case 1:
+		return "inflight"
+	case 2:
+		return "awaiting_pubcomp"
+	default:
+		return "unknown"
+	}
 }
 
 // fireDueWills publishes wills whose scheduled fire-time has arrived. We use
@@ -181,6 +235,10 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 	for _, w := range wills {
 		if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
 			j.logger.Warn("fire delayed will", "client", w.client, "err", err)
+			continue
+		}
+		if j.metrics != nil {
+			j.metrics.WillsFiredTotal.Inc()
 		}
 	}
 	return nil
@@ -189,13 +247,19 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 // expireSessions deletes session rows whose v5 SessionExpiryInterval has
 // elapsed. Subscriptions and deliveries cascade via FK ON DELETE CASCADE.
 func (j *Janitor) expireSessions(ctx context.Context) error {
-	_, err := j.pool.Exec(ctx, `
+	ct, err := j.pool.Exec(ctx, `
 		DELETE FROM sessions
 		 WHERE connected = false
 		   AND session_expires_at IS NOT NULL
 		   AND session_expires_at <= now()
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	if j.metrics != nil && ct.RowsAffected() > 0 {
+		j.metrics.SessionsExpired.Add(float64(ct.RowsAffected()))
+	}
+	return nil
 }
 
 // expireRetained drops retained rows past their MessageExpiryInterval.

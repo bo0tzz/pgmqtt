@@ -34,19 +34,17 @@ suggested below. Cross items off in this file as they ship.
           `Values.limits.{maxConnections,maxInboundMsgsPerSec}`.
         Tests: `TestMaxConnectionsRejects`, `TestRateLimitDisconnects`.
 
-- [ ] **Prometheus metrics.** Helm `serviceMonitor.enabled` exists but the
-      broker doesn't expose `/metrics`. Implement (`prometheus/client_golang`
-      is conventional for Go; `slog`-driven counters are an alternative if
-      we want zero deps). Minimum gauges/counters to expose:
-        * `pgmqtt_connections{state="connected|disconnected"}`
-        * `pgmqtt_publishes_total{qos}` (counter)
-        * `pgmqtt_deliveries_inflight{qos}` (gauge from deliveries table)
-        * `pgmqtt_takeovers_total` (counter)
-        * `pgmqtt_dead_brokers_handled_total`
-        * `pgmqtt_session_expired_total`
-        * `pgmqtt_will_fired_total`
-        * Postgres pool stats from pgxpool.
-      Add `metricsPort` in Helm + ServiceMonitor template.
+- [x] **Prometheus metrics.** `internal/metrics` registers
+      `pgmqtt_connections`, `pgmqtt_publishes_total{qos}`,
+      `pgmqtt_deliveries_inflight{state}` (queued/inflight/awaiting_pubcomp,
+      refreshed each janitor tick), `pgmqtt_takeovers_total`,
+      `pgmqtt_dead_brokers_handled_total`, `pgmqtt_sessions_expired_total`,
+      `pgmqtt_wills_fired_total`, `pgmqtt_quota_exceeded_total`,
+      `pgmqtt_rate_limited_total`, plus a pgxpool collector for connection
+      pool depth/acquire latency. Served on `:9090/metrics` by default
+      (`PGMQTT_METRICS_ADDR`). Helm: `metrics.{enabled,port}`,
+      `serviceMonitor.{enabled,interval,path}`, plus the existing
+      ServiceMonitor flag is now wired to a real template.
 
 - [x] **Configurable v5 server policy.** `PGMQTT_RECEIVE_MAXIMUM`,
       `PGMQTT_TOPIC_ALIAS_MAXIMUM`, `PGMQTT_KEEPALIVE_MAX_SEC` and Helm

@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bo0tzz/pgmqtt/internal/config"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
 // Notifier emits cross-Pod publish notifications. The default notifier
@@ -60,6 +61,8 @@ type Engine struct {
 	notify   Notifier
 	takeover TakeoverNotifier
 	quota    QuotaNotifier
+
+	metrics *metrics.Metrics
 
 	connsMu     sync.RWMutex
 	conns       map[string]*Conn // client_id -> *Conn
@@ -120,6 +123,12 @@ func (e *Engine) SetTakeoverNotifier(t TakeoverNotifier) {
 // SetQuotaNotifier swaps the quota-exceeded notifier. Call before Serve.
 func (e *Engine) SetQuotaNotifier(q QuotaNotifier) {
 	e.quota = q
+}
+
+// SetMetrics installs a Metrics instance. Engine increments
+// counters/gauges on it as events occur. Calls are no-op when nil.
+func (e *Engine) SetMetrics(m *metrics.Metrics) {
+	e.metrics = m
 }
 
 // Serve runs the accept loops until ctx is cancelled or a fatal accept error.
@@ -295,6 +304,14 @@ func (e *Engine) registerConn(clientID string, c *Conn) (prev *Conn) {
 	defer e.connsMu.Unlock()
 	prev = e.conns[clientID]
 	e.conns[clientID] = c
+	if e.metrics != nil {
+		if prev == nil {
+			e.metrics.Connections.Inc()
+		} else {
+			// CONNECT for an already-connected client_id is a takeover.
+			e.metrics.TakeoversTotal.Inc()
+		}
+	}
 	return prev
 }
 
@@ -303,6 +320,9 @@ func (e *Engine) unregisterConnIfSame(clientID string, c *Conn) {
 	defer e.connsMu.Unlock()
 	if cur, ok := e.conns[clientID]; ok && cur == c {
 		delete(e.conns, clientID)
+		if e.metrics != nil {
+			e.metrics.Connections.Dec()
+		}
 	}
 }
 
