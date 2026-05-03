@@ -546,9 +546,12 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		}
 	}
 
+	willFired := false
 	if willFireImmediate && c.willTopic != "" {
 		if err := c.fireWill(bgCtx); err != nil {
 			c.eng.logger.Warn("fire will", "err", err)
+		} else {
+			willFired = true
 		}
 	}
 
@@ -560,15 +563,29 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		return
 	}
 
+	// When we just fired the will, also NULL the will_* columns. Otherwise
+	// the row still has will_topic/will_payload set with the (about-to-be)
+	// stale broker_id; if this pod later dies before something else clears
+	// them, the leader's dead-broker scan would fire the same will a
+	// second time. Clearing them here closes that window down to "between
+	// fireWill's commit and this UPDATE's commit" — eliminating it
+	// entirely would require an atomic publish+update tx, which the
+	// publishCore boundary doesn't currently allow.
 	_, err := c.eng.pool.Exec(bgCtx, `
 		UPDATE sessions SET
 			connected=false,
 			broker_id=NULL,
 			last_seen=now(),
 			will_fire_at=$2,
-			session_expires_at=$3
+			session_expires_at=$3,
+			will_topic      = CASE WHEN $4 THEN NULL ELSE will_topic END,
+			will_payload    = CASE WHEN $4 THEN NULL ELSE will_payload END,
+			will_qos        = CASE WHEN $4 THEN NULL ELSE will_qos END,
+			will_retain     = CASE WHEN $4 THEN NULL ELSE will_retain END,
+			will_delay      = CASE WHEN $4 THEN NULL ELSE will_delay END,
+			will_properties = CASE WHEN $4 THEN NULL ELSE will_properties END
 		WHERE client_id=$1`,
-		c.clientID, willFireAt, persistExpiresAt)
+		c.clientID, willFireAt, persistExpiresAt, willFired)
 	if err != nil {
 		c.eng.logger.Warn("mark disconnected", "client", c.clientID, "err", err)
 	}
