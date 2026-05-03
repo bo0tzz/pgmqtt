@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — broker correctness
+
+- `publishCore` is now a single transaction covering retain mutation,
+  optional QoS-2 inbound dedup (was a separate `pool.Exec`), the message
+  INSERT + fanout, the cross-Pod `pg_notify`, and the COMMIT. Previously
+  retain and dedup ran on a separate connection before the publish tx
+  began, and `pg_notify` ran AFTER commit — both windows admitted silent
+  failure modes (orphan retained row + missing live publish; QoS-2
+  message swallowed by ON CONFLICT after a crashed publishCore;
+  successful PUBACK with no peer notified).
+- `handleDisconnect` now NULLs `will_topic`/`will_payload`/`will_qos`/
+  `will_retain`/`will_delay`/`will_properties` when it just fired the
+  immediate-will, closing the window where a later pod death would have
+  fired the same will a second time via the dead-broker scan.
+- `handleDisconnect`'s clean-session path and `janitor.expireSessions`
+  now wrap their cleanup in one tx (DELETE deliveries, DELETE session,
+  COMMIT). Same for the CONNECT clean-start path.
+- `janitor.fireDueWills` publishes the will *before* clearing
+  `will_fire_at` / will_*. A crash between publish-commit and clear
+  surfaces as a duplicate-will on the next janitor tick rather than
+  silent loss.
+- Migration **0006** drops the `deliveries.client_id → sessions` FK.
+  The implicit `FOR KEY SHARE` lock on every delivery insert was the
+  dominant Postgres bottleneck under fan-out load (MultiXact SLRU
+  thrash, ~10× slowdown on every `sessions` lookup). Cleanup now happens
+  explicitly in the broker's session-delete paths plus a new
+  `janitor.sweepOrphanDeliveries`.
+- Migration **0007** adds a partial index
+  `deliveries(client_id, id) WHERE state=0 AND qos>0` so the broker's
+  inflight-delivery scan stops falling back to a full pkey walk.
+
+### Added — operability
+
+- `pgmqtt_publish_seconds` Prometheus histogram with stages `total`,
+  `qos2_dedup`, `retain`, `tx_begin`, `mqtt_publish_query`, `tx_commit`,
+  `notify`, `response_write`. Per-stage attribution of inbound PUBLISH
+  latency without correlating against `pg_stat_statements`.
+- `PGMQTT_PG_STATEMENT_TIMEOUT_MS` (default `30000`) plumbed into the
+  pgxpool ConnConfig.RuntimeParams. Bounds wedged Postgres so publisher
+  dispatch can't hang past keepalive.
+- Helm `auth.allowAnonymous` and `extraEnv` values — the chart
+  previously documented `--set auth.allowAnonymous=true` but no
+  template rendered it; setting it was a silent no-op.
+- Helm `crds.install` is now actually wired. The User CRD moved from
+  `crds/users.yaml` (Helm v3 install-only) into a templated CRD in
+  `templates/crd-users.yaml` gated on `.Values.crds.install`.
+- `cfg.PodName` (was read from POD_NAME env via Downward API but never
+  consumed) is now pinned onto every log line via `slog.With`, so
+  aggregated-log operators can correlate pod ↔ broker UUID.
+
+### Added — docs
+
+- `docs/PERF.md` runbook: stage-by-stage attribution, calibrated kind
+  baseline (3.49 ms total / 0.1 ms fsync — fsync is *not* the
+  bottleneck), under-load measurement showing MultiXact SLRU thrash,
+  and a "how does this compare to other brokers?" table grounded in
+  published benchmarks.
+- `docs/VERSIONING.md` defines the SemVer policy across broker /
+  operator API / PG schema and the CHANGELOG flow.
+
+### Added — tests
+
+- 19 new `internal/operator/user_controller_test.go` cases covering
+  BYO Secret error paths, finalizer-add/Secret-create transient
+  failures, DB error paths, deletion paths, multi-User isolation,
+  OwnerReference encoding, and bcrypt-cost edges. Coverage on the
+  controller's per-function lines is now 96–100% (Reconcile 97.6%,
+  reconcileDelete 100%, resolveCredentialSecret 96%).
+- `internal/db/migrate_test.go` exercises the new `statement_timeout`
+  knob via testcontainers Postgres.
+
+### Verified
+
+- Network-partition chaos via Chaos Mesh: 5 partition cycles × 30 s
+  on/off during 300 s soak with `-inflight 50`, 0 lost / 0 dups across
+  all subscribers. Recorded in `docs/VERIFY.md`.
+- Soak rig cross-validation against Mosquitto 2.x: with
+  `persistence true`, identical clean metrics shape — confirms the
+  rig's reports are broker-attributable, not rig-attributable.
+
 ## [0.1.0] - 2026-05-03
 
 First tagged release. Production-ready scope per `docs/TODO.md`.
