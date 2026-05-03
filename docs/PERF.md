@@ -4,13 +4,17 @@ This is a runbook for the question *"why is my pgmqtt slower than I
 expected?"*. It assumes you've read [OPS.md](OPS.md) for the basic
 metrics surface and have Prometheus + Grafana scraping `/metrics`.
 
-The TL;DR for sizing: at QoS-1, sustained per-connection throughput is
-bounded by `RTT + Postgres COMMIT time`. Postgres COMMIT time is
-`fsync` time when `synchronous_commit=on`, which is the default and
-the right setting for a broker that promises at-least-once delivery.
-On NVMe with a battery-backed write cache, `fsync` is ~1 ms; on a
-container volume on overlay storage, expect 10–30 ms. Total system
-throughput scales linearly with parallel publisher connections.
+The architectural shape: at QoS-1, sustained per-connection throughput
+is bounded by `RTT + the broker's per-PUBLISH cost`, where the
+per-PUBLISH cost is dominated by Postgres time (BeginTx + the fanout
+SELECT + COMMIT). With `synchronous_commit=on` (the right default for
+at-least-once delivery), `COMMIT` includes a WAL fsync.
+
+This document is intentionally light on absolute numbers — calibrated
+results require a run on your hardware with the histograms below.
+A baseline benchmark suite for pgmqtt's own dev / CI clusters lives
+in [VERIFY.md](VERIFY.md); contribute results back if you measure
+something interesting.
 
 ## What's instrumented
 
@@ -42,27 +46,16 @@ histogram_quantile(0.99,
   sum by (le, stage)(rate(pgmqtt_publish_seconds_bucket[5m])))
 ```
 
-A typical breakdown on a healthy cluster (NVMe-backed Postgres):
-
-| Stage                | Median  | p99    |
-| ---                  | ---     | ---    |
-| `total`              | 2 ms    | 8 ms   |
-| `tx_begin`           | 0.1 ms  | 1 ms   |
-| `mqtt_publish_query` | 0.5 ms  | 3 ms   |
-| `tx_commit`          | 1 ms    | 5 ms   |
-| `notify`             | 0.1 ms  | 1 ms   |
-| `response_write`     | 0.05 ms | 0.5 ms |
-
-If `total` p99 is much higher than the sum of the per-stage p99s,
-something is happening between stages — typically goroutine scheduling
-under CPU pressure.
+When `total` p99 is materially higher than the sum of the per-stage
+p99s, something is happening between stages — typically goroutine
+scheduling under CPU pressure, or a stage that isn't yet
+instrumented. Cross-check against `process_cpu_seconds_total` and
+`go_sched_latencies_seconds`.
 
 ## Common patterns
 
-**Slow `tx_commit`, everything else fast.** This is fsync. Either
-your disk is slow (kind on overlayfs is the canonical example), or
-Postgres' WAL volume is contended. Check `pg_stat_io` (PG16+) for
-`fsync_time`:
+**`tx_commit` dominates.** This is fsync. Either your disk is slow,
+or Postgres' WAL volume is contended. Check `pg_stat_io` (PG16+):
 
 ```sql
 SELECT backend_type, object, fsyncs, fsync_time
@@ -71,20 +64,21 @@ SELECT backend_type, object, fsyncs, fsync_time
    AND fsyncs > 0;
 ```
 
-If `fsync_time / fsyncs` is in the tens of ms on supposedly-fast disk,
-the disk path is the issue (kernel block cache, virtualised storage,
-network-attached volume).
+`fsync_time / fsyncs` gives mean fsync cost. Compare against the
+underlying disk's expected fsync — if much slower, the disk path is
+indirected (kernel block cache, virtualised storage, copy-on-write
+overlay, network-attached volume).
 
-**Slow `tx_begin`, everything else fast.** Pool exhaustion. Check
+**`tx_begin` dominates.** Pool exhaustion. Check
 `pgmqtt_pgxpool_acquire_seconds_total / pgmqtt_pgxpool_acquire_count`
-for mean acquire time. If it's > 1 ms you're contending on a small
-pool. Bump `PGMQTT_DB_MAX_CONNS` (default 10) if your worker count
-warrants it.
+for mean acquire time and compare against `pgmqtt_pgxpool_in_use`
+vs `pgmqtt_pgxpool_total`. Saturated pool → bump
+`PGMQTT_DB_MAX_CONNS`.
 
-**Slow `mqtt_publish_query`.** This is the fanout SQL — the work of
-expanding subscribers and writing delivery rows. If it dominates,
-you have either a very fanned-out topic (many matching subscribers)
-or `pg_stat_statements` will tell you which subquery is slow:
+**`mqtt_publish_query` dominates.** This is the fanout SQL — expand
+subscribers and write delivery rows. Either the topic is very
+fanned-out (many matching subscribers, big delivery insert), or a
+specific subquery is slow. `pg_stat_statements` will tell you which:
 
 ```sql
 SELECT query, calls, mean_exec_time, total_exec_time, rows
@@ -94,13 +88,13 @@ SELECT query, calls, mean_exec_time, total_exec_time, rows
  LIMIT 10;
 ```
 
-**Slow `notify`.** A NOTIFY queue is in shared memory and bounded.
-If LISTENers are slow to consume, NOTIFY blocks. Check
-`pg_listening_channels()` from a `psql` session — should return
-`pgmqtt_deliveries` and the per-broker quota channels. If brokers
-get behind on LISTEN, the queue grows; PG's `pg_notification_queue_usage()`
-returns the fraction filled (0.0..1.0). > 0.5 means a broker has
-gone quiet.
+**`notify` shows up at all.** Postgres' NOTIFY queue is in shared
+memory and bounded. If LISTENers fall behind, NOTIFY blocks.
+`pg_notification_queue_usage()` returns fill ratio (0.0..1.0); > 0.5
+means at least one broker's LISTEN has gone quiet. Check
+`pg_listening_channels()` from a `psql` session — pgmqtt brokers
+should LISTEN on `pgmqtt_<broker_uuid>`, `pgmqtt_takeover_<uuid>`,
+and `pgmqtt_quota_<uuid>`.
 
 ## Enabling `pg_stat_statements`
 
@@ -128,29 +122,28 @@ copy.
 
 ## Deciding to optimise
 
-The two main broker-side levers (in increasing complexity):
+**Profile before changing anything.** The histograms will tell you
+which stage dominates; the right lever depends on which one.
 
-1. **Connection-pool tuning**. If `tx_begin` is your dominant stage
-   under load, raise `PGMQTT_DB_MAX_CONNS`. Cheap.
-2. **Async PUBLISH dispatch with pipelined commits**. If `tx_commit`
-   dominates and your disk is already as fast as it'll get, the broker
-   could pipeline up to `serverReceiveMaximum` (100) commits per
-   connection and let Postgres group-commit them. Estimated 5–10×
-   single-connection win on slow disks. Real engineering project,
-   not a tweak. Profile first.
+Possible levers, framed by which stage they target — none of these
+have been benchmarked yet on documented hardware, so the *whether*
+and *how much* is unverified:
 
-The two main Postgres-side levers:
-
-1. **Faster disk** — NVMe with battery-backed write cache. Single
-   biggest no-brainer.
-2. **`commit_delay` + `commit_siblings`** — small group-commit window
-   that helps when there are multiple concurrent publisher transactions.
-   Useless for a single-connection workload.
+- `tx_begin` dominates → raise `PGMQTT_DB_MAX_CONNS`. Cheap.
+- `tx_commit` dominates with slow disk → faster disk (NVMe with
+  battery-backed write cache).
+- `tx_commit` dominates with multiple concurrent publishers →
+  `commit_delay` + `commit_siblings` for group commit. Useless on
+  single-connection workloads.
+- `tx_commit` dominates and disk is already fast → async PUBLISH
+  dispatch with pipelined commits inside the broker (let up to
+  `serverReceiveMaximum` PUBLISHes per conn fly with PG group commit).
+  Real engineering project; not yet implemented.
 
 What to **not** do: `synchronous_commit=off` or UNLOGGED tables.
-Both give up the at-least-once durability promise. A PUBACK for a
-message Postgres later loses is exactly the failure mode QoS-1 exists
-to prevent.
+Both give up the at-least-once durability promise — a PUBACK for a
+message Postgres later loses is exactly the failure mode QoS-1
+exists to prevent.
 
 ## Validating throughput on your hardware
 
