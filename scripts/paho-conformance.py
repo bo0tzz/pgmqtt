@@ -93,7 +93,7 @@ def main() -> int:
         )]
         candidates.sort()
 
-        print(f"\n=== Paho v{version} — {len(candidates)} tests ===")
+        print(f"\n=== Paho v{version} — {len(candidates)} tests ===", flush=True)
         results = []
         for name in candidates:
             signal.signal(signal.SIGALRM, handler)
@@ -117,12 +117,12 @@ def main() -> int:
                 results.append((name, "EXCEPT", str(e)[:160]))
             finally:
                 signal.alarm(0)
-
-        for name, status, why in results:
+            name_, status, why = results[-1]
             tag = "✓" if status == "PASS" else "✗"
-            print(f"  {tag} {name:50s} {status} {why}")
+            print(f"  {tag} {name_:50s} {status} {why}", flush=True)
+
         passes = sum(1 for _, s, _ in results if s == "PASS")
-        print(f"=== v{version}: {passes}/{len(results)} passing ===")
+        print(f"=== v{version}: {passes}/{len(results)} passing ===", flush=True)
         if passes != len(results):
             overall_pass = False
 

@@ -44,7 +44,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		  JOIN messages m ON m.id = d.message_id
 		 WHERE d.message_id = $1
 		   AND s.broker_id = $2
-		   AND d.state IN (0, 1)
+		   AND d.state = 0
 		   AND (m.expires_at IS NULL OR m.expires_at > now())
 	`, messageID, self)
 	if err != nil {
@@ -185,6 +185,9 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		if currentPacketID != nil && state >= 1 {
 			pid = *currentPacketID
 		} else {
+			// Race-safe state transition: only one caller may flip state=0→1.
+			// If RowsAffected==0 someone else already claimed the delivery —
+			// release the slot and skip.
 			tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
 			if err != nil {
 				conn.returnInflight()
@@ -196,13 +199,19 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 				conn.returnInflight()
 				return false, err
 			}
-			if _, err := tx.Exec(ctx, `
+			ct, err := tx.Exec(ctx, `
 				UPDATE deliveries SET packet_id=$1, state=1
-				 WHERE id=$2
-			`, pid, deliveryID); err != nil {
+				 WHERE id=$2 AND state=0
+			`, pid, deliveryID)
+			if err != nil {
 				_ = tx.Rollback(ctx)
 				conn.returnInflight()
 				return false, err
+			}
+			if ct.RowsAffected() == 0 {
+				_ = tx.Rollback(ctx)
+				conn.returnInflight()
+				return false, nil
 			}
 			if err := tx.Commit(ctx); err != nil {
 				conn.returnInflight()
