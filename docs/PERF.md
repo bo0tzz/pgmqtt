@@ -256,3 +256,53 @@ PUBACKs at end-of-run). Keep `-inflight` ≤ broker's
 For comparing against a reference broker, the same rig runs against
 Mosquitto, EMQX, or any MQTT 3.1.1+5 broker — the metrics shape
 (published / received / lost / dups) is broker-independent.
+
+## How does this compare to other brokers?
+
+Most published broker numbers measure **in-memory** throughput; pgmqtt's
+durability model (every PUBLISH committed to Postgres before PUBACK) is
+fundamentally different and the comparison is only meaningful against
+brokers in a comparable durable mode. From a 2026 survey of public
+benchmarks (see commit history for sources):
+
+| Broker | Mode | Hardware | Throughput |
+| --- | --- | --- | --- |
+| EMQX | QoS 1, in-memory | 1× c5.4xlarge (16 vCPU) | 50k msg/s p2p, 250k fan-out |
+| Mosquitto | QoS 1, persistence off | 1× c5.4xlarge | 37k p2p, 81k fan-out |
+| HiveMQ 4.18 | QoS 1, **persisted** | 3× m6a.8xlarge cluster | 270k msg/s |
+| RabbitMQ + MQTT plugin | QoS 1, **durable classic queues** | 1× 8 vCPU / 32 GB | ~18k msg/s |
+| **TBMQ on PostgreSQL** | QoS 1 persistent, INSERT-per-msg | 1 PG node, 12 cores / 64 GB | **30k msg/s** ceiling |
+| Kafka | acks=all, default fsync (pagecache) | OpenMessaging cluster | ~600k msg/s |
+| Kafka | acks=all + `flush.messages=1` (per-msg fsync) | — | "two to three orders of magnitude lower"; rarely used |
+| Raw Postgres single-row INSERTs | `synchronous_commit=on`, full ACID | Ryzen 9 7950X / NVMe | ~1.9k writes/s real workload |
+
+The closest direct analogue is **TBMQ's PostgreSQL prototype** — same
+"every PUBLISH is INSERTed and COMMITed in PG before PUBACK" model.
+ThingsBoard hit ~30k msg/s on dedicated 12-core / 64 GB and subsequently
+migrated TBMQ off PG to Redis to scale further. That's the realistic
+ceiling for this architecture on well-provisioned dedicated hardware.
+
+Where pgmqtt should plausibly land:
+
+- **10k–30k msg/s on dedicated hardware** at QoS-1 sync commit. One to
+  two orders of magnitude below in-memory brokers (EMQX/NanoMQ at 50k–
+  250k); within an order of magnitude of RabbitMQ-durable (~18k) and
+  TBMQ-on-PG (~30k).
+- The gap to in-memory is the price of "every PUBLISH is in WAL before
+  PUBACK." It is not an implementation defect — TBMQ migrating off PG
+  and Kafka explicitly avoiding per-message fsync are evidence this is
+  a structural cost.
+- The 125 msg/s we measured on a contended kind cluster is **not**
+  representative. Kind on shared host with concurrent workloads,
+  through Docker overlay, with PG and broker on the same node, is
+  about 2.5 orders of magnitude below the architectural ceiling — that
+  matches what the Postgres-write-performance literature predicts when
+  WAL fsync, pgxpool contention, and concurrent small transactions
+  stack up.
+
+If you're picking pgmqtt over an in-memory broker, you're paying that
+1–2 OOM throughput cost in exchange for "messages are in your existing
+Postgres cluster's backup story", "no separate broker state to back
+up", and "operator-managed users via the existing Kubernetes auth
+boundary." Those trade-offs are the value proposition; the throughput
+table is the cost.
