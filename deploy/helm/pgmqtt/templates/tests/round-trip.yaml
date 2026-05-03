@@ -1,0 +1,44 @@
+{{- /*
+A `helm test` Pod that runs an MQTT round-trip against the deployed chart.
+Mirrors .github/ci/smoke-in-cluster.sh, but uses an inline username/password
+of the chart-installed User if you've created one. Otherwise the test
+expects a pre-seeded User CR named per `Values.test.username` whose
+credentials Secret is mounted via env.
+*/ -}}
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "pgmqtt.fullname" . }}-test-roundtrip
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pgmqtt.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: mosq
+      image: {{ .Values.tests.image }}
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -eu
+          (mosquitto_sub -h "$HOST" -p "$PORT" -u "$U" -P "$P" -t 'helmtest/#' -C 1 -W 15 > /tmp/got 2>&1) &
+          SUB=$!
+          sleep 1
+          mosquitto_pub -h "$HOST" -p "$PORT" -u "$U" -P "$P" -t helmtest/x -m hello -q 1
+          wait $SUB
+          cat /tmp/got
+          grep -q hello /tmp/got
+      env:
+        - name: HOST
+          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: host } }
+        - name: PORT
+          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: port } }
+        - name: U
+          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: username } }
+        - name: P
+          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: password } }
+{{- end }}

@@ -62,26 +62,21 @@ suggested below. Cross items off in this file as they ship.
 
 ## 2. Helm / k8s
 
-- [ ] **PodDisruptionBudget** in chart. `minAvailable: 1` by default.
-      A rolling cluster upgrade can otherwise take both replicas down.
-
-- [ ] **HorizontalPodAutoscaler** template (off by default; toggle via
-      `autoscaling.enabled`). Once metrics land we can scale on
-      `pgmqtt_connections` or CPU.
-
-- [ ] **NetworkPolicy** template (off by default). Restrict broker→postgres
-      egress to the postgres Service.
-
-- [ ] **TLS termination example.** `docs/TLS.md` with a working config for:
-      Nginx ingress `tcp-services` ConfigMap, HAProxy `frontend tls / backend
-      tcp` mode, and an `Ingress` example for `wss://`. Don't ship the
-      terminator in our chart; just document.
-
+- [x] **PodDisruptionBudget** template — minAvailable=1 default.
+- [x] **HorizontalPodAutoscaler** template (off by default;
+      `autoscaling.enabled`). Scales on CPU by default; supports
+      `customMetrics` for `pgmqtt_connections` once a prometheus-adapter
+      is installed.
+- [x] **NetworkPolicy** template (off by default). Includes DNS egress,
+      configurable postgres egress selector, optional kubernetesAPI
+      egress for the leader's reconciler.
+- [x] **TLS termination example.** `docs/TLS.md` with the four working
+      patterns (HTTPS Ingress for wss, ingress-nginx tcp-services, HAProxy
+      frontend tls/backend tcp, cloud LB with ACM/GCLB).
 - [ ] **PSP / SCC**: chart already sets `runAsNonRoot`, etc. Verify against
       OpenShift restricted-v2 SCC.
-
-- [ ] **Helm chart-tests directory** (`helm test pgmqtt`) with a Pod that
-      runs the same mosquitto round-trip as `.github/ci/smoke-in-cluster.sh`.
+- [x] **Helm chart-tests directory** (`helm test pgmqtt`) with a mosquitto
+      round-trip Pod (helm.sh/hook=test).
 
 ## 3. Testing actually run
 

@@ -47,6 +47,65 @@ metrics:
   enabled: true
   port: 9090
 
+## PodDisruptionBudget. Default minAvailable=1 prevents a rolling cluster
+## upgrade from taking every replica down at once. Set to false if you
+## prefer to manage disruption budgets out-of-band.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  ## Use maxUnavailable instead by setting it and clearing minAvailable.
+  maxUnavailable: ""
+
+## HorizontalPodAutoscaler. Off by default — enable once metrics are scraped.
+## CPU is the cheapest signal; for connection-driven scaling use the custom
+## metrics block (e.g. against `pgmqtt_connections` from the ServiceMonitor).
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: ""
+  customMetrics: []
+  # Example using prometheus-adapter exposed `pgmqtt_connections`:
+  # customMetrics:
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: pgmqtt_connections
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "1000"
+
+## NetworkPolicy. Off by default; enable to lock down broker→postgres egress
+## and broker ingress. The ingress block is permissive when `from` is empty
+## (allow all sources, restricted to broker ports). Provide explicit pod or
+## namespace selectors in production.
+networkPolicy:
+  enabled: false
+  ingress:
+    from: []
+  egress:
+    postgresPort: 5432
+    postgres: []
+    # Example: pin egress to a CloudNativePG-managed cluster.
+    # postgres:
+    #   - podSelector:
+    #       matchLabels:
+    #         cnpg.io/cluster: my-cluster
+    kubernetesAPI: []
+    # Example for the cluster's API endpoint(s):
+    # kubernetesAPI:
+    #   - ipBlock:
+    #       cidr: 10.0.0.1/32
+
+## helm test target. Spins up a mosquitto Pod that does a pub/sub round-trip
+## against the broker. Requires a pre-existing credentials Secret — easiest
+## is to apply a User CR named e.g. "smoketest" before `helm test pgmqtt`.
+tests:
+  enabled: true
+  image: eclipse-mosquitto:2.0
+  credentialsSecret: smoketest-mqtt-credentials
+
 resources:
   requests:
     cpu: 100m
