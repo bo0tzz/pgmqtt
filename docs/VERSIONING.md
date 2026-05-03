@@ -6,8 +6,9 @@ across three surfaces, treated as a single product version:
 1. The `pgmqttd` broker binary and its on-the-wire MQTT 3.1.1 / 5 behaviour.
 2. The `pgmqtt.io/*` Kubernetes operator API (CRDs and their reconciler
    semantics).
-3. The Postgres schema in `internal/db/schema.sql` (and any subsequent
-   migrations).
+3. The Postgres schema, defined as a sequence of versioned migrations
+   in `internal/db/migrations/` (currently `0001_init.sql` through
+   `0005_quota.sql`).
 
 The Helm chart version tracks the same `MAJOR.MINOR.PATCH` and is bumped
 in lockstep with the broker.

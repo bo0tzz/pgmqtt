@@ -72,3 +72,11 @@ Soak (manual):
       session loss rather than falsely attributing it to itself.
       This hardens the claim that the rig's pgmqtt results are
       broker-attributable, not rig-attributable.
+- [x] **Network-partition chaos via Chaos Mesh.** 3-replica kind cluster
+      with a `NetworkChaos` `action: partition` between client pods and
+      broker pods. 5 partition cycles (30 s on / 30 s off) during a
+      300 s soak with `-pubs 5 -inflight 50 -subs 5`: zero lost, zero
+      dups across all 5 subscribers. Validates that pgmqtt's
+      pipelined-publisher replay + at-least-once semantics hold under
+      pure network failure (TCP drop without process death), not just
+      under broker-pod death. Chaos Mesh installs cleanly on kind.

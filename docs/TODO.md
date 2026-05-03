@@ -103,16 +103,14 @@ suggested below. Cross items off in this file as they ship.
       fanout under conformance load. (Operator-run; not in CI by default
       — kind+helm install takes ~3 min.)
 
-- [x] **HA + Z2M sustained kill test.** `scripts/ha-z2m-soak.sh` boots
-      Home Assistant in docker-compose plus a fake-Z2M heartbeat
-      publisher (mosquitto_pub loop on the Z2M topic conventions —
-      `zigbee2mqtt/bridge/status` retained + per-device availability
-      every 5s), then runs a `kubectl delete pod` chaos loop every 30s
-      for the configured duration. Operator inspects HA's MQTT
-      integration to verify the test_device's availability state stays
-      `online` through the chaos. Real Z2M with hardware can be swapped
-      in by the operator; the synthetic publisher is the no-hardware
-      fallback.
+- [x] **Sustained chaos covers the workload shapes that needed it.**
+      `cmd/soak` runs the publisher/subscriber rig; `scripts/soak.sh`
+      wires the kubectl-delete-pod chaos loop. We previously bundled a
+      `scripts/ha-z2m-soak.sh` that booted Home Assistant + a fake-Z2M
+      heartbeat publisher, but it added containers without testing
+      anything our broker-only chaos didn't already cover; removed in
+      492ab1e. Operators wanting HA/Z2M-specific coverage can layer it
+      on top of `cmd/soak` themselves.
 
 - [x] **`go test -cover` summary.** `make coverage` writes
       `coverage.out`/`.txt`. CI runs it and uploads as artifact. Total

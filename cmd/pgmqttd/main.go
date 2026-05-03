@@ -30,6 +30,13 @@ func main() {
 		logger.Error("config", "err", err)
 		os.Exit(1)
 	}
+	// Pin the K8s Pod name (from POD_NAME env / Downward API) onto every
+	// log line so operators reading aggregated logs can correlate which
+	// pod produced which line without hunting the random broker UUID.
+	if cfg.PodName != "" {
+		logger = logger.With("pod", cfg.PodName)
+		slog.SetDefault(logger)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
