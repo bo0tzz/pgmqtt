@@ -80,6 +80,7 @@ func main() {
 	qos := flag.Int("qos", 1, "QoS for publishes (0/1/2)")
 	subs := flag.Int("subs", 1, "number of subscribers")
 	pubs := flag.Int("pubs", 1, "number of concurrent publishers (each on its own conn + topic)")
+	inflight := flag.Int("inflight", 1, "per-publisher in-flight PUBLISH window (1 = strict serial). >1 pipelines PUBLISH→PUBACK to push past RTT limits; should be ≤ broker's serverReceiveMaximum")
 	topic := flag.String("topic", "soak/x", "topic prefix; each publisher uses '<topic>/<pub-id>'; subscribers wildcard-subscribe '<topic>/+'")
 	flag.Parse()
 
@@ -91,6 +92,15 @@ func main() {
 	}
 	if *pubs > 0xFFFF {
 		log.Fatalf("pubs must fit in uint16")
+	}
+	if *inflight < 1 {
+		log.Fatalf("inflight must be ≥ 1")
+	}
+	if *qos == 2 && *inflight > 1 {
+		// QoS-2's PUBREC→PUBREL→PUBCOMP makes per-pid bookkeeping more
+		// involved than the rig currently implements. Strict-serial QoS-2
+		// is what we test today.
+		log.Fatalf("inflight > 1 not supported for QoS 2 (PUBREC/PUBREL bookkeeping)")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -143,7 +153,7 @@ func main() {
 			defer pubWG.Done()
 			pubTopic := fmt.Sprintf("%s/pub-%d", *topic, idx)
 			runPublisher(ctx, *broker, fmt.Sprintf("soak-pub-%d", idx),
-				*user, *pass, pubTopic, byte(*qos), r, endAt,
+				*user, *pass, pubTopic, byte(*qos), r, *inflight, endAt,
 				uint16(idx), publishedByPub[idx])
 		}(i, myRate)
 	}
@@ -238,8 +248,19 @@ func main() {
 // error the publisher reconnects (with a 500ms backoff) and resumes from
 // the current seq — `published` only increments on a successful ack so a
 // broker restart mid-PUBLISH is correctly counted as a re-send.
+//
+// inflight controls QoS-1 pipelining: with inflight=1 the publisher
+// awaits each PUBACK before sending the next PUBLISH (strict-serial,
+// RTT-bound). With inflight>1 it queues up to N un-ACKed PUBLISHes,
+// using a separate read goroutine to demux PUBACKs by packet_id. QoS 0
+// and QoS 2 always use the strict-serial path.
 func runPublisher(ctx context.Context, broker, clientID, user, pass, topic string,
-	qos byte, rate int, endAt time.Time, pubID uint16, published *atomic.Int64) {
+	qos byte, rate, inflight int, endAt time.Time, pubID uint16, published *atomic.Int64) {
+	if qos == 1 && inflight > 1 {
+		runPublisherPipelined(ctx, broker, clientID, user, pass, topic,
+			rate, inflight, endAt, pubID, published)
+		return
+	}
 	tick := time.NewTicker(time.Second / time.Duration(rate))
 	defer tick.Stop()
 
@@ -353,6 +374,102 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 				published.Add(1)
 			}
 		}
+	}
+}
+
+// runPublisherPipelined is the QoS-1 pipelined variant. A reader
+// goroutine pulls PUBACKs off the wire and increments `published`
+// when each in-flight pid's ACK arrives. The writer fires PUBLISHes
+// up to `inflight` ahead. On any I/O error or connection drop, both
+// goroutines tear down the conn; the outer loop reconnects and
+// resumes from the next seq (un-ACKed messages get re-sent on the
+// new conn — broker treats them as fresh inserts, so subscriber dups
+// can occur exactly when chaos hits, same as the strict-serial path).
+func runPublisherPipelined(ctx context.Context, broker, clientID, user, pass, topic string,
+	rate, inflight int, endAt time.Time, pubID uint16, published *atomic.Int64) {
+	tick := time.NewTicker(time.Second / time.Duration(rate))
+	defer tick.Stop()
+
+	var seq int64
+	pid := uint16(0)
+	for {
+		c, r, err := connectWithBackoff(ctx, broker, clientID, user, pass, false)
+		if err != nil {
+			return
+		}
+		// Reader goroutine: read packets, signal completion via slot
+		// channel, signal disconnect via stop channel.
+		slot := make(chan struct{}, inflight)
+		stop := make(chan struct{})
+		var once sync.Once
+		killWriter := func() { once.Do(func() { close(stop) }) }
+		go func() {
+			defer killWriter()
+			for {
+				ack, err := r.Read()
+				if err != nil {
+					log.Printf("publish[pid=%d] reader: %v — reconnecting", pubID, err)
+					return
+				}
+				if ack.FixedHeader.Type != packets.Puback {
+					log.Printf("publish[pid=%d] reader: got type=%d (want PUBACK) — reconnecting",
+						pubID, ack.FixedHeader.Type)
+					return
+				}
+				published.Add(1)
+				select {
+				case <-slot:
+				default:
+					// Slot already free: extra ack? shouldn't happen.
+				}
+			}
+		}()
+
+	writer:
+		for {
+			select {
+			case <-ctx.Done():
+				_ = c.Close()
+				return
+			case <-stop:
+				_ = c.Close()
+				break writer
+			case slot <- struct{}{}:
+			}
+			if time.Now().After(endAt) {
+				_ = c.Close()
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-stop:
+				_ = c.Close()
+				break writer
+			case <-ctx.Done():
+				_ = c.Close()
+				return
+			}
+			payload := encodePayload(pubID, seq)
+			pid++
+			if pid == 0 {
+				pid = 1
+			}
+			pk := &packets.Packet{
+				FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 1},
+				ProtocolVersion: mqttwire.ProtocolMQTT5,
+				TopicName:       topic,
+				Payload:         payload,
+				PacketID:        pid,
+			}
+			if err := mqttwire.Write(c, pk); err != nil {
+				log.Printf("publish[pid=%d] write (seq=%d): %v — reconnecting", pubID, seq, err)
+				_ = c.Close()
+				break writer
+			}
+			seq++
+		}
+		// Wait for reader to drain & exit, then loop and reconnect.
+		<-stop
 	}
 }
 
