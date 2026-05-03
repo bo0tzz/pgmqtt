@@ -23,10 +23,18 @@ Tables in `public.`:
 In short: `users + sessions + subscriptions + retained + schema_migrations`
 are the survival set; the rest is regenerable.
 
+`pg_dump --format=custom` captures schema (tables, indexes, sequences,
+functions like `mqtt_topic_match` / `mqtt_publish` / `mqtt_next_packet_id` /
+`mqtt_retained_expires_at`, partial indexes from 0007/0008, expiry
+columns from 0003/0004) by default — you don't need to enumerate them.
+The table above is the operator-facing survival set, not an exhaustive
+schema inventory. `messages.id` and `deliveries.id` are BIGSERIALs;
+their sequence current values are also captured.
+
 ## pg_dump (any Postgres)
 
 Stop-the-world consistent backup using a transaction snapshot. Run from
-any host with `psql`/`pg_dump` and reach to the broker DB:
+any host with `psql`/`pg_dump` that can reach the broker DB:
 
 ```bash
 PGPASSWORD=$PASS pg_dump \
@@ -81,11 +89,14 @@ spec:
 After a restore, the broker should come up cleanly and:
 
 1. `pgmqttd` Pods reach Ready with no migration errors.
-2. Existing clients with cleansession=false / SessionExpiryInterval>0 can
+2. `SELECT count(*) FROM schema_migrations` matches the migrations
+   directory in the running binary (`ls internal/db/migrations/*.sql |
+   wc -l`). Catches a binary/dump mismatch before traffic hits.
+3. Existing clients with cleansession=false / SessionExpiryInterval>0 can
    reconnect and receive any queued QoS-1/2 messages. (Test with one
    pre-seeded subscriber + a known retained topic.)
-3. Retained messages are still delivered to new subscribers.
-4. The User CRD reconciler doesn't constantly rewrite the `users` table
+4. Retained messages are still delivered to new subscribers.
+5. The User CRD reconciler doesn't constantly rewrite the `users` table
    (it shouldn't — `ObservedSecretHash` in CR status drives a no-op
    when nothing changed).
 
@@ -105,3 +116,17 @@ diff before restoring an old dump under a much newer binary.
 If the dump *postdates* the binary (downgrade), startup will fail
 with an "unknown migration" error. Roll the binary forward or restore
 into a known-matching version.
+
+### Migrations that mutate existing structure
+
+A few migrations alter or drop existing schema rather than add new
+tables; their roll-forward behaviour against an older dump is worth
+calling out:
+
+- **0006** drops the `deliveries.client_id → sessions` FK. If the dump
+  was taken before 0006, the constraint is present in the restored
+  schema and the migration's `ALTER TABLE … DROP CONSTRAINT` runs
+  cleanly on first boot. No data movement.
+- **0007/0008** add partial indexes on `deliveries`. Index-build is
+  blocking but cheap on a freshly-restored DB (small dead-tuple
+  footprint).
