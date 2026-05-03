@@ -41,14 +41,34 @@ import (
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
 
-// subStats accumulates per-subscriber receive counts. Loss is counted at
-// end-of-run via gap analysis on the seen-sequence map.
+// subStats accumulates per-subscriber receive counts, tracked per-publisher
+// so multiple publishers don't collide in the seq space. Loss is counted at
+// end-of-run via gap analysis on each publisher's seen-sequence map.
 type subStats struct {
 	received atomic.Int64
 	dups     atomic.Int64
-	lost     atomic.Int64
-	seen     map[int64]int
 	mu       sync.Mutex
+	// seen[pub_id][seq] = times-received. Loss = gaps in seen[pub_id]
+	// over [0, max_seq_for_pub]. Dups = any seen[pub_id][seq] > 1.
+	seen map[uint16]map[int64]int
+}
+
+// payload layout: 2 bytes BE pub_id || 8 bytes BE seq. Subscribers decode
+// both fields to attribute the publish to the right publisher.
+const payloadLen = 10
+
+func encodePayload(pubID uint16, seq int64) []byte {
+	b := make([]byte, payloadLen)
+	binary.BigEndian.PutUint16(b[0:2], pubID)
+	binary.BigEndian.PutUint64(b[2:10], uint64(seq))
+	return b
+}
+
+func decodePayload(b []byte) (pubID uint16, seq int64, ok bool) {
+	if len(b) < payloadLen {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint16(b[0:2]), int64(binary.BigEndian.Uint64(b[2:10])), true
 }
 
 func main() {
@@ -56,14 +76,21 @@ func main() {
 	user := flag.String("user", "test", "username")
 	pass := flag.String("pass", "test", "password")
 	dur := flag.Duration("duration", 1*time.Minute, "how long to run")
-	rate := flag.Int("rate", 100, "messages per second (publisher)")
+	rate := flag.Int("rate", 100, "TOTAL messages per second across all publishers")
 	qos := flag.Int("qos", 1, "QoS for publishes (0/1/2)")
 	subs := flag.Int("subs", 1, "number of subscribers")
-	topic := flag.String("topic", "soak/x", "topic to publish on")
+	pubs := flag.Int("pubs", 1, "number of concurrent publishers (each on its own conn + topic)")
+	topic := flag.String("topic", "soak/x", "topic prefix; each publisher uses '<topic>/<pub-id>'; subscribers wildcard-subscribe '<topic>/+'")
 	flag.Parse()
 
 	if *qos < 0 || *qos > 2 {
 		log.Fatalf("qos must be 0/1/2")
+	}
+	if *pubs < 1 {
+		log.Fatalf("pubs must be ≥ 1")
+	}
+	if *pubs > 0xFFFF {
+		log.Fatalf("pubs must fit in uint16")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -71,29 +98,61 @@ func main() {
 
 	endAt := time.Now().Add(*dur)
 
+	// Subscribers wildcard-subscribe to <topic>/+ so they get publishes
+	// from every publisher.
+	subFilter := *topic + "/+"
+
 	subStatsList := make([]*subStats, *subs)
 	var subWG sync.WaitGroup
 	for i := 0; i < *subs; i++ {
-		s := &subStats{seen: map[int64]int{}}
+		s := &subStats{seen: map[uint16]map[int64]int{}}
 		subStatsList[i] = s
 		subWG.Add(1)
 		go func(idx int, st *subStats) {
 			defer subWG.Done()
 			runSubscriber(ctx, *broker, fmt.Sprintf("soak-sub-%d", idx), *user, *pass,
-				*topic, byte(*qos), st)
+				subFilter, byte(*qos), st)
 		}(i, s)
 	}
 
 	// Give subscribers a moment to land their SUBSCRIBE.
 	time.Sleep(500 * time.Millisecond)
 
-	// Publisher.
+	// Publishers. Each gets its own connection (separate goroutine), client_id,
+	// payload pub_id, and topic. Total target rate is split evenly; if the
+	// configured rate doesn't divide cleanly the remainder spills onto the
+	// first few publishers.
 	var published atomic.Int64
+	publishedByPub := make([]*atomic.Int64, *pubs)
+	for i := range publishedByPub {
+		publishedByPub[i] = new(atomic.Int64)
+	}
+	var pubWG sync.WaitGroup
+	perPubRate := *rate / *pubs
+	if perPubRate < 1 {
+		perPubRate = 1
+	}
+	remainder := *rate - perPubRate**pubs
+	for i := 0; i < *pubs; i++ {
+		myRate := perPubRate
+		if i < remainder {
+			myRate++
+		}
+		pubWG.Add(1)
+		go func(idx int, r int) {
+			defer pubWG.Done()
+			pubTopic := fmt.Sprintf("%s/pub-%d", *topic, idx)
+			runPublisher(ctx, *broker, fmt.Sprintf("soak-pub-%d", idx),
+				*user, *pass, pubTopic, byte(*qos), r, endAt,
+				uint16(idx), publishedByPub[idx])
+		}(i, myRate)
+	}
+	pubWG.Wait()
+	for i := range publishedByPub {
+		published.Add(publishedByPub[i].Load())
+	}
 	pubDone := make(chan struct{})
-	go func() {
-		defer close(pubDone)
-		runPublisher(ctx, *broker, "soak-pub", *user, *pass, *topic, byte(*qos), *rate, endAt, &published)
-	}()
+	close(pubDone)
 
 	<-pubDone
 	// Drain time — wait for any inflight messages to land. Long enough to
@@ -104,8 +163,9 @@ func main() {
 	cancel()
 	subWG.Wait()
 
-	// Compute loss via gap analysis on each sub's received set. A sequence
-	// is "lost" if it's in [0, max_observed] but missing.
+	// Compute loss via gap analysis per publisher × subscriber. A sequence
+	// is "lost" for (sub, pub) if it's in [0, max_observed_for_that_pub]
+	// but missing from sub's seen map for that pub.
 	type subReport struct {
 		Received int64 `json:"received"`
 		Dups     int64 `json:"dups"`
@@ -116,16 +176,19 @@ func main() {
 	totalDups := int64(0)
 	for i, s := range subStatsList {
 		s.mu.Lock()
-		var maxSeq int64 = -1
-		for k := range s.seen {
-			if k > maxSeq {
-				maxSeq = k
-			}
-		}
 		var lost int64
-		if maxSeq >= 0 {
+		for _, perPub := range s.seen {
+			var maxSeq int64 = -1
+			for k := range perPub {
+				if k > maxSeq {
+					maxSeq = k
+				}
+			}
+			if maxSeq < 0 {
+				continue
+			}
 			for j := int64(0); j <= maxSeq; j++ {
-				if _, ok := s.seen[j]; !ok {
+				if _, ok := perPub[j]; !ok {
 					lost++
 				}
 			}
@@ -138,15 +201,16 @@ func main() {
 	}
 
 	out := map[string]any{
-		"broker":       *broker,
-		"qos":          *qos,
-		"duration":     dur.String(),
-		"rate":         *rate,
-		"subs":         *subs,
-		"published":    published.Load(),
-		"sub_reports":  reports,
-		"total_lost":   totalLost,
-		"total_dups":   totalDups,
+		"broker":      *broker,
+		"qos":         *qos,
+		"duration":    dur.String(),
+		"rate":        *rate,
+		"subs":        *subs,
+		"pubs":        *pubs,
+		"published":   published.Load(),
+		"sub_reports": reports,
+		"total_lost":  totalLost,
+		"total_dups":  totalDups,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -169,12 +233,13 @@ func main() {
 }
 
 // runPublisher publishes seq=0..N at the configured rate until ctx ends or
-// endAt elapses. Each payload is the BE-uint64 sequence number. On I/O
+// endAt elapses. Each payload encodes (pubID, seq) so multiple concurrent
+// publishers don't collide in the seq space at the subscriber. On I/O
 // error the publisher reconnects (with a 500ms backoff) and resumes from
 // the current seq — `published` only increments on a successful ack so a
 // broker restart mid-PUBLISH is correctly counted as a re-send.
 func runPublisher(ctx context.Context, broker, clientID, user, pass, topic string,
-	qos byte, rate int, endAt time.Time, published *atomic.Int64) {
+	qos byte, rate int, endAt time.Time, pubID uint16, published *atomic.Int64) {
 	tick := time.NewTicker(time.Second / time.Duration(rate))
 	defer tick.Stop()
 
@@ -199,8 +264,7 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 				_ = c.Close()
 				return
 			}
-			payload := make([]byte, 8)
-			binary.BigEndian.PutUint64(payload, uint64(seq))
+			payload := encodePayload(pubID, seq)
 			pk := &packets.Packet{
 				FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: qos},
 				ProtocolVersion: mqttwire.ProtocolMQTT5,
@@ -396,45 +460,58 @@ func readSubscriber(ctx context.Context, c net.Conn, r *mqttwire.Reader, stats *
 			log.Printf("subscriber read: %v — reconnecting", err)
 			return
 		}
-		// SUBACK / UNSUBACK / PINGRESP are protocol replies we issued
-		// requests for; just skip without resetting the read deadline.
-		if pk.FixedHeader.Type != packets.Publish {
-			continue
-		}
-		if len(pk.Payload) < 8 {
-			continue
-		}
-		seq := int64(binary.BigEndian.Uint64(pk.Payload[:8]))
-		stats.mu.Lock()
-		stats.seen[seq]++
-		if stats.seen[seq] > 1 {
-			stats.dups.Add(1)
-		}
-		stats.mu.Unlock()
-		stats.received.Add(1)
-		if pk.FixedHeader.Qos == 1 {
-			_ = mqttwire.Write(c, &packets.Packet{
-				FixedHeader:     packets.FixedHeader{Type: packets.Puback},
-				ProtocolVersion: mqttwire.ProtocolMQTT5,
-				PacketID:        pk.PacketID,
-			})
-		} else if pk.FixedHeader.Qos == 2 {
-			_ = mqttwire.Write(c, &packets.Packet{
-				FixedHeader:     packets.FixedHeader{Type: packets.Pubrec},
-				ProtocolVersion: mqttwire.ProtocolMQTT5,
-				PacketID:        pk.PacketID,
-			})
-			pubrel, err := r.Read()
-			if err != nil {
+		// Single-read-loop dispatch by packet type. Anything that's not
+		// a PUBLISH or PUBREL is either a protocol reply we asked for
+		// (SUBACK/UNSUBACK/PINGRESP) or a server-initiated control
+		// (DISCONNECT) — the latter ends the session, the former are
+		// no-ops here.
+		switch pk.FixedHeader.Type {
+		case packets.Publish:
+			pubID, seq, ok := decodePayload(pk.Payload)
+			if !ok {
 				continue
 			}
-			if pubrel.FixedHeader.Type == packets.Pubrel {
+			stats.mu.Lock()
+			perPub := stats.seen[pubID]
+			if perPub == nil {
+				perPub = map[int64]int{}
+				stats.seen[pubID] = perPub
+			}
+			perPub[seq]++
+			if perPub[seq] > 1 {
+				stats.dups.Add(1)
+			}
+			stats.mu.Unlock()
+			stats.received.Add(1)
+			switch pk.FixedHeader.Qos {
+			case 1:
 				_ = mqttwire.Write(c, &packets.Packet{
-					FixedHeader:     packets.FixedHeader{Type: packets.Pubcomp},
+					FixedHeader:     packets.FixedHeader{Type: packets.Puback},
 					ProtocolVersion: mqttwire.ProtocolMQTT5,
-					PacketID:        pubrel.PacketID,
+					PacketID:        pk.PacketID,
+				})
+			case 2:
+				// Send PUBREC immediately. The matching PUBREL arrives
+				// asynchronously and is handled by the next iteration's
+				// case packets.Pubrel below — not by a synchronous
+				// blocking r.Read here, which would silently swallow
+				// any concurrent PUBLISH the broker delivers in the
+				// meantime (broker's outbound flow control allows
+				// multiple in-flight QoS-2 deliveries per subscriber).
+				_ = mqttwire.Write(c, &packets.Packet{
+					FixedHeader:     packets.FixedHeader{Type: packets.Pubrec},
+					ProtocolVersion: mqttwire.ProtocolMQTT5,
+					PacketID:        pk.PacketID,
 				})
 			}
+		case packets.Pubrel:
+			_ = mqttwire.Write(c, &packets.Packet{
+				FixedHeader:     packets.FixedHeader{Type: packets.Pubcomp},
+				ProtocolVersion: mqttwire.ProtocolMQTT5,
+				PacketID:        pk.PacketID,
+			})
+		case packets.Disconnect:
+			return
 		}
 	}
 }
