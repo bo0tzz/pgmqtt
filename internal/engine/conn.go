@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,12 @@ func (e *Engine) maxInboundRate() int {
 
 func (c *Conn) run(ctx context.Context) {
 	defer c.shutdown()
+	defer func() {
+		if r := recover(); r != nil {
+			c.eng.logger.Error("conn run panic",
+				"client", c.clientID, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 
 	// Wait for CONNECT (must be first).
 	if err := c.nc.SetReadDeadline(time.Now().Add(connectTimeout)); err != nil {
@@ -205,6 +212,18 @@ func (c *Conn) dispatch(ctx context.Context, pk *packets.Packet) error {
 		return c.write(&packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pingresp}})
 	case packets.Disconnect:
 		return c.handleGracefulDisconnect(ctx, pk)
+	case packets.Auth:
+		// We don't advertise an authentication method on CONNACK and reject
+		// CONNECTs that supply AuthenticationMethod (cackBadAuthMethod), so
+		// AUTH (3.15) cannot legitimately arrive mid-connection. Reply with
+		// DISCONNECT 0x82 (Protocol error) per MQTT-4.12.0-2 instead of
+		// silently dropping the socket via the default case, which left the
+		// client unable to distinguish a TCP wedge from a server reject.
+		_ = c.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  0x82,
+		})
+		return fmt.Errorf("AUTH unexpected: enhanced auth not supported")
 	default:
 		return fmt.Errorf("unsupported packet type: %d", pk.FixedHeader.Type)
 	}
@@ -486,6 +505,15 @@ func (c *Conn) returnInflight() {
 // runDrainLoop wakes on drainKick and tries to send any state=0 deliveries
 // for this client up to the in-flight cap.
 func (c *Conn) runDrainLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.eng.logger.Error("drain loop panic",
+				"client", c.clientID, "panic", r, "stack", string(debug.Stack()))
+			// Best-effort tear down: a half-broken drain loop is worse than
+			// a clean takeover by the next CONNECT.
+			c.shutdown()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():

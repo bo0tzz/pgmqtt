@@ -21,6 +21,7 @@ import (
 //	0x85 Client identifier not valid
 //	0x86 Bad username or password
 //	0x87 Not authorized
+//	0x8C Bad authentication method
 const (
 	cackSuccess             byte = 0x00
 	cackUnsupportedProtocol byte = 0x84
@@ -28,6 +29,7 @@ const (
 	cackNotAuthorized       byte = 0x87
 	cackClientIDInvalid     byte = 0x85
 	cackUnspecified         byte = 0x80
+	cackBadAuthMethod       byte = 0x8C
 )
 
 func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
@@ -68,6 +70,18 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	if c.keepalive > maxAllowedKeepalive {
 		c.keepalive = maxAllowedKeepalive
 		keepaliveOverridden = true
+	}
+
+	// Reject MQTT 5 enhanced authentication. We don't advertise any
+	// authentication method on CONNACK, so a client shouldn't send one;
+	// if it does, MQTT-4.12.0-1 says we MAY return CONNACK 0x8C
+	// (Bad authentication method). We do — silently ignoring the property
+	// (current behaviour) is a spec hazard because the client thinks
+	// password auth was bypassed in favour of its enhanced flow.
+	if pv == mqttwire.ProtocolMQTT5 && len(pk.Properties.AuthenticationMethod) > 0 {
+		_ = c.writeConnackReject(pv, cackBadAuthMethod)
+		return fmt.Errorf("enhanced auth method %q not supported",
+			pk.Properties.AuthenticationMethod)
 	}
 
 	// Authenticate. PGMQTT_ALLOW_ANONYMOUS=true skips this when no username
@@ -151,6 +165,17 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
+			return err
+		}
+		// inbound_qos2 has FK ON DELETE CASCADE on (client_id) → sessions, but
+		// takeOwnership above re-uses the existing sessions row instead of
+		// dropping it. Without this explicit DELETE, a fresh QoS-2 PUBLISH
+		// from the new session that happens to reuse a packet_id from the
+		// prior incarnation would hit ON CONFLICT DO NOTHING in publishCore
+		// and be silently swallowed (the broker re-emits PUBREC but doesn't
+		// fan out). Drop the stale tombstones to make cleanStart actually
+		// clean.
+		if _, err := tx.Exec(ctx, `DELETE FROM inbound_qos2 WHERE client_id=$1`, c.clientID); err != nil {
 			return err
 		}
 	}

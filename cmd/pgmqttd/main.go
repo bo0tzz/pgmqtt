@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -86,8 +89,9 @@ func main() {
 	eng.SetMetrics(mtx)
 	if cfg.MetricsAddr != "" {
 		go func() {
+			defer recoverPanic(logger, "metrics serve")
 			logger.Info("metrics listening", "addr", cfg.MetricsAddr)
-			if err := mtx.Serve(ctx, cfg.MetricsAddr); err != nil && err.Error() != "http: Server closed" {
+			if err := mtx.Serve(ctx, cfg.MetricsAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Warn("metrics serve", "err", err)
 			}
 		}()
@@ -118,6 +122,7 @@ func main() {
 	go jt.RunWith(ctx, ld)
 
 	go func() {
+		defer recoverPanic(logger, "operator run")
 		opts := operator.Options{
 			ServiceHost: cfg.ServiceHost,
 			ServicePort: cfg.ServicePort,
@@ -135,4 +140,15 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("shutdown complete")
+}
+
+// recoverPanic recovers from a panic in a long-lived background goroutine,
+// logs the panic + stack at ERROR level, and returns. Used as `defer
+// recoverPanic(logger, "<scope>")` at the top of every goroutine that
+// would otherwise take the broker down on an unexpected panic.
+func recoverPanic(logger *slog.Logger, scope string) {
+	if r := recover(); r != nil {
+		logger.Error("goroutine panic", "scope", scope,
+			"panic", r, "stack", string(debug.Stack()))
+	}
 }

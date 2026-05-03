@@ -8,3 +8,6 @@ coverage.txt
 .smoke-*
 *.test
 
+
+# Subagent worktrees (ephemeral)
+.claude/

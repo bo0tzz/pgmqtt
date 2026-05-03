@@ -331,6 +331,9 @@ func (e *Engine) dispatchQuotaExceeded(ctx context.Context, clientIDs []string) 
 			e.logger.Warn("quota notify", "broker", bid, "client", cid, "err", err)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		e.logger.Warn("quota iterate", "err", err)
+	}
 }
 
 func jsonOrNil(b []byte) any {
