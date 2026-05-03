@@ -106,6 +106,39 @@ tests:
   image: eclipse-mosquitto:2.0
   credentialsSecret: smoketest-mqtt-credentials
 
+## Optional in-cluster MQTT web client. We don't ship a UI we wrote ourselves;
+## this section deploys a third-party client (default: EMQX's MQTTX Web) as
+## an extra Deployment + Service. The UI is a static SPA that connects to
+## the broker via WebSocket from the user's browser — the user will have to
+## paste credentials they pull from the User CR's auto-generated Secret
+## (browsers can't read kube secrets). See docs/UI.md for the workflow.
+##
+## To enable:  helm install ... --set ui.enabled=true
+ui:
+  enabled: false
+  image:
+    # MQTTX Web's docker image. Tag pinned by the operator; latest works
+    # too. We don't pin here because we don't proactively follow upstream.
+    repository: emqx/mqttx-web
+    tag: latest
+    pullPolicy: IfNotPresent
+  containerPort: 80
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false  # nginx writes /var/cache; flip if running under restricted SCC.
+    capabilities:
+      drop:
+        - ALL
+
 resources:
   requests:
     cpu: 100m

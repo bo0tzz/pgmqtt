@@ -118,22 +118,16 @@ suggested below. Cross items off in this file as they ship.
 
 ## 5. Off-the-shelf web UI
 
-- [ ] **Evaluate dropping a UI into the Helm chart.** We don't write our
-      own. Candidates (each needs a proper sniff for "self-hostable +
-      static-ish + auth-aware"):
-        * **MQTTX Web** — EMQX's. Has a `docker-compose` for `mqttx/mqttx-web`.
-          ([github.com/emqx/MQTTX](https://github.com/emqx/MQTTX)) — likely
-          the strongest candidate; commercial-quality UI, supports v5, runs
-          stateless.
-        * **mqtt-explorer** — desktop only; skip.
-        * **HiveMQ Web Client** — single-page, hosted only, no self-host
-          docker image last I checked.
-        * **mqtt-web-client** (various forks) — too unmaintained.
-      Once a candidate is chosen, ship as an `optional` Helm subchart or
-      a sibling chart that mounts the credential Secret automatically.
-      Acceptance: a user can `helm install pgmqtt --set ui.enabled=true`,
-      then `kubectl port-forward` to the UI Service and connect to the
-      broker without copy-pasting credentials.
+- [x] **Optional UI = MQTTX Web** as a sibling Deployment + Service when
+      `ui.enabled=true`. Shipped as a templated extra (not a subchart),
+      using `emqx/mqttx-web:latest` by default. The "no copy-paste of
+      credentials" goal in the original TODO turned out to require a
+      server-side auth-proxy (browsers can't read kube Secrets); the
+      pragmatic flow is documented in `docs/UI.md` — `kubectl
+      port-forward` then a single `kubectl get secret` go-template that
+      prints all five connection fields ready to paste. Verdict on the
+      other candidates (mqtt-explorer / HiveMQ / various forks) is in
+      the same doc.
 
 ## 6. Docs
 
