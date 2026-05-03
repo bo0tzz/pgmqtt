@@ -147,7 +147,6 @@ psql "$PGMQTT_DATABASE_URL" -c "INSERT INTO users(username,password_hash) VALUES
 | `PGMQTT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `PGMQTT_BCRYPT_COST` | `10` | Bcrypt cost for password hashes (4–31) |
 | `PGMQTT_RECEIVE_MAXIMUM` | `100` | v5 server `ReceiveMaximum` advertised to clients |
-| `PGMQTT_TOPIC_ALIAS_MAXIMUM` | `0` | v5 server `TopicAliasMaximum` (0 rejects inbound aliases) |
 | `PGMQTT_KEEPALIVE_MAX_SEC` | `60` | Server cap on negotiated keepalive |
 | `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` | `10000` | Slow-subscriber cap; over → DISCONNECT 0x97 (0 disables) |
 | `PGMQTT_MAX_CONNECTIONS` | `5000` | Per-Pod connection cap; over → CONNACK 0x9F (0 disables) |

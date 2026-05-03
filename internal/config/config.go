@@ -25,12 +25,16 @@ type Config struct {
 	// + per-conn handlers enforce the values during the session.
 	//   ReceiveMaximum     — cap on un-ACKed inbound QoS>0 PUBLISHes per conn.
 	//                        0 disables advertising (server picks).
-	//   TopicAliasMaximum  — advertised inbound-alias capacity. 0 (default)
-	//                        means we do not accept client-side aliases.
 	//   KeepaliveMax       — server cap on the negotiated keepalive interval.
-	V5ReceiveMaximum    uint16
-	V5TopicAliasMaximum uint16
-	V5KeepaliveMax      time.Duration
+	//
+	// We intentionally do NOT expose a knob for `TopicAliasMaximum` because
+	// the broker does not maintain an inbound topic-alias map — the value
+	// advertised to clients is hardcoded to 0, which per [MQTT-3.3.2-12]
+	// tells clients to never send a TopicAlias > 0. Outbound aliases
+	// (server → client) are negotiated via the *client's*
+	// TopicAliasMaximum in CONNECT and supported.
+	V5ReceiveMaximum uint16
+	V5KeepaliveMax   time.Duration
 
 	// Bcrypt cost used by the User-CR reconciler when hashing passwords for
 	// the broker's `users` table. 10 is bcrypt's library default.
@@ -71,7 +75,6 @@ func FromEnv() (*Config, error) {
 		AllowAnonymous: os.Getenv("PGMQTT_ALLOW_ANONYMOUS") == "true",
 
 		V5ReceiveMaximum:             uint16(getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)),
-		V5TopicAliasMaximum:          uint16(getenvInt("PGMQTT_TOPIC_ALIAS_MAXIMUM", 0)),
 		V5KeepaliveMax:               time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
 		BcryptCost:                   getenvInt("PGMQTT_BCRYPT_COST", 10),
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),

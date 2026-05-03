@@ -73,12 +73,11 @@ type Engine struct {
 
 	// Runtime-tunable knobs. Stored as atomics so test setters don't race
 	// with the accept loop / dispatch path. Populated from cfg in New().
-	maxConnsAtomic        atomic.Int64
-	maxQueuedAtomic       atomic.Int64
-	maxInboundRateAtomic  atomic.Int64
-	receiveMaxV5Atomic    atomic.Int64
-	topicAliasMaxV5Atomic atomic.Int64
-	keepaliveMaxV5Atomic  atomic.Int64 // nanoseconds
+	maxConnsAtomic       atomic.Int64
+	maxQueuedAtomic      atomic.Int64
+	maxInboundRateAtomic atomic.Int64
+	receiveMaxV5Atomic   atomic.Int64
+	keepaliveMaxV5Atomic atomic.Int64 // nanoseconds
 
 	listenersMu  sync.RWMutex
 	tcpListener  net.Listener
@@ -111,7 +110,6 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		e.maxQueuedAtomic.Store(int64(cfg.MaxQueuedDeliveriesPerClient))
 		e.maxInboundRateAtomic.Store(int64(cfg.MaxInboundMsgsPerSec))
 		e.receiveMaxV5Atomic.Store(int64(cfg.V5ReceiveMaximum))
-		e.topicAliasMaxV5Atomic.Store(int64(cfg.V5TopicAliasMaximum))
 		e.keepaliveMaxV5Atomic.Store(int64(cfg.V5KeepaliveMax))
 	}
 	return e, nil

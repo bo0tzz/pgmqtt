@@ -90,7 +90,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		c.eng.metrics.PublishesTotal.WithLabelValues(strconv.Itoa(int(pk.FixedHeader.Qos))).Inc()
 	}
 	c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
-		"qos", pk.FixedHeader.Qos, "msg", res.MessageID, "brokers", len(res.BrokerIDs))
+		"qos", pk.FixedHeader.Qos, "msg", res.MessageID,
+		"brokers", len(res.BrokerIDs), "broker_ids", res.BrokerIDs,
+		"overflow", len(res.OverflowClients))
 
 	if err := c.eng.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
 		c.eng.logger.Warn("publish notify", "msg", res.MessageID, "err", err)

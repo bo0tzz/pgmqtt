@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/bcrypt"
@@ -152,6 +153,152 @@ func TestReconcile_BYOSecret(t *testing.T) {
 	err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha-mqtt-credentials"}, &auto)
 	if err == nil {
 		t.Error("auto-generated secret should not exist for BYO")
+	}
+}
+
+// TestReconcile_NotFound exercises the early-return path when the User CR
+// has been deleted before the work item is processed (an event fired but
+// the cache entry is gone). Reconcile must return cleanly with no error
+// and not panic on the missing object.
+func TestReconcile_NotFound(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ghost"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.Requeue {
+		t.Errorf("expected no requeue for not-found user")
+	}
+}
+
+// TestReconcile_IsIdempotent verifies that reconciling an already-up-to-
+// date User does not re-hash the password (which would change the stored
+// bcrypt despite the cleartext being identical). The hash field's
+// bcrypt-cost parameter is comparable since CompareHashAndPassword
+// validates regardless; we instead snapshot the hash bytes and assert
+// they don't change across redundant reconciles.
+func TestReconcile_IsIdempotent(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "idem", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	// Run twice to settle finalizer + initial provision.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "idem"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hashBefore string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='idem'`).Scan(&hashBefore); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	// Run a third time — should be a no-op-on-DB (status update only).
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "idem"}}); err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
+	var hashAfter string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='idem'`).Scan(&hashAfter); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if hashBefore != hashAfter {
+		t.Errorf("hash changed across idempotent reconcile:\n  before=%s\n  after =%s", hashBefore, hashAfter)
+	}
+}
+
+// TestReconcile_BYOSecretCustomKey exercises the path where the User CR
+// references a Secret with a non-default key for the password.
+func TestReconcile_BYOSecretCustomKey(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	byoSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "mqtt"},
+		Data:       map[string][]byte{"my-pw-key": []byte("s3kr3t")},
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "byo", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+				Key:                  "my-pw-key",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, byoSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "byo"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='byo'`).Scan(&hash); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("s3kr3t")); err != nil {
+		t.Errorf("password mismatch with custom key: %v", err)
+	}
+}
+
+// TestReconcile_BcryptCostHonored asserts the BcryptCost field on the
+// reconciler is used to compute the stored hash. We can't read the cost
+// out of the bcrypt format directly without parsing, but the cost prefix
+// is encoded as `$2a$NN$` so a simple string check works.
+func TestReconcile_BcryptCostHonored(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "costy", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost:  6, // explicit, non-default
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "costy"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='costy'`).Scan(&hash); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	// bcrypt golang's GenerateFromPassword writes the cost as a
+	// zero-padded 2-digit decimal between dollar signs.
+	if !strings.HasPrefix(hash, "$2a$06$") {
+		t.Errorf("expected bcrypt cost 6 in hash prefix, got %q", hash[:7])
 	}
 }
 

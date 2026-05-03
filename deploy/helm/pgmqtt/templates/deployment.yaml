@@ -63,8 +63,6 @@ spec:
               value: {{ .Values.listeners.ws.port | quote }}
             - name: PGMQTT_RECEIVE_MAXIMUM
               value: {{ .Values.v5.receiveMaximum | quote }}
-            - name: PGMQTT_TOPIC_ALIAS_MAXIMUM
-              value: {{ .Values.v5.topicAliasMaximum | quote }}
             - name: PGMQTT_KEEPALIVE_MAX_SEC
               value: {{ .Values.v5.keepaliveMaxSec | quote }}
             - name: PGMQTT_BCRYPT_COST

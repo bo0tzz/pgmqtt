@@ -184,12 +184,16 @@ operator:
 
 ## v5 server policy. See protocol-spec links in docs/CONFORMANCE.md.
 ##   receiveMaximum: cap on un-ACKed inbound QoS>0 PUBLISHes per conn.
-##   topicAliasMaximum: 0 means we reject inbound topic aliases entirely.
 ##   keepaliveMaxSec: server cap on the negotiated keepalive interval; v5
 ##                    clients are notified via the ServerKeepAlive property.
+##
+## TopicAliasMaximum is intentionally not exposed: the broker does not
+## maintain an inbound topic-alias map, so we hardcode the advertised
+## value to 0 (per [MQTT-3.3.2-12], clients then never send aliases).
+## Outbound aliases (server → client) are supported via the client's
+## CONNECT-advertised TopicAliasMaximum.
 v5:
   receiveMaximum: 100
-  topicAliasMaximum: 0
   keepaliveMaxSec: 60
 
 ## Slow-subscriber backpressure. When a subscriber has this many rows in the

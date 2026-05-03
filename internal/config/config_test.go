@@ -16,9 +16,6 @@ func TestFromEnvDefaults(t *testing.T) {
 	if c.V5ReceiveMaximum != 100 {
 		t.Errorf("V5ReceiveMaximum default: got %d want 100", c.V5ReceiveMaximum)
 	}
-	if c.V5TopicAliasMaximum != 0 {
-		t.Errorf("V5TopicAliasMaximum default: got %d want 0", c.V5TopicAliasMaximum)
-	}
 	if c.V5KeepaliveMax != 60*time.Second {
 		t.Errorf("V5KeepaliveMax default: got %v want 60s", c.V5KeepaliveMax)
 	}
@@ -31,7 +28,6 @@ func TestFromEnvDefaults(t *testing.T) {
 func TestFromEnvOverrides(t *testing.T) {
 	t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
 	t.Setenv("PGMQTT_RECEIVE_MAXIMUM", "256")
-	t.Setenv("PGMQTT_TOPIC_ALIAS_MAXIMUM", "8")
 	t.Setenv("PGMQTT_KEEPALIVE_MAX_SEC", "120")
 	t.Setenv("PGMQTT_BCRYPT_COST", "12")
 
@@ -41,9 +37,6 @@ func TestFromEnvOverrides(t *testing.T) {
 	}
 	if c.V5ReceiveMaximum != 256 {
 		t.Errorf("V5ReceiveMaximum: got %d want 256", c.V5ReceiveMaximum)
-	}
-	if c.V5TopicAliasMaximum != 8 {
-		t.Errorf("V5TopicAliasMaximum: got %d want 8", c.V5TopicAliasMaximum)
 	}
 	if c.V5KeepaliveMax != 120*time.Second {
 		t.Errorf("V5KeepaliveMax: got %v want 120s", c.V5KeepaliveMax)

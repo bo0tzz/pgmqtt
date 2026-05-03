@@ -79,6 +79,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		return err
 	}
 
+	e.logger.Debug("deliver scan", "msg", messageID, "broker", self, "rows", len(items))
 	for _, it := range items {
 		retain := false
 		if it.retainAsPublished {
@@ -233,6 +234,9 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 // drainSessionQueue sends queued / inflight deliveries on reconnect. Rows in
 // state 0 (queued) become PUBLISH; state 1 (already-sent) become PUBLISH+DUP;
 // state 2 (PUBREC received, awaiting PUBCOMP) become PUBREL.
+//
+// Logs the per-state row count at Debug level so chaos-related loss can be
+// localized to "did takeover see the rows".
 func (c *Conn) drainSessionQueue(ctx context.Context) error {
 	rows, err := c.eng.pool.Query(ctx, `
 		SELECT d.id, d.qos, d.state, d.packet_id,
@@ -285,6 +289,21 @@ func (c *Conn) drainSessionQueue(ctx context.Context) error {
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	if len(items) > 0 {
+		var s0, s1, s2 int
+		for _, it := range items {
+			switch it.state {
+			case 0:
+				s0++
+			case 1:
+				s1++
+			case 2:
+				s2++
+			}
+		}
+		c.eng.logger.Debug("drain resumed", "client", c.clientID,
+			"queued", s0, "inflight", s1, "awaiting_pubcomp", s2)
 	}
 
 	for _, it := range items {

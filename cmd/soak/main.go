@@ -98,8 +98,9 @@ func main() {
 	<-pubDone
 	// Drain time — wait for any inflight messages to land. Long enough to
 	// cover a chaos restart cycle (broker death + restart + session resume
-	// + queued-delivery drain).
-	time.Sleep(10 * time.Second)
+	// + queued-delivery drain). 30s is well-above the slowest observed
+	// recovery path under kind-cluster chaos.
+	time.Sleep(30 * time.Second)
 	cancel()
 	subWG.Wait()
 
@@ -224,8 +225,21 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 				seq++
 				published.Add(1)
 			case 1:
-				if _, err := r.Read(); err != nil {
+				ack, err := r.Read()
+				if err != nil {
 					log.Printf("publish puback read (seq=%d): %v — reconnecting", seq, err)
+					_ = c.Close()
+					disconnected = true
+					continue
+				}
+				// MUST verify the packet is actually a PUBACK matching our
+				// in-flight packet ID. The broker can send other packets
+				// (e.g. DISCONNECT 0x8B during graceful shutdown) that
+				// would otherwise be silently mis-counted as PUBACK and
+				// produce false-positive "published" counts.
+				if ack.FixedHeader.Type != packets.Puback || ack.PacketID != pid {
+					log.Printf("publish: got type=%d pid=%d (want PUBACK pid=%d) for seq=%d — reconnecting",
+						ack.FixedHeader.Type, ack.PacketID, pid, seq)
 					_ = c.Close()
 					disconnected = true
 					continue
@@ -240,8 +254,9 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 					disconnected = true
 					continue
 				}
-				if rec.FixedHeader.Type != packets.Pubrec {
-					log.Printf("expected PUBREC, got %d — reconnecting", rec.FixedHeader.Type)
+				if rec.FixedHeader.Type != packets.Pubrec || rec.PacketID != pid {
+					log.Printf("publish: got type=%d pid=%d (want PUBREC pid=%d) for seq=%d — reconnecting",
+						rec.FixedHeader.Type, rec.PacketID, pid, seq)
 					_ = c.Close()
 					disconnected = true
 					continue
@@ -256,8 +271,16 @@ func runPublisher(ctx context.Context, broker, clientID, user, pass, topic strin
 					disconnected = true
 					continue
 				}
-				if _, err := r.Read(); err != nil {
+				comp, err := r.Read()
+				if err != nil {
 					log.Printf("publish pubcomp read (seq=%d): %v — reconnecting", seq, err)
+					_ = c.Close()
+					disconnected = true
+					continue
+				}
+				if comp.FixedHeader.Type != packets.Pubcomp || comp.PacketID != pid {
+					log.Printf("publish: got type=%d pid=%d (want PUBCOMP pid=%d) for seq=%d — reconnecting",
+						comp.FixedHeader.Type, comp.PacketID, pid, seq)
 					_ = c.Close()
 					disconnected = true
 					continue

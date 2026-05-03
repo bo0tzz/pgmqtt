@@ -142,6 +142,7 @@ func (l *Listener) run(ctx context.Context) {
 				l.logger.Warn("invalid publish payload", "payload", notif.Payload)
 				continue
 			}
+			l.logger.Debug("listener notify", "broker", l.uuid, "msg", msgID)
 			if err := l.eng.Deliver(ctx, msgID); err != nil {
 				l.logger.Warn("deliver", "msg", msgID, "err", err)
 			}

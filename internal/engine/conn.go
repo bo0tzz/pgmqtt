@@ -253,11 +253,11 @@ func (c *Conn) write(pk *packets.Packet) error {
 	return mqttwire.Write(c.nc, pk)
 }
 
-// V5 server policy. The broker advertises these in CONNACK and enforces them
-// during the session. Driven by config (see PGMQTT_RECEIVE_MAXIMUM /
-// PGMQTT_TOPIC_ALIAS_MAXIMUM / PGMQTT_KEEPALIVE_MAX_SEC). Stored as atomics
-// so the test setters don't race the accept loop. The defaults here match
-// the historical hardcoded values used pre-config plumbing.
+// V5 server policy. The broker advertises these in CONNACK and enforces
+// them during the session. Driven by config (see PGMQTT_RECEIVE_MAXIMUM /
+// PGMQTT_KEEPALIVE_MAX_SEC). Stored as atomics so test setters don't
+// race the accept loop. The defaults match the historical hardcoded
+// values used pre-config plumbing.
 
 func (e *Engine) serverReceiveMaximum() uint16 {
 	if v := e.receiveMaxV5Atomic.Load(); v > 0 {
@@ -266,12 +266,13 @@ func (e *Engine) serverReceiveMaximum() uint16 {
 	return 100
 }
 
-// serverTopicAliasMaximum: 0 means we don't accept client-side aliases —
-// PUBLISH with TopicAlias>0 → DISCONNECT 0x94. Outbound aliases (server→
-// client) are supported when the client advertises TopicAliasMaximum>0.
-func (e *Engine) serverTopicAliasMaximum() uint16 {
-	return uint16(e.topicAliasMaxV5Atomic.Load())
-}
+// serverTopicAliasMaximum is hardcoded to 0 — the broker does not
+// maintain an inbound topic-alias map, so we tell clients (per
+// [MQTT-3.3.2-12]) never to send TopicAlias > 0. Inbound PUBLISHes with
+// a TopicAlias get DISCONNECT 0x94. Outbound aliases (server → client)
+// are supported when the client advertises TopicAliasMaximum > 0 in
+// CONNECT.
+func (e *Engine) serverTopicAliasMaximum() uint16 { return 0 }
 
 func (e *Engine) maxAllowedKeepalive() time.Duration {
 	if v := e.keepaliveMaxV5Atomic.Load(); v > 0 {

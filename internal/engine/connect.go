@@ -119,6 +119,9 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		_ = c.writeConnackReject(pv, cackUnspecified)
 		return err
 	}
+	c.eng.logger.Debug("takeover", "client", c.clientID,
+		"prev_broker", prevBroker, "new_broker", c.eng.BrokerID(),
+		"new_session", newSession)
 
 	// Notify the prior owner Pod (if any and different) so it can close the stale socket.
 	if prevBroker != uuid.Nil && prevBroker != c.eng.BrokerID() {
