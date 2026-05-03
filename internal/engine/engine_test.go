@@ -359,6 +359,120 @@ func TestRateLimitDisconnects(t *testing.T) {
 	}
 }
 
+// TestUnsubscribeStopsDelivery verifies that after a client UNSUBSCRIBEs,
+// new PUBLISHes to the previously-matched filter are not delivered. Catches
+// regressions in the subscriptions-table delete path.
+func TestUnsubscribeStopsDelivery(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	sub := h.Connect(t, "unsub-1")
+	defer sub.Close()
+	pub := h.Connect(t, "unsub-pub")
+	defer pub.Close()
+
+	sub.Subscribe(t, "us/+", 0)
+	pub.Publish(t, "us/before", []byte("before"), 0, false)
+	pk := sub.Read(t, 2*time.Second)
+	if string(pk.Payload) != "before" {
+		t.Fatalf("first message payload = %q, want before", pk.Payload)
+	}
+
+	// Unsubscribe.
+	unsub := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Unsubscribe, Qos: 1},
+		ProtocolVersion: 5,
+		PacketID:        sub.NextPacketID(),
+		Filters:         packets.Subscriptions{{Filter: "us/+"}},
+	}
+	if err := sub.WritePacket(unsub); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	ack, err := sub.NextRaw()
+	if err != nil {
+		t.Fatalf("unsuback: %v", err)
+	}
+	if ack.FixedHeader.Type != packets.Unsuback {
+		t.Fatalf("expected UNSUBACK got %d", ack.FixedHeader.Type)
+	}
+
+	pub.Publish(t, "us/after", []byte("after"), 0, false)
+
+	// Subscriber must not receive — set a short read deadline so this
+	// doesn't hang on regression.
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	got, err := sub.NextRaw()
+	if err == nil && got.FixedHeader.Type == packets.Publish {
+		t.Fatalf("got publish after unsubscribe: %q", got.Payload)
+	}
+}
+
+// TestQoS2OutboundFullDance has the subscriber complete the full
+// PUBREC→PUBREL→PUBCOMP handshake so the broker's outbound-QoS-2 state
+// machine (handlePubrec + handlePubcomp) actually runs. Without this the
+// receiver-side dance is exercised but the publisher-side handlers on the
+// broker are never reached by tests.
+func TestQoS2OutboundFullDance(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	sub := h.Connect(t, "q2-full-sub")
+	defer sub.Close()
+	pub := h.Connect(t, "q2-full-pub")
+	defer pub.Close()
+
+	sub.Subscribe(t, "q2full/+", 2)
+	pub.Publish(t, "q2full/x", []byte("exactly-once"), 2, false)
+
+	pk := sub.Read(t, 2*time.Second)
+	if pk.FixedHeader.Type != packets.Publish || pk.FixedHeader.Qos != 2 {
+		t.Fatalf("expected QoS-2 PUBLISH, got type=%d qos=%d",
+			pk.FixedHeader.Type, pk.FixedHeader.Qos)
+	}
+
+	// Subscriber → broker: PUBREC. Broker's handlePubrec moves the
+	// delivery to state=2 and sends PUBREL.
+	if err := sub.WritePacket(&packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Pubrec},
+		ProtocolVersion: 5,
+		PacketID:        pk.PacketID,
+	}); err != nil {
+		t.Fatalf("pubrec: %v", err)
+	}
+	pubrel, err := sub.NextRaw()
+	if err != nil {
+		t.Fatalf("read pubrel: %v", err)
+	}
+	if pubrel.FixedHeader.Type != packets.Pubrel {
+		t.Fatalf("expected PUBREL got %d", pubrel.FixedHeader.Type)
+	}
+
+	// Subscriber → broker: PUBCOMP. Broker's handlePubcomp deletes the
+	// delivery row.
+	if err := sub.WritePacket(&packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Pubcomp},
+		ProtocolVersion: 5,
+		PacketID:        pubrel.PacketID,
+	}); err != nil {
+		t.Fatalf("pubcomp: %v", err)
+	}
+
+	// Cross-check: no leftover delivery rows for this client.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := h.Pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM deliveries WHERE client_id='q2-full-sub'`).Scan(&n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("delivery row not cleared after PUBCOMP")
+}
+
 // TestSlowSubscriberQuotaExceeded forces a subscriber's pending-deliveries
 // queue past the cap and asserts the broker DISCONNECTs them with reason
 // 0x97 (Quota Exceeded). The QoS-0 drop branch is exercised in the same
