@@ -66,10 +66,21 @@ First tagged release. Production-ready scope per `docs/TODO.md`.
 ### Added — tests
 
 - `cmd/soak` traffic-generator + `scripts/soak.sh` chaos wrapper.
+  Reconnects on broker death, uses persistent v5 sessions on
+  subscribers (clean_start=false + SessionExpiryInterval=3600) so
+  messages published during the disconnect window queue server-side
+  and drain on reconnect — verified zero-loss QoS-1 and zero-loss
+  QoS-2 under broker-kill-every-6s chaos at 200 msg/s. Skips
+  re-SUBSCRIBE when CONNACK reports `session_present=true` to avoid
+  drain/SUBACK interleave.
 - `scripts/paho-multi-broker.sh` runs Paho conformance against a 3-Pod
   kind broker via the Service VIP.
 - `scripts/ha-z2m-soak.sh` — Home Assistant + synthetic Z2M heartbeats
   with `kubectl delete pod` chaos.
+- Engine tests for `handleUnsubscribe`, broker-side outbound QoS-2
+  receiver state (`handlePubrec` + `handlePubcomp`).
+- Metrics: `TestServeBindsAndShutsDown` exercises the http.Server
+  lifecycle.
 
 ### Conformance
 
