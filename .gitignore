@@ -1,8 +1,10 @@
 /pgmqttd
+/soak
 /dist/
 *.log
 .env
 coverage.out
+coverage.txt
 .smoke-*
 *.test
 

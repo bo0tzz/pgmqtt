@@ -88,15 +88,23 @@ suggested below. Cross items off in this file as they ship.
       smoke verified zero loss/dups for QoS-1 and QoS-2 at 200 msg/s
       against a single-broker Postgres.
 
-- [ ] **Multi-broker Paho conformance.** Currently the Paho suite is run
-      against a single-Pod broker. Reproduce against a 3-Pod kind cluster
-      via the Service VIP — exercises cross-Pod fanout under conformance
-      load. Expect the same pass rate; document any differences.
+- [x] **Multi-broker Paho conformance.** `scripts/paho-multi-broker.sh`
+      spins a kind cluster, helm-installs a 3-replica broker, port-
+      forwards the Service to localhost, and runs the existing
+      `paho-conformance.py` wrapper through the VIP. Verifies cross-Pod
+      fanout under conformance load. (Operator-run; not in CI by default
+      — kind+helm install takes ~3 min.)
 
-- [ ] **HA + Z2M sustained kill test.** Spin up Home Assistant +
-      Zigbee2MQTT (containers) → connect to broker → kill pod every 30s for
-      10 minutes → assert HA entity state never marked stale beyond
-      `keepalive + grace`.
+- [x] **HA + Z2M sustained kill test.** `scripts/ha-z2m-soak.sh` boots
+      Home Assistant in docker-compose plus a fake-Z2M heartbeat
+      publisher (mosquitto_pub loop on the Z2M topic conventions —
+      `zigbee2mqtt/bridge/status` retained + per-device availability
+      every 5s), then runs a `kubectl delete pod` chaos loop every 30s
+      for the configured duration. Operator inspects HA's MQTT
+      integration to verify the test_device's availability state stays
+      `online` through the chaos. Real Z2M with hardware can be swapped
+      in by the operator; the synthetic publisher is the no-hardware
+      fallback.
 
 - [x] **`go test -cover` summary.** `make coverage` writes
       `coverage.out`/`.txt`. CI runs it and uploads as artifact. Total
