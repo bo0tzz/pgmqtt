@@ -166,19 +166,21 @@ because the multixact path was one component — the
 `WITH matches AS (...) INSERT INTO deliveries` body itself takes
 ~14.9 ms (now 19.8% of total PG time).
 
-After the fix, the new dominant hot path is `drainSessionQueue`'s
+After the fix, the new dominant hot path was `drainSessionQueue`'s
 resume scan in `internal/engine/deliver.go` (~36% of PG time at 501 ms
 mean). The query filters on `state IN (0,1,2)` which doesn't match
-the `state=0 AND qos>0` partial index, so it falls back to the
-broader `(client_id, state, id)` index and walks dead-tuple chains.
-Two follow-ups for that path:
+the `state=0 AND qos>0` partial index, so the planner fell back to
+the broader `(client_id, state, id)` index and walked dead-tuple
+chains. **Migration 0008** added
+`deliveries(client_id, id) WHERE state IN (0, 1, 2)` — a partial
+index whose predicate exactly matches the resume WHERE clause — so
+the planner now picks it deterministically and the resume scan no
+longer walks the broader index. Remaining follow-up for that path:
 
-1. A second partial index `deliveries(client_id, id) WHERE state ≤ 2`
-   to cover the resume predicate.
-2. Investigate why subscribers are reconnecting ~5×/sec/sub under
+1. Investigate why subscribers are reconnecting ~5×/sec/sub under
    load — likely chaos from rig DISCONNECTs, but if the production
-   shape sees the same churn, the resume query becomes a real
-   bottleneck.
+   shape sees the same churn, the resume query frequency itself
+   becomes worth tracking even with the index in place.
 
 ## Common patterns
 

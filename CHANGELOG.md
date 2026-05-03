@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migration **0007** adds a partial index
   `deliveries(client_id, id) WHERE state=0 AND qos>0` so the broker's
   inflight-delivery scan stops falling back to a full pkey walk.
+- Migration **0008** adds a partial index
+  `deliveries(client_id, id) WHERE state IN (0, 1, 2)` covering
+  `drainSessionQueue`'s resume scan. After 0006/0007 landed, the
+  resume scan became the new dominant PG hot path (~36% of total PG
+  time, 501 ms mean) because its `state IN (0,1,2)` predicate didn't
+  match 0007's narrower `state=0 AND qos>0` index. The new index's
+  predicate matches the WHERE clause exactly, so the planner picks
+  it deterministically.
 
 ### Added — operability
 
