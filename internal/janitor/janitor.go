@@ -5,7 +5,9 @@ package janitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/google/uuid"
@@ -73,6 +75,13 @@ type Leader interface {
 
 // RunWith starts the loop, gated on leader.
 func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
+	defer func() {
+		if r := recover(); r != nil {
+			j.logger.Error("janitor goroutine panic",
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		return
@@ -80,6 +89,20 @@ func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
 	case <-leader.Lost():
 		return
 	}
+
+	// runCtx cancels when leadership is lost so an in-flight tick's PG
+	// queries don't keep running on an ex-leader pod. Combined with the
+	// leader-write fence (task #84), this closes the double-fire window
+	// for wills/expiries when leadership transitions mid-tick.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	go func() {
+		select {
+		case <-leader.Lost():
+			cancelRun()
+		case <-runCtx.Done():
+		}
+	}()
 
 	t := time.NewTicker(j.interval)
 	defer t.Stop()
@@ -90,11 +113,25 @@ func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
 		case <-leader.Lost():
 			return
 		case <-t.C:
-			if err := j.Tick(ctx); err != nil {
+			if err := j.tickWithRecover(runCtx); err != nil &&
+				!errors.Is(err, context.Canceled) {
 				j.logger.Warn("janitor tick", "err", err)
 			}
 		}
 	}
+}
+
+// tickWithRecover wraps a single Tick so a panic in any sub-job logs and
+// returns an error instead of taking the whole pod down.
+func (j *Janitor) tickWithRecover(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			j.logger.Error("janitor tick panic",
+				"panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("janitor tick panic: %v", r)
+		}
+	}()
+	return j.Tick(ctx)
 }
 
 // Tick runs one full scan cycle: dead-Pod detection + sweep.
@@ -412,6 +449,7 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) erro
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 	type will struct {
 		client  string
 		topic   string
@@ -424,10 +462,12 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) erro
 	for rows.Next() {
 		var w will
 		if err := rows.Scan(&w.client, &w.topic, &w.payload, &w.qos, &w.retain, &w.props); err != nil {
-			rows.Close()
 			return err
 		}
 		wills = append(wills, w)
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 	rows.Close()
 

@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine"
 )
@@ -119,6 +121,12 @@ func (l *Listener) Stop() {
 
 func (l *Listener) run(ctx context.Context) {
 	defer close(l.doneCh)
+	defer func() {
+		if r := recover(); r != nil {
+			l.logger.Error("listener goroutine panic",
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 	pubCh := unquotedPub(l.uuid)
 	takeoverCh := unquotedTakeover(l.uuid)
 	quotaCh := unquotedQuota(l.uuid)
@@ -135,25 +143,40 @@ func (l *Listener) run(ctx context.Context) {
 			l.logger.Warn("listener wait", "err", err)
 			return
 		}
-		switch notif.Channel {
-		case pubCh:
-			msgID, err := strconv.ParseInt(notif.Payload, 10, 64)
-			if err != nil {
-				l.logger.Warn("invalid publish payload", "payload", notif.Payload)
-				continue
-			}
-			l.logger.Debug("listener notify", "broker", l.uuid, "msg", msgID)
-			if err := l.eng.Deliver(ctx, msgID); err != nil {
-				l.logger.Warn("deliver", "msg", msgID, "err", err)
-			}
-		case takeoverCh:
-			if c, ok := l.eng.ConnFor(notif.Payload); ok {
-				l.logger.Info("takeover from peer", "client", notif.Payload)
-				c.Shutdown()
-			}
-		case quotaCh:
-			l.eng.QuotaExceededLocally(notif.Payload)
+		l.dispatchNotification(ctx, notif, pubCh, takeoverCh, quotaCh)
+	}
+}
+
+// dispatchNotification handles a single NOTIFY. Wrapped in its own recover so
+// a panic in Deliver / Shutdown / QuotaExceededLocally on one notification
+// can't kill the listener — the broker stops fan-out for that pod entirely
+// when the listener dies, so per-event isolation matters.
+func (l *Listener) dispatchNotification(ctx context.Context, notif *pgconn.Notification, pubCh, takeoverCh, quotaCh string) {
+	defer func() {
+		if r := recover(); r != nil {
+			l.logger.Error("listener dispatch panic",
+				"channel", notif.Channel, "payload", notif.Payload,
+				"panic", r, "stack", string(debug.Stack()))
 		}
+	}()
+	switch notif.Channel {
+	case pubCh:
+		msgID, err := strconv.ParseInt(notif.Payload, 10, 64)
+		if err != nil {
+			l.logger.Warn("invalid publish payload", "payload", notif.Payload)
+			return
+		}
+		l.logger.Debug("listener notify", "broker", l.uuid, "msg", msgID)
+		if err := l.eng.Deliver(ctx, msgID); err != nil {
+			l.logger.Warn("deliver", "msg", msgID, "err", err)
+		}
+	case takeoverCh:
+		if c, ok := l.eng.ConnFor(notif.Payload); ok {
+			l.logger.Info("takeover from peer", "client", notif.Payload)
+			c.Shutdown()
+		}
+	case quotaCh:
+		l.eng.QuotaExceededLocally(notif.Payload)
 	}
 }
 
