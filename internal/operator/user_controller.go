@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -274,6 +273,3 @@ func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
 	}
 	user.Status.Conditions = append(user.Status.Conditions, cond)
 }
-
-// ensure errors import is referenced.
-var _ = errors.New
