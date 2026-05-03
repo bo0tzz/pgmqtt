@@ -75,12 +75,52 @@ First tagged release. Production-ready scope per `docs/TODO.md`.
   drain/SUBACK interleave.
 - `scripts/paho-multi-broker.sh` runs Paho conformance against a 3-Pod
   kind broker via the Service VIP.
-- `scripts/ha-z2m-soak.sh` — Home Assistant + synthetic Z2M heartbeats
-  with `kubectl delete pod` chaos.
 - Engine tests for `handleUnsubscribe`, broker-side outbound QoS-2
   receiver state (`handlePubrec` + `handlePubcomp`).
 - Metrics: `TestServeBindsAndShutsDown` exercises the http.Server
   lifecycle.
+
+### Verification & test rig
+
+- `cmd/soak` publisher pipelining: new `-inflight N` flag enables
+  QoS-1 PUBLISH→PUBACK pipelining via a dedicated reader goroutine
+  that demuxes PUBACKs by packet ID. Pushes per-publisher throughput
+  past the strict-serial RTT ceiling. Strict-serial path
+  (`inflight=1`) preserved as the default; QoS-0 / QoS-2 still take
+  the strict-serial path. Pipelined publisher records every
+  outstanding `(pid → seq)` and folds in-flight + un-replayed entries
+  into a replay queue on disconnect, so seqs that were on the wire
+  when the broker died are resent on the new conn. End-of-run drain
+  waits up to 2s for `outstanding` to empty so `published` doesn't
+  under-report by the in-flight window.
+- `cmd/soak` parallel publishers: `-pubs N` runs N concurrent
+  publishers each on its own connection, client_id, and topic
+  (`<topic>/pub-<idx>`); subscribers wildcard-subscribe `<topic>/+`.
+  Payloads now encode `(pub_id, seq)` so loss / dup analysis is
+  per-publisher × per-subscriber. Total `-rate` is split across
+  publishers (remainder spilled onto the first few).
+- `cmd/soak` subscriber single-read-loop: one goroutine handles all
+  reads (PUBLISH delivery + PUBREC ack interleave) so QoS-2 doesn't
+  deadlock on shared-conn ordering with multiple inbound publishers.
+- `cmd/soak` PUBACK validation: publisher now asserts the ack frame
+  is actually `PUBACK` with the matching packet ID before counting
+  the seq as published. Stops e.g. a graceful-shutdown DISCONNECT
+  0x8B from being mis-counted as a successful publish, which would
+  hide loss in the report.
+- Broker-side soak diagnostics: extra log breadcrumbs around
+  PUBLISH-arrived / PUBACK-emitted / cross-Pod fan-out timing for
+  reproducing soak failures locally without re-running the full
+  10-minute kind chaos loop.
+- `docs/CONFORMANCE.md` adds a "Multi-broker via Service VIP" section
+  recording the 3-replica kind run with subscribers and publishers
+  routinely landing on different Pods (kube-proxy per-conn
+  round-robin), exercising the Postgres-coordinated handoff. Same
+  9/10 v3.1.1 and 23/27 deterministic v5 result as single-broker.
+- Soak rig scope trimmed to broker-only chaos: dropped the bundled
+  Home Assistant + Zigbee2MQTT integration probe; the in-tree rig
+  is now `Postgres + pgmqttd + cmd/soak` only. Operators who want
+  HA/Z2M coverage can layer it on top of the broker chaos loop
+  themselves.
 
 ### Conformance
 

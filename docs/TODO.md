@@ -179,8 +179,11 @@ suggested below. Cross items off in this file as they ship.
       to false. Manual `workflow_dispatch` runs `--snapshot` for
       dry-runs.
 
-- [ ] **Semver policy** + CHANGELOG discipline: docs/CHANGELOG.md exists,
-      keep it up to date.
+- [x] **Semver policy** + CHANGELOG discipline. `docs/VERSIONING.md`
+      defines what bumps MAJOR / MINOR / PATCH (across broker, operator
+      API, and Postgres schema) and the `[Unreleased]` → `[X.Y.Z] -
+      YYYY-MM-DD` flow. `CHANGELOG.md` follows Keep a Changelog and is
+      updated per-PR.
 
 - [ ] **Deprecation policy** for the `User` CRD (`v1alpha1` → `v1beta1` →
       `v1`). For now `v1alpha1` is fine.
