@@ -55,41 +55,34 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		}
 	}
 
-	// QoS-2 inbound dedup: a duplicate PUBLISH (same packet_id, before
-	// PUBREL) must NOT re-fan-out. We claim the (client_id, packet_id) pair
-	// in inbound_qos2; ON CONFLICT is the dedup signal.
-	if pk.FixedHeader.Qos == 2 {
-		startQ2 := time.Now()
-		ct, err := c.eng.pool.Exec(ctx, `
-			INSERT INTO inbound_qos2(client_id, packet_id) VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, c.clientID, pk.PacketID)
-		c.eng.metrics.ObservePublishStage("qos2_dedup", time.Since(startQ2))
-		if err != nil {
-			return err
-		}
-		if ct.RowsAffected() == 0 {
-			// Duplicate — re-send PUBREC without fanning out again.
-			return c.write(&packets.Packet{
-				FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
-				PacketID:    pk.PacketID,
-			})
-		}
-	}
-
 	props, err := propsToJSON(pk.Properties)
 	if err != nil {
 		return err
 	}
 
-	res, err := c.eng.publishCore(ctx, publishCore{
+	core := publishCore{
 		Topic:      pk.TopicName,
 		Payload:    pk.Payload,
 		QoS:        pk.FixedHeader.Qos,
 		Retain:     pk.FixedHeader.Retain,
 		Properties: props,
 		Publisher:  c.clientID,
-	})
+	}
+	if pk.FixedHeader.Qos == 2 {
+		core.QoS2DedupKey = &qos2DedupKey{ClientID: c.clientID, PacketID: pk.PacketID}
+	}
+
+	res, err := c.eng.publishCore(ctx, core)
+	if errors.Is(err, ErrQoS2Duplicate) {
+		// QoS-2 retransmit before PUBREL — re-send PUBREC, no fanout.
+		// Atomic dedup-and-publish runs in publishCore now; previously
+		// the dedup INSERT lived outside the publishCore tx and could
+		// silently swallow QoS-2 messages on partial failure.
+		return c.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
+			PacketID:    pk.PacketID,
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -144,7 +137,31 @@ type publishCore struct {
 	Retain     bool
 	Properties []byte // jsonb-encoded mochi Properties (or nil)
 	Publisher  string // empty for synthesized (will, retained-fanout, etc.)
+
+	// QoS2DedupKey, if non-zero, makes publishCore claim the
+	// (client_id, packet_id) pair in inbound_qos2 inside the same tx as
+	// the message INSERT. If the row already exists, the tx aborts and
+	// publishCore returns ErrQoS2Duplicate so the caller can re-send
+	// PUBREC without fanning out again. Atomic dedup-and-publish — the
+	// previous "INSERT inbound_qos2 outside the tx, then BEGIN" pattern
+	// was a silent QoS-2 message-loss surface (dedup row would persist
+	// even if publishCore failed, causing the retry to hit ON CONFLICT
+	// and skip fanout).
+	QoS2DedupKey *qos2DedupKey
 }
+
+// qos2DedupKey identifies the QoS-2 publish for inbound dedup. PacketID
+// is unique per client_id, so the pair is unique per in-flight QoS-2
+// message.
+type qos2DedupKey struct {
+	ClientID string
+	PacketID uint16
+}
+
+// ErrQoS2Duplicate signals that the QoS-2 PUBLISH was a duplicate of an
+// already-claimed (client_id, packet_id). Caller should re-send PUBREC
+// without invoking the fanout side-effects.
+var ErrQoS2Duplicate = errors.New("qos2 inbound duplicate")
 
 // publishResult bundles fanout outputs that publishCore returns to the
 // caller. overflowClients are subscribers with QoS>0 deliveries dropped
@@ -157,18 +174,44 @@ type publishResult struct {
 }
 
 // publishCore performs the SQL portion of the publisher path. Retained writes
-// run before the fanout transaction (so retain updates are durable even if
-// nobody currently subscribes). The caller is responsible for emitting NOTIFY.
+// runs the retained mutation, the message INSERT, the cross-pod
+// pg_notify, and (for retained=true with empty payload) the retained-row
+// DELETE all inside a single transaction. The caller is responsible for
+// the post-commit Notifier hook used by the in-process test harness.
 func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult, error) {
 	var res publishResult
+
+	startBegin := time.Now()
+	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
+	e.metrics.ObservePublishStage("tx_begin", time.Since(startBegin))
+	if err != nil {
+		return res, err
+	}
+	defer tx.Rollback(ctx)
+
+	if p.QoS2DedupKey != nil {
+		startQ2 := time.Now()
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO inbound_qos2(client_id, packet_id) VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, p.QoS2DedupKey.ClientID, p.QoS2DedupKey.PacketID)
+		e.metrics.ObservePublishStage("qos2_dedup", time.Since(startQ2))
+		if err != nil {
+			return res, err
+		}
+		if ct.RowsAffected() == 0 {
+			return res, ErrQoS2Duplicate
+		}
+	}
+
 	if p.Retain {
 		startRetain := time.Now()
 		if len(p.Payload) == 0 {
-			if _, err := e.pool.Exec(ctx, `DELETE FROM retained WHERE topic=$1`, p.Topic); err != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM retained WHERE topic=$1`, p.Topic); err != nil {
 				return res, err
 			}
 		} else {
-			if _, err := e.pool.Exec(ctx, `
+			if _, err := tx.Exec(ctx, `
 				INSERT INTO retained (topic, payload, qos, properties, expires_at, updated_at)
 				VALUES ($1, $2, $3, $4, mqtt_retained_expires_at($4::jsonb), now())
 				ON CONFLICT (topic) DO UPDATE SET
@@ -183,14 +226,6 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 		}
 		e.metrics.ObservePublishStage("retain", time.Since(startRetain))
 	}
-
-	startBegin := time.Now()
-	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
-	e.metrics.ObservePublishStage("tx_begin", time.Since(startBegin))
-	if err != nil {
-		return res, err
-	}
-	defer tx.Rollback(ctx)
 
 	var publisher any
 	if p.Publisher != "" {
