@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,10 @@ import (
 // publisher path: optional retain update, message insert, delivery fanout,
 // notify peers. PUBACK / PUBREC are responded to per QoS.
 func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
+	startTotal := time.Now()
+	defer func() {
+		c.eng.metrics.ObservePublishStage("total", time.Since(startTotal))
+	}()
 	if err := mqttwire.ValidateTopicName(pk.TopicName); err != nil {
 		return err
 	}
@@ -54,10 +59,12 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	// PUBREL) must NOT re-fan-out. We claim the (client_id, packet_id) pair
 	// in inbound_qos2; ON CONFLICT is the dedup signal.
 	if pk.FixedHeader.Qos == 2 {
+		startQ2 := time.Now()
 		ct, err := c.eng.pool.Exec(ctx, `
 			INSERT INTO inbound_qos2(client_id, packet_id) VALUES ($1, $2)
 			ON CONFLICT DO NOTHING
 		`, c.clientID, pk.PacketID)
+		c.eng.metrics.ObservePublishStage("qos2_dedup", time.Since(startQ2))
 		if err != nil {
 			return err
 		}
@@ -94,9 +101,11 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		"brokers", len(res.BrokerIDs), "broker_ids", res.BrokerIDs,
 		"overflow", len(res.OverflowClients))
 
+	startNotify := time.Now()
 	if err := c.eng.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
 		c.eng.logger.Warn("publish notify", "msg", res.MessageID, "err", err)
 	}
+	c.eng.metrics.ObservePublishStage("notify", time.Since(startNotify))
 	if len(res.OverflowClients) > 0 {
 		c.eng.dispatchQuotaExceeded(ctx, res.OverflowClients)
 	}
@@ -106,20 +115,25 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		return nil
 	case 1:
 		// PUBACK closes the inbound flow-control slot for QoS 1.
+		startWrite := time.Now()
 		err := c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Puback},
 			PacketID:    pk.PacketID,
 		})
+		c.eng.metrics.ObservePublishStage("response_write", time.Since(startWrite))
 		c.inboundInflight.Add(-1)
 		return err
 	case 2:
 		// PUBREC alone doesn't close the slot — we're still waiting for
 		// PUBREL (which triggers PUBCOMP). The slot is released in
 		// handlePubrel.
-		return c.write(&packets.Packet{
+		startWrite := time.Now()
+		err := c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
 			PacketID:    pk.PacketID,
 		})
+		c.eng.metrics.ObservePublishStage("response_write", time.Since(startWrite))
+		return err
 	default:
 		return errors.New("invalid qos")
 	}
@@ -150,6 +164,7 @@ type publishResult struct {
 func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult, error) {
 	var res publishResult
 	if p.Retain {
+		startRetain := time.Now()
 		if len(p.Payload) == 0 {
 			if _, err := e.pool.Exec(ctx, `DELETE FROM retained WHERE topic=$1`, p.Topic); err != nil {
 				return res, err
@@ -168,9 +183,12 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 				return res, err
 			}
 		}
+		e.metrics.ObservePublishStage("retain", time.Since(startRetain))
 	}
 
+	startBegin := time.Now()
 	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
+	e.metrics.ObservePublishStage("tx_begin", time.Since(startBegin))
 	if err != nil {
 		return res, err
 	}
@@ -181,6 +199,7 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 		publisher = p.Publisher
 	}
 
+	startQuery := time.Now()
 	row := tx.QueryRow(ctx, `
 		SELECT msg_id, broker_ids, overflow_clients
 		  FROM mqtt_publish($1, $2, $3::smallint, $4, $5::jsonb, $6, $7::int)
@@ -191,9 +210,13 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 	if err := row.Scan(&res.MessageID, &brokers, &overflow); err != nil {
 		return res, err
 	}
+	e.metrics.ObservePublishStage("mqtt_publish_query", time.Since(startQuery))
+
+	startCommit := time.Now()
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
+	e.metrics.ObservePublishStage("tx_commit", time.Since(startCommit))
 	res.BrokerIDs = brokers
 	res.OverflowClients = overflow
 	return res, nil

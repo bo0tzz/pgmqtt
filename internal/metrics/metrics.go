@@ -35,6 +35,13 @@ type Metrics struct {
 	WillsFiredTotal    prometheus.Counter
 	QuotaExceededTotal prometheus.Counter
 	RateLimitedTotal   prometheus.Counter
+
+	// PublishStageSeconds attributes time across the QoS-1/QoS-2 inbound
+	// publisher path. Exists so an operator can answer "where does PUBACK
+	// latency come from?" without adding pg_stat_statements correlation.
+	// Stages: total, qos2_dedup, retain, tx_begin, mqtt_publish_query,
+	// tx_commit, notify, response_write (PUBACK or PUBREC).
+	PublishStageSeconds *prometheus.HistogramVec
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -78,6 +85,15 @@ func New() *Metrics {
 			Name: "pgmqtt_rate_limited_total",
 			Help: "Total inbound rate-limit DISCONNECT 0x96 events emitted by this Pod.",
 		}),
+		PublishStageSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "pgmqtt_publish_seconds",
+			Help: "Time spent in each stage of the inbound PUBLISH path. " +
+				"Stages: total, qos2_dedup, retain, tx_begin, mqtt_publish_query, tx_commit, notify, response_write.",
+			Buckets: []float64{
+				.0001, .0002, .0005, .001, .002, .005,
+				.01, .02, .05, .1, .25, .5, 1, 2.5, 5,
+			},
+		}, []string{"stage"}),
 	}
 
 	reg.MustRegister(
@@ -90,10 +106,21 @@ func New() *Metrics {
 		m.WillsFiredTotal,
 		m.QuotaExceededTotal,
 		m.RateLimitedTotal,
+		m.PublishStageSeconds,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	return m
+}
+
+// ObservePublishStage records a duration sample for one stage of the publish
+// path. Safe to call when m is nil — the engine constructs metrics on demand
+// and unit tests run without one.
+func (m *Metrics) ObservePublishStage(stage string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.PublishStageSeconds.WithLabelValues(stage).Observe(d.Seconds())
 }
 
 // RegisterPgxPool registers a collector that reports pgxpool stats every

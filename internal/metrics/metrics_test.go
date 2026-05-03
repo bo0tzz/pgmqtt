@@ -21,6 +21,8 @@ func TestHandlerRendersExpectedSeries(t *testing.T) {
 	m.QuotaExceededTotal.Inc()
 	m.RateLimitedTotal.Add(2)
 	m.DeliveriesInflight.WithLabelValues("queued").Set(0)
+	m.ObservePublishStage("total", 5*time.Millisecond)
+	m.ObservePublishStage("tx_commit", 30*time.Millisecond)
 
 	srv := httptest.NewServer(m.Handler())
 	defer srv.Close()
@@ -43,6 +45,9 @@ func TestHandlerRendersExpectedSeries(t *testing.T) {
 		"pgmqtt_wills_fired_total",
 		"pgmqtt_quota_exceeded_total",
 		"pgmqtt_rate_limited_total",
+		"pgmqtt_publish_seconds_bucket",
+		"pgmqtt_publish_seconds_count",
+		"pgmqtt_publish_seconds_sum",
 		"go_goroutines",
 	}
 	for _, w := range want {
