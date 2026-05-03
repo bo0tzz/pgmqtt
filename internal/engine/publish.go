@@ -83,6 +83,8 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	if err != nil {
 		return err
 	}
+	c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
+		"qos", pk.FixedHeader.Qos, "msg", msgID, "brokers", len(brokerIDs))
 
 	if err := c.eng.notify.Notify(ctx, brokerIDs, msgID); err != nil {
 		c.eng.logger.Warn("publish notify", "msg", msgID, "err", err)

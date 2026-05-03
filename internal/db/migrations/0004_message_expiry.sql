@@ -4,6 +4,10 @@ ALTER TABLE messages
   ADD COLUMN expires_at TIMESTAMPTZ;
 CREATE INDEX messages_expires_idx ON messages(expires_at) WHERE expires_at IS NOT NULL;
 
+-- noop: we replace mqtt_publish below with the expires_at variant. The original
+-- definition was in 0002_publish.sql.
+DROP FUNCTION IF EXISTS mqtt_publish(TEXT, BYTEA, SMALLINT, BOOLEAN, JSONB, TEXT);
+
 -- Replace mqtt_publish to set expires_at when properties.me > 0.
 CREATE OR REPLACE FUNCTION mqtt_publish(
     p_topic         TEXT,

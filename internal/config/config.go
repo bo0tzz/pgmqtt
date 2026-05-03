@@ -41,8 +41,11 @@ func FromEnv() (*Config, error) {
 	return c, nil
 }
 
+// getenv returns the env value if set (including empty string) — only
+// substitutes the default when the variable is unset. Empty string means "I
+// explicitly want this listener disabled".
 func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def
