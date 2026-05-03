@@ -23,9 +23,10 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
-// Notifier emits cross-Pod publish notifications. The default notifier
-// (NewLocalNotifier) is single-Pod: it dispatches the deliver step in-process.
-// In M5 the listener installs a Postgres-LISTEN-backed implementation.
+// Notifier emits cross-Pod publish notifications. The default
+// (`localNotifier`) is a no-op for tests; production wires
+// `listener.NewNotifier`, which fires `pg_notify` on
+// `pgmqtt_<broker_id>` for each owning Pod.
 type Notifier interface {
 	// Notify is called after a successful publish. brokerIDs are the unique
 	// broker UUIDs that own currently-connected subscribers; messageID is the
@@ -34,8 +35,10 @@ type Notifier interface {
 	Notify(ctx context.Context, brokerIDs []uuid.UUID, messageID int64) error
 }
 
-// TakeoverNotifier emits a takeover signal so the prior owner of a client_id
-// can close its now-stale socket. M4 uses a no-op; M6 wires the real one.
+// TakeoverNotifier emits a takeover signal so the prior owner of a
+// client_id can close its now-stale socket. The default is a no-op
+// (single-Pod tests); production wires `listener.NewTakeoverNotifier`,
+// which fires `pg_notify` on `pgmqtt_takeover_<broker_id>`.
 type TakeoverNotifier interface {
 	NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string) error
 }
@@ -397,8 +400,9 @@ func (e *Engine) rejectConnAtCap(nc net.Conn) {
 	_, _ = nc.Write([]byte{0x20, 0x03, 0x00, 0x9F, 0x00})
 }
 
-// localNotifier is the default — no-op. Wires M5's Postgres-LISTEN-backed
-// notifier for cross-Pod fanout, or NewInProcessNotifier for single-Pod tests.
+// localNotifier is the default — no-op. Production swaps in the
+// Postgres-LISTEN-backed notifier from the listener package; tests can
+// use NewInProcessNotifier for in-memory fanout.
 type localNotifier struct{}
 
 func (l *localNotifier) Notify(_ context.Context, _ []uuid.UUID, _ int64) error { return nil }
