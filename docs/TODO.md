@@ -73,8 +73,16 @@ suggested below. Cross items off in this file as they ship.
 - [x] **TLS termination example.** `docs/TLS.md` with the four working
       patterns (HTTPS Ingress for wss, ingress-nginx tcp-services, HAProxy
       frontend tls/backend tcp, cloud LB with ACM/GCLB).
-- [ ] **PSP / SCC**: chart already sets `runAsNonRoot`, etc. Verify against
-      OpenShift restricted-v2 SCC.
+- [x] **PSP / SCC**: chart's broker pod sets `runAsNonRoot=true`,
+      `allowPrivilegeEscalation=false`, `readOnlyRootFilesystem=true`,
+      drops all capabilities, and uses `seccompProfile: RuntimeDefault`.
+      That matches OpenShift `restricted-v2` SCC's *requirements*. The
+      one OpenShift wrinkle: hardcoded `runAsUser: 65532` is overridden
+      by the SCC mutating admission (which assigns a UID from the
+      namespace range). Operators on OpenShift should `--set
+      podSecurityContext.runAsUser=null,podSecurityContext.runAsGroup=null,podSecurityContext.fsGroup=null`
+      to let SCC populate them. (Verify with `oc adm policy
+      who-can use scc/restricted-v2`.)
 - [x] **Helm chart-tests directory** (`helm test pgmqtt`) with a mosquitto
       round-trip Pod (helm.sh/hook=test).
 

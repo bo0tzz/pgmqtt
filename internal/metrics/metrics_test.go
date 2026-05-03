@@ -1,11 +1,14 @@
 package metrics
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestHandlerRendersExpectedSeries asserts the registry exports each
@@ -49,5 +52,57 @@ func TestHandlerRendersExpectedSeries(t *testing.T) {
 	}
 	if !strings.Contains(out, `pgmqtt_publishes_total{qos="1"} 1`) {
 		t.Errorf("publishes_total{qos=1} not rendered: %s", out)
+	}
+}
+
+// TestServeBindsAndShutsDown verifies Serve listens on the supplied address,
+// answers /metrics, and exits cleanly when the context is cancelled. The
+// server lifecycle is what the operator actually depends on; the registry
+// content is exercised in the test above.
+func TestServeBindsAndShutsDown(t *testing.T) {
+	m := New()
+
+	// Pick a free port up-front; pass it to Serve and check the URL works.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Serve(ctx, addr) }()
+
+	// Poll briefly for the server to bind.
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Get("http://" + addr + "/metrics")
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("metrics never bound: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("metrics status: %d", resp.StatusCode)
+	}
+
+	// Cancel context; Serve should return ErrServerClosed-ish.
+	cancel()
+	select {
+	case err := <-errCh:
+		// http.Server.ListenAndServe returns http.ErrServerClosed after
+		// Shutdown — Serve wraps that with no annotation so we expect
+		// either ErrServerClosed or nil.
+		if err != nil && err != http.ErrServerClosed {
+			t.Fatalf("unexpected serve error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not exit after ctx cancel")
 	}
 }

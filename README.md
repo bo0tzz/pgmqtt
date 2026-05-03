@@ -49,23 +49,44 @@ Postgres you almost certainly already run.
 v1 covers everything in the design plan. See [PLAN.md](docs/PLAN.md) and the
 verification checklist in [docs/VERIFY.md](docs/VERIFY.md).
 
+Operational docs:
+
+- [`docs/OPS.md`](docs/OPS.md) — runbook (leader-stuck, zombie ownership,
+  pool exhaustion, schema-migration safety, DB failover).
+- [`docs/SIZING.md`](docs/SIZING.md) — Pod resources per N conns,
+  `max_connections` per traffic level, when to consider ltree.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, what the
+  broker enforces, what infrastructure must.
+- [`docs/BACKUP.md`](docs/BACKUP.md) — survival vs ephemeral tables,
+  `pg_dump` and cnpg flows, recovery drill.
+- [`docs/TLS.md`](docs/TLS.md) — four TLS-termination patterns.
+- [`docs/UI.md`](docs/UI.md) — optional MQTTX Web companion.
+- [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — Paho conformance
+  results.
+
 ### What's NOT in v1
 
-- **ACLs / topic-level authorization.** Auth ends at username.
+- **ACLs / topic-level authorization.** Auth ends at username — any
+  authenticated user can publish/subscribe to any topic.
 - **Shared subscriptions** (`$share/{group}/{filter}`) — the wire form is
   parsed but the underlying filter is treated as a normal subscription.
-- **MQTT v5 message expiry on retained.** Retained messages persist until
-  overwritten or explicitly cleared. v5 `Message Expiry Interval` is stored
-  but not enforced.
-- **MQTT v5 topic aliases.** Aliases are decoded but not maintained
-  per-connection. Add as a `topicAliasMaximum`-aware client side feature.
-- **Inbound QoS-2 dedup.** The PUBREL/PUBCOMP dance works on the publisher
-  side, but the broker doesn't track inbound packet-id state to suppress a
-  duplicate PUBLISH from a buggy client. Realistic clients don't retry mid-
-  PUBREL.
-- **Bridges, plugin hooks, dashboards.**
-- **`ltree`-backed retained/subscription indexes.** Linear scan with the SQL
-  match function is fine until tens of thousands of subs.
+- **TLS termination inside `pgmqttd`.** Front it with an L4/L7 terminator;
+  see [`docs/TLS.md`](docs/TLS.md) for four working patterns.
+- **A first-party web dashboard.** The chart can optionally install
+  MQTTX Web alongside (`--set ui.enabled=true`); see
+  [`docs/UI.md`](docs/UI.md).
+- **`ltree`-backed retained/subscription indexes.** Linear scan with the
+  SQL match function is fine until tens of thousands of subs; see
+  [`docs/SIZING.md`](docs/SIZING.md) for trigger conditions.
+
+Things that *are* in v1 that the design plan originally listed as
+"future": v5 message expiry (interval enforced + sweep), per-conn topic
+aliases (outbound supported, inbound rejected with 0x94), inbound QoS-2
+dedup tombstones, will-delay + session-expiry janitor, slow-subscriber
+backpressure with DISCONNECT 0x97, per-conn inbound rate limit with
+DISCONNECT 0x96, max-connections cap with CONNACK 0x9F, Prometheus
+`/metrics`. Conformance: 23/27 v5 deterministic Paho pass, 9/10 v3.1.1
+(see [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md)).
 
 ## Quick start (Kubernetes)
 
@@ -118,10 +139,19 @@ psql "$PGMQTT_DATABASE_URL" -c "INSERT INTO users(username,password_hash) VALUES
 | `PGMQTT_DATABASE_URL` | (required) | Postgres connection URL |
 | `PGMQTT_TCP_ADDR` | `:1883` | MQTT-over-TCP listener; empty disables |
 | `PGMQTT_WS_ADDR` | `:8083` | MQTT-over-WS listener; empty disables |
+| `PGMQTT_METRICS_ADDR` | `:9090` | Prometheus `/metrics` listener; empty disables |
 | `PGMQTT_SERVICE_HOST` | (auto in helm) | Host advertised in auto-generated User Secrets |
 | `PGMQTT_SERVICE_PORT` | `1883` | TCP port advertised in auto-generated Secrets |
 | `PGMQTT_SERVICE_WS_PORT` | `8083` | WS port advertised in auto-generated Secrets |
+| `PGMQTT_ALLOW_ANONYMOUS` | `false` | Skip auth when CONNECT has no username (test rigs only) |
 | `PGMQTT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `PGMQTT_BCRYPT_COST` | `10` | Bcrypt cost for password hashes (4–31) |
+| `PGMQTT_RECEIVE_MAXIMUM` | `100` | v5 server `ReceiveMaximum` advertised to clients |
+| `PGMQTT_TOPIC_ALIAS_MAXIMUM` | `0` | v5 server `TopicAliasMaximum` (0 rejects inbound aliases) |
+| `PGMQTT_KEEPALIVE_MAX_SEC` | `60` | Server cap on negotiated keepalive |
+| `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` | `10000` | Slow-subscriber cap; over → DISCONNECT 0x97 (0 disables) |
+| `PGMQTT_MAX_CONNECTIONS` | `5000` | Per-Pod connection cap; over → CONNACK 0x9F (0 disables) |
+| `PGMQTT_MAX_INBOUND_MSGS_PER_SEC` | `1000` | Per-conn token-bucket rate; over → DISCONNECT 0x96 (0 disables) |
 
 ## Development
 
