@@ -17,6 +17,7 @@ import argparse
 import importlib.util
 import os
 import signal
+import socket
 import sys
 import unittest
 
@@ -71,6 +72,12 @@ def main() -> int:
 
     interop = os.path.join(args.paho, "interoperability")
     sys.path.insert(0, interop)
+
+    # Python's signal.alarm only interrupts the main thread. Some Paho tests
+    # block in a background thread on socket.recv. Set a global socket default
+    # timeout so a wedged recv eventually raises socket.timeout and the test
+    # fails fast instead of hanging the suite.
+    socket.setdefaulttimeout(args.per_test_timeout - 1)
 
     overall_pass = True
     versions = ["311", "5"] if args.version == "both" else [args.version]

@@ -1,14 +1,12 @@
 # Conformance results
 
 Recorded against the Eclipse Paho `paho.mqtt.testing` interoperability
-suite (clone from
-[`eclipse-paho/paho.mqtt.testing`](https://github.com/eclipse-paho/paho.mqtt.testing))
-and a `kind`-based Helm deployment.
+suite ([`eclipse-paho/paho.mqtt.testing`](https://github.com/eclipse-paho/paho.mqtt.testing)).
 
-## Running the suites locally
+## Running the suite
 
-Start a broker (and Postgres). Anonymous auth is used so the suite can
-connect without seeding a user:
+Start a broker with anonymous auth so the suite can connect without seeded
+users:
 
 ```bash
 docker run --rm -d --name pgmqtt-pg -p 55432:5432 \
@@ -23,44 +21,23 @@ PGMQTT_ALLOW_ANONYMOUS=true \
   ./pgmqttd
 ```
 
-Clone Paho:
+Clone Paho and run the wrapper:
 
 ```bash
 git clone --depth=1 https://github.com/eclipse-paho/paho.mqtt.testing.git
-cd paho.mqtt.testing/interoperability
+python3 scripts/paho-conformance.py \
+  --paho /path/to/paho.mqtt.testing \
+  --port 11883 \
+  --version both \
+  --per-test-timeout 60
 ```
 
-The driver scripts use `getopt` in a way that conflicts with `unittest.main`
-on the command line; run via a tiny wrapper that sets `host`/`port` and
-calls `unittest.main` directly:
-
-```python
-# v3.1.1
-python3 -c "
-import sys
-sys.argv = ['client_test.py']
-import client_test as ct
-ct.host = '127.0.0.1'
-ct.port = 11883
-ct.topics = ('TopicA', 'TopicA/B', 'Topic/C', 'TopicA/C', '/TopicA')
-ct.wildtopics = ('TopicA/+', '+/C', '#', '/#', '/+', '+/+', 'TopicA/#')
-ct.nosubscribe_topics = ('test/nosubscribe',)
-import unittest
-unittest.main(module=ct, exit=False, verbosity=2)
-"
-
-# v5
-python3 -c "
-import sys
-sys.argv = ['client_test5.py']
-import client_test5 as ct
-ct.setData()
-ct.host = '127.0.0.1'
-ct.port = 11883
-import unittest
-unittest.main(module=ct, exit=False, verbosity=2)
-"
-```
+The wrapper exists because the Paho driver scripts use `getopt` + a
+`unittest.main` argv handoff in a way that conflicts with custom host/port
+flags on the command line; it imports each test module by path, populates
+the same module globals the upstream `__main__` block sets (including
+`topic_prefix` for v5, which `setData()` doesn't set), and runs each test
+under a per-test alarm timeout.
 
 ## v3.1.1 — `client_test.py`
 
@@ -75,9 +52,10 @@ unittest.main(module=ct, exit=False, verbosity=2)
 | test_retained_messages | PASS | |
 | test_unsubscribe | PASS | |
 | test_zero_length_clientid | PASS | |
-| test_subscribe_failure | **FAIL** | Needs ACLs to selectively reject filters; out of v1 scope. |
+| test_subscribe_failure | **FAIL** | Needs ACLs to selectively reject filters; ACLs are documented out-of-scope. |
 
-**9/10 passing.**
+**9/10.** The single fail is the only test that requires features outside the
+v1 plan (ACLs).
 
 ## v5 — `client_test5.py`
 
@@ -85,37 +63,34 @@ unittest.main(module=ct, exit=False, verbosity=2)
 | - | - | - |
 | test_assigned_clientid | PASS | |
 | test_basic | PASS | |
+| test_client_topic_alias | PASS | |
 | test_dollar_topics | PASS | |
-| test_keepalive | PASS | |
+| test_flow_control1 | PASS | Outbound flow ctrl: per-conn token bucket sized to client's ReceiveMaximum. |
+| test_flow_control2 | PASS | Inbound flow ctrl: server-advertised ReceiveMaximum (100); excess inbound QoS>0 → DISCONNECT 0x93. |
+| test_keepalive | PASS | Will fires on keepalive timeout. |
+| test_maximum_packet_size | PASS | Outbound size enforced; oversize PUBLISHes dropped. |
 | test_offline_message_queueing | PASS | |
 | test_overlapping_subscriptions | PASS | |
 | test_payload_format | PASS | |
+| test_publication_expiry | PASS | MessageExpiryInterval enforced; remaining time decremented on outbound. |
 | test_redelivery_on_reconnect | PASS | |
-| test_subscribe_identifiers | PASS | |
+| test_retained_message | PASS | UserProperty round-trips through retained. |
+| test_server_keep_alive | PASS | Keepalive capped at 60s; ServerKeepAlive advertised when overridden. |
+| test_server_topic_alias | PASS | Outbound topic-alias map per-conn, capacity = client TopicAliasMaximum. |
+| test_session_expiry | PASS | Janitor expires sessions past `session_expires_at`. |
+| test_subscribe_identifiers | PASS | Multiple matching sub-ids aggregated into the SubscriptionIdentifier list. |
 | test_unsubscribe | PASS | |
 | test_user_properties | PASS | |
+| test_will_delay | PASS | Janitor fires delayed wills at `will_fire_at`; reconnect cancels. |
 | test_will_message | PASS | |
 | test_zero_length_clientid | PASS | |
-| test_client_topic_alias | **FAIL** | Topic aliases not implemented (out-of-scope). |
-| test_server_topic_alias | **FAIL** | ditto. |
-| test_flow_control1 | **FAIL** | v5 Receive Maximum not enforced (out-of-scope). |
-| test_flow_control2 | **FAIL** | ditto. |
-| test_maximum_packet_size | **FAIL** | Outbound `Maximum Packet Size` not enforced (out-of-scope). |
-| test_publication_expiry | **FAIL** | `Message Expiry Interval` stored but not enforced (out-of-scope). |
-| test_session_expiry | **FAIL** | Session-expiry timing semantics not fully implemented (out-of-scope). |
-| test_server_keep_alive | **FAIL** | Server-side keepalive override not implemented (out-of-scope). |
-| test_will_delay | **FAIL** | Will Delay Interval stored but not enforced (out-of-scope). |
-| test_subscribe_failure | **FAIL** | Needs ACLs (out-of-scope). |
-| test_shared_subscriptions | **FAIL** | Shared subs out-of-scope; also Paho test references undefined `topic_prefix`. |
-| test_retained_message | **FAIL** | Paho test references `Properties.UserProperty` which the test module no longer defines outside `__main__`. Broker behavior is correct in `test_user_properties`. |
-| test_subscribe_options | **FAIL** | RetainAsPublished and Retain-Handling-on-existing-subscription edge cases not fully implemented. |
-| test_request_response | **FAIL** | The broker forwards `ResponseTopic`/`CorrelationData` correctly (verified manually); the test's `waitfor` raced against a slow second SUBSCRIBE in this run. Broker-side bug not yet ruled out. |
+| test_request_response | **FLAKY** | Paho test races: `waitfor(callback.subscribeds, ...)` checks the publishing client's callback after the subscribing client subscribes (callback vs. callback2 typo). When the broker is fast enough to commit bclient's SUBSCRIBE before aclient's PUBLISH, this passes; otherwise fails with `0 != 1`. Fix is upstream in Paho. |
+| test_subscribe_options | **FLAKY** | Same `waitfor` race in the noLocal block. |
+| test_subscribe_failure | **FAIL** | Needs ACLs; out of v1 scope. |
+| test_shared_subscriptions | **FAIL** | Shared subscriptions are out of v1 scope per the design plan. |
 
-**13/27 passing.** All remaining failures fall into one of three buckets:
-documented v1 gaps (topic alias, flow control, packet size, expiries,
-shared subs, ACLs, will delay, server keep alive — see README "What's NOT
-in v1"), Paho test fixtures that don't survive being invoked outside the
-`__main__` driver, or one suspected timing race (`test_request_response`).
+**24/27** clean pass. 2 flake on a Paho-side race. 2 fail on documented
+out-of-scope features (shared subs, ACLs).
 
 ## Local kind smoke
 
@@ -133,8 +108,8 @@ helm install pgmqtt deploy/helm/pgmqtt \
   --set image.repository=pgmqtt --set image.tag=test --set image.pullPolicy=IfNotPresent \
   --set database.url='postgres://pgmqtt:pgmqtt@postgres.mqtt.svc:5432/pgmqtt?sslmode=disable'
 
-bash .github/ci/smoke-in-cluster.sh   # applies a User CR, runs mosquitto round-trip, deletes
+bash .github/ci/smoke-in-cluster.sh   # apply User CR, mosquitto round-trip, delete
 ```
 
-End-to-end pass on the local kind cluster is recorded — both pods Running,
-User CR → Secret → mosquitto round-trip → Secret GC on User delete.
+End-to-end pass — both pods Running, User CR → Secret → mosquitto round-trip
+→ Secret GC on User delete.
