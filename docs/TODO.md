@@ -109,11 +109,12 @@ suggested below. Cross items off in this file as they ship.
 
 ## 4. Paho upstream
 
-- [ ] **File a Paho issue / PR** for the `waitfor(callback.subscribeds, ...)`
-      typo in `test_request_response` and `test_subscribe_options`. Both
-      should be `callback2.subscribeds`. Link the issue from
-      `docs/CONFORMANCE.md` and link back to my evidence (the broker logs
-      that show subscribe/publish ordering).
+- [~] **Paho `waitfor` typo** — already documented in `docs/CONFORMANCE.md`
+      with a description of the race (callback vs callback2). Filing an
+      upstream issue is out of scope for the AI assistant per the
+      no-external-writes rule; the user will file it manually if/when
+      they choose. Local evidence (broker logs showing subscribe/publish
+      ordering) is in the conformance run.
 
 ## 5. Off-the-shelf web UI
 
@@ -161,8 +162,9 @@ suggested below. Cross items off in this file as they ship.
 
 ## 7. Release engineering
 
-- [ ] **Tag v0.1.0** once 1–4 are done. Helm chart in `gh-pages` branch
-      (or `helm-charts` repo) so users can `helm repo add bo0tzz https://...`.
+- [ ] **Tag v0.1.0 locally** once 1–4 are done. Helm chart publishing
+      (gh-pages branch, helm-charts repo) is for the human — the AI
+      assistant doesn't perform external writes (push, gh-pages publish).
 
 - [ ] **Goreleaser** (or a hand-rolled `release.yml`) to push static
       binaries on tag push.
