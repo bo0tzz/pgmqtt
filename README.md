@@ -104,13 +104,18 @@ DISCONNECT 0x96, max-connections cap with CONNACK 0x9F, Prometheus
 You need Postgres reachable from your cluster. CloudNativePG works great;
 any Postgres ≥ 14 is fine.
 
+The Helm chart is published as an OCI artefact to GitHub Container
+Registry on every release tag. There is no HTTP-hosted Helm repo —
+install directly from the OCI URL. (The chart source still lives
+under `deploy/helm/pgmqtt` if you prefer to install from a checkout.)
+
 ```bash
 # Provision Postgres first, then a Secret with the connection URL:
 kubectl create namespace mqtt
 kubectl -n mqtt create secret generic pgmqtt-db \
     --from-literal=url='postgres://pgmqtt:secret@postgres.default.svc:5432/pgmqtt?sslmode=disable'
 
-helm install pgmqtt deploy/helm/pgmqtt \
+helm install pgmqtt oci://ghcr.io/bo0tzz/charts/pgmqtt --version 0.1.1 \
     --namespace mqtt \
     --set database.existingSecret=pgmqtt-db \
     --set replicaCount=2

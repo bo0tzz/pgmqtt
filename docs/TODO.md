@@ -165,9 +165,12 @@ suggested below. Cross items off in this file as they ship.
 
 ## 7. Release engineering
 
-- [ ] **Tag v0.1.0 locally** once 1–4 are done. Helm chart publishing
-      (gh-pages branch, helm-charts repo) is for the human — the AI
-      assistant doesn't perform external writes (push, gh-pages publish).
+- [ ] **Tag v0.1.0 locally** once 1–4 are done. The chart is published
+      automatically to `oci://ghcr.io/bo0tzz/charts/pgmqtt` by the
+      `chart-release.yml` workflow on tag push (no HTTP repo, no
+      gh-pages step). The AI assistant doesn't perform the tag push
+      itself — that remains a human action — but everything downstream
+      of the tag is wired.
 
 - [x] **Goreleaser** + matching workflow. `.goreleaser.yaml` produces
       `pgmqttd_<version>_<os>_<arch>.tar.gz` for `linux/{amd64,arm64}`
