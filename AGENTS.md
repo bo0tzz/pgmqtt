@@ -145,6 +145,25 @@ that assume a default tick at or below 1s. Bumping the default tick to
 Fix: keep the default at 1s. Operators who want longer intervals set the
 env explicitly. Document the tradeoff in `docs/OPS.md`.
 
+### Paho conformance flakes hide real signal in tier3
+
+`scripts/paho-conformance.py` runs the upstream Eclipse Paho test suite.
+A handful of tests are documented-flaky upstream (`test_request_response`,
+`test_subscribe_options` — both have a `waitfor` race that fires on
+timing) and a handful are out-of-scope for v1 (`test_subscribe_failure`
+needs ACLs, `test_shared_subscriptions` is documented-out-of-scope).
+Fail-fasting on any of these blocks the rest of tier3 (multi-broker
+paho + soak smoke).
+
+Fix: pass `--known-flaky` to the wrapper. The default list (set in the
+script) covers the documented flakes and out-of-scope tests. Tests in
+that set that fail emit a `FAIL(known-flaky)` line and are excluded
+from the wrapper's exit-code calculation. Override with
+`--known-flaky ''` if you want every test to be hard.
+
+The summary line reads `v5: 24/27 passing (+3 known-flaky)` so operators
+see the real signal at a glance.
+
 ## Reference
 
 - [`docs/TODO.md`](docs/TODO.md) — authoritative production-readiness
