@@ -89,23 +89,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one more row before DISCONNECT 0x97. `OFFSET (p_max_queued - 1)
   LIMIT 1` restores the intended `>= cap` boundary.
   `engine_test.go::TestSlowSubscriberQuotaExceeded` catches this.
-- **Janitor tick interval is exposed via `PGMQTT_JANITOR_INTERVAL_MS`
-  and Helm `janitor.intervalMs`** (default still 1s). An earlier change
-  in this cycle bumped the default to 5s to reduce idle DB churn (the
-  prior 1s × 11 jobs × N pods generated ~33 PG queries/sec at idle on
-  a 3-replica cluster), but Paho v5 `test_will_delay` regressed by 4s:
-  the spec measures will-delay precision in seconds and the suite
-  asserts within 1s. Reverted the default to 1s; per-job stratification
-  (fire_due_wills @ 1s, cleanup jobs @ 5–30s) is the proper fix and is
-  tracked separately. Operators with low-traffic deployments can dial
-  the knob up themselves.
+- **Janitor sub-jobs are stratified by per-job interval.** Earlier
+  this round the base tick was bumped from 1s→5s to drop idle DB
+  churn, but Paho v5 `test_will_delay` asserts will-fire within 1s
+  of `WillDelayInterval`, so 5s blew the conformance suite and the
+  bump was reverted. The real fix is per-job stratification: each
+  sub-job carries its own minimum interval and a `lastRun`
+  timestamp; the base ticker fires every 1s (the GCD) and a job
+  fires iff `now - lastRun >= interval`. Shipping cadences:
+  `fire_due_wills` 1s (Paho precision), `expire_sessions` /
+  `expire_retained` / `find_dead_brokers` 5s,
+  `refresh_deliveries_gauge` / `refresh_state_gauges` 10s,
+  `sweep_inbound_qos2` / `sweep_orphan_deliveries` /
+  `sweep_orphan_messages` 30s. On a 3-pod cluster idle PG load
+  drops from ~33 queries/sec (11 jobs × 3 pods × 1Hz) to ~10/sec
+  averaged. Tests collapse the stratification with `SetJobIntervals`
+  (interval=0 ⇒ "fire every tick"). New
+  `TestJanitorStratifiedIntervals` pins the contract via a fake
+  clock that advances 1s per Tick over 12 ticks and asserts each
+  job's histogram sample-count.
+  Knob: `PGMQTT_JANITOR_INTERVAL_MS` / Helm `janitor.intervalMs`
+  (default 1000) overrides the base tick.
 - **Strict integer parsing for env vars + Helm `int` cast on numeric
-  values.** Before: `getenvInt` used `fmt.Sscanf("%d")` which
-  permissively parses just the leading integer prefix; combined with
-  Helm rendering large integers in Go's `%v` scientific notation
-  (`1.6777216e+07` for 16777216), `MAX_PACKET_SIZE` resolved to 1 byte
-  in production deploys, and the broker rejected every PUBLISH as
-  "packet too large". Soak surfaced the bug. Fix: `strconv.Atoi`
+  values.** `getenvInt` used `fmt.Sscanf("%d")` which permissively
+  parses just the leading integer prefix; combined with Helm
+  rendering large integers in Go's `%v` scientific notation
+  (`1.6777216e+07` for 16777216), `MAX_PACKET_SIZE` resolved to 1
+  byte in production deploys and the broker rejected every PUBLISH
+  as "packet too large". Soak surfaced the bug. Fix: `strconv.Atoi`
   (strict) + `int` cast on every numeric value in
   `deploy/helm/pgmqtt/templates/deployment.yaml` to force decimal-
   integer rendering. Logged Warn now fires on un-parseable values.

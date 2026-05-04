@@ -15,11 +15,39 @@
 //     observes the same state, sets its own Prometheus gauge; aggregation
 //     across Pods (Prom max()) gives the right cluster-wide value.
 //
-// Cost of running on every Pod: N × 9 sub-jobs/sec instead of 9. For the
-// 3-pod default deployment that's ~27 cheap PG queries/sec; trivial
-// compared to publish/deliver load. If a deployment scales past hundreds
-// of Pods, an opt-in pg_try_advisory_lock(TICK_KEY) prefix on Tick would
-// rate-limit cluster-wide.
+// # Stratified intervals
+//
+// The base ticker fires every j.interval (default 1s, the GCD of all
+// per-job intervals). Each sub-job carries its own minimum interval and
+// a lastRun timestamp; on each base tick the loop visits every job and
+// fires it iff (now - lastRun) >= job.interval. This drops idle DB churn
+// ~5× vs the naive "every-job-every-tick" model without losing
+// time-bound spec precision:
+//
+//	fire_due_wills          1s   Paho test_will_delay asserts within 1s
+//	expire_sessions         5s   SessionExpiryInterval is minutes-hours
+//	expire_retained         5s   MessageExpiryInterval is seconds-grade
+//	find_dead_brokers       5s   broker keepalive is 30s anyway
+//	handle_dead_broker      —    fired in the same tick as find_dead_brokers
+//	refresh_deliveries_gauge 10s sub-minute observability gauge
+//	refresh_state_gauges    10s  sub-minute observability gauge
+//	sweep_inbound_qos2      30s  grace 1h default
+//	sweep_orphan_deliveries 30s  grace 10min default
+//	sweep_orphan_messages   30s  grace 10min default
+//
+// At idle on a 3-pod cluster this is ~3.4 PG queries/sec averaged
+// (1Hz fire_due_wills × 3 pods + 0.2Hz × 3 jobs × 3 pods + 0.1Hz × 2
+// × 3 + 0.033Hz × 3 × 3) instead of 33/sec.
+//
+// Tests can collapse stratification with SetJobIntervals (set every job
+// to 0 → "fire on every tick"); SetInterval still overrides the base
+// cadence.
+//
+// Cost of running on every Pod: even with stratification, all jobs are
+// idempotent across Pods (advisory locks, SKIP LOCKED, pure DELETEs)
+// so the work is correct on every Pod. If a deployment scales past
+// hundreds of Pods, an opt-in pg_try_advisory_lock(TICK_KEY) prefix
+// on Tick would rate-limit cluster-wide.
 package janitor
 
 import (
@@ -38,12 +66,53 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
+// Job names used as the per-job metric label and as the key for
+// SetJobIntervals. Keep in sync with the table in the package doc.
+const (
+	JobFindDeadBrokers       = "find_dead_brokers"
+	JobHandleDeadBroker      = "handle_dead_broker"
+	JobFireDueWills          = "fire_due_wills"
+	JobExpireSessions        = "expire_sessions"
+	JobExpireRetained        = "expire_retained"
+	JobSweepInboundQoS2      = "sweep_inbound_qos2"
+	JobSweepOrphanDeliveries = "sweep_orphan_deliveries"
+	JobRefreshDeliveriesGauge = "refresh_deliveries_gauge"
+	JobRefreshStateGauges    = "refresh_state_gauges"
+	JobSweepOrphanMessages   = "sweep_orphan_messages"
+)
+
+// defaultJobIntervals defines the per-job cadence. The base ticker fires
+// at the GCD (1s by default); a job whose interval is 0 fires on every
+// tick (used by tests via SetJobIntervals).
+var defaultJobIntervals = map[string]time.Duration{
+	JobFindDeadBrokers:        5 * time.Second,
+	JobFireDueWills:           1 * time.Second,
+	JobExpireSessions:         5 * time.Second,
+	JobExpireRetained:         5 * time.Second,
+	JobSweepInboundQoS2:       30 * time.Second,
+	JobSweepOrphanDeliveries:  30 * time.Second,
+	JobRefreshDeliveriesGauge: 10 * time.Second,
+	JobRefreshStateGauges:     10 * time.Second,
+	JobSweepOrphanMessages:    30 * time.Second,
+}
+
 // Run loops until ctx is cancelled, running Tick every interval on this Pod.
 type Janitor struct {
 	pool     *pgxpool.Pool
 	eng      *engine.Engine
 	logger   *slog.Logger
 	interval time.Duration
+
+	// jobIntervals maps job name → minimum cadence. A job fires on a
+	// given Tick iff (now - lastRun[job]) >= jobIntervals[job]. Initialised
+	// from defaultJobIntervals; tests override via SetJobIntervals.
+	jobIntervals map[string]time.Duration
+	lastRun      map[string]time.Time
+
+	// nowFn returns the current time. Defaults to time.Now; tests can
+	// substitute a fake clock to exercise stratified intervals without
+	// real sleeps.
+	nowFn func() time.Time
 
 	// orphanGrace is the minimum age of a message with zero deliveries before
 	// the sweep deletes it. Keeps very-recent publishes safe from races.
@@ -59,25 +128,41 @@ type Janitor struct {
 
 // New constructs a Janitor.
 func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
+	intervals := make(map[string]time.Duration, len(defaultJobIntervals))
+	for k, v := range defaultJobIntervals {
+		intervals[k] = v
+	}
 	return &Janitor{
 		pool:   pool,
 		eng:    eng,
 		logger: logger,
-		// 1s default. Will-delay precision is measured in seconds in the
-		// MQTT 5 spec and the Paho v5 conformance suite (test_will_delay)
-		// asserts will-fire within 1s of the configured WillDelayInterval.
-		// A 5s default reduced idle DB churn but blew that test by 4s;
-		// keep 1s and stratify the cleanup jobs separately if churn
-		// becomes a real bottleneck (tracked as a follow-up).
+		// 1s base tick = GCD of stratified per-job intervals. The shortest
+		// per-job cadence is fire_due_wills @ 1s (Paho v5 test_will_delay
+		// asserts within 1s of WillDelayInterval); cleanup jobs run on
+		// 5s/10s/30s cadences via the per-job stratification below, so
+		// idle DB churn is ~5× lower than naive "every-job-every-tick".
 		// Override via PGMQTT_JANITOR_INTERVAL_MS or Janitor.SetInterval.
 		interval:         1 * time.Second,
+		jobIntervals:     intervals,
+		lastRun:          make(map[string]time.Time),
+		nowFn:            time.Now,
 		orphanGrace:      10 * time.Minute,
 		inboundQoS2Grace: 1 * time.Hour,
 	}
 }
 
-// SetInterval overrides the default tick interval. Useful for tests.
+// SetInterval overrides the default base tick interval. Useful for tests.
 func (j *Janitor) SetInterval(d time.Duration) { j.interval = d }
+
+// SetJobIntervals overrides per-job intervals. Unspecified jobs keep their
+// current value. A job with interval 0 fires on every base tick — handy
+// for tests that want one Tick to exercise every sub-job. Useful for
+// tests that want to collapse stratification.
+func (j *Janitor) SetJobIntervals(m map[string]time.Duration) {
+	for k, v := range m {
+		j.jobIntervals[k] = v
+	}
+}
 
 // SetOrphanGrace overrides the orphan-message grace period.
 func (j *Janitor) SetOrphanGrace(d time.Duration) { j.orphanGrace = d }
@@ -129,40 +214,98 @@ func (j *Janitor) tickWithRecover(ctx context.Context) (err error) {
 	return j.Tick(ctx)
 }
 
-// Tick runs one full scan cycle: dead-Pod detection + sweep. Each sub-job
-// is timed and any error is counted on the per-job metrics, so an operator
-// can alert on a specific job degrading without parsing logs.
-func (j *Janitor) Tick(ctx context.Context) error {
-	var candidates []uuid.UUID
-	if err := j.timed("find_dead_brokers", func() error {
-		var err error
-		candidates, err = j.findDeadBrokerCandidates(ctx)
-		return err
-	}); err != nil {
-		return err
+// shouldRun reports whether (now - j.lastRun[job]) >= j.jobIntervals[job].
+// The first call for any job always fires (zero-value lastRun).
+func (j *Janitor) shouldRun(job string, now time.Time) bool {
+	interval := j.jobIntervals[job]
+	if interval <= 0 {
+		// 0 or unset = fire every tick (test collapse mode, or a job
+		// whose interval was deleted).
+		return true
 	}
-	for _, id := range candidates {
-		var claimed bool
-		if err := j.timed("handle_dead_broker", func() error {
+	last := j.lastRun[job]
+	if last.IsZero() {
+		return true
+	}
+	return now.Sub(last) >= interval
+}
+
+// markRun records the time job last fired.
+func (j *Janitor) markRun(job string, now time.Time) {
+	j.lastRun[job] = now
+}
+
+// Tick runs one full scan cycle, with each sub-job gated by its per-job
+// stratified interval. A job fires iff (now - lastRun[job]) >= interval[job].
+// Each sub-job is timed and any error is counted on the per-job metrics, so
+// an operator can alert on a specific job degrading without parsing logs.
+func (j *Janitor) Tick(ctx context.Context) error {
+	now := j.nowFn()
+
+	// find_dead_brokers + handle_dead_broker run together: a positive
+	// candidate list is meaningless without the per-broker takeover. Gate
+	// on find_dead_brokers' interval.
+	if j.shouldRun(JobFindDeadBrokers, now) {
+		var candidates []uuid.UUID
+		if err := j.timed(JobFindDeadBrokers, func() error {
 			var err error
-			claimed, err = j.handleDeadBroker(ctx, id)
+			candidates, err = j.findDeadBrokerCandidates(ctx)
 			return err
 		}); err != nil {
-			j.logger.Warn("dead broker handling", "broker", id, "err", err)
-			continue
+			j.markRun(JobFindDeadBrokers, now)
+			return err
 		}
-		if claimed && j.metrics != nil {
-			j.metrics.DeadBrokersTotal.Inc()
+		j.markRun(JobFindDeadBrokers, now)
+		for _, id := range candidates {
+			var claimed bool
+			if err := j.timed(JobHandleDeadBroker, func() error {
+				var err error
+				claimed, err = j.handleDeadBroker(ctx, id)
+				return err
+			}); err != nil {
+				j.logger.Warn("dead broker handling", "broker", id, "err", err)
+				continue
+			}
+			if claimed && j.metrics != nil {
+				j.metrics.DeadBrokersTotal.Inc()
+			}
 		}
 	}
-	_ = j.timed("fire_due_wills", func() error { return j.fireDueWills(ctx) })
-	_ = j.timed("expire_sessions", func() error { return j.expireSessions(ctx) })
-	_ = j.timed("expire_retained", func() error { return j.expireRetained(ctx) })
-	_ = j.timed("sweep_inbound_qos2", func() error { return j.sweepInboundQoS2(ctx) })
-	_ = j.timed("sweep_orphan_deliveries", func() error { return j.sweepOrphanDeliveries(ctx) })
-	_ = j.timed("refresh_deliveries_gauge", func() error { return j.refreshDeliveriesGauge(ctx) })
-	_ = j.timed("refresh_state_gauges", func() error { return j.refreshStateGauges(ctx) })
-	return j.timed("sweep_orphan_messages", func() error { return j.sweepOrphanMessages(ctx) })
+
+	// Run the rest of the per-job suite in deterministic order. Order
+	// matters only when one job's effects feed another within the same
+	// tick: expire_sessions before sweep_orphan_deliveries (cleared
+	// session rows produce orphans), sweep_orphan_deliveries before
+	// sweep_orphan_messages (a deletion can leave a message with no
+	// deliveries). The 1s/5s stratified cadence preserves that ordering
+	// across ticks too — a 30s sweep_orphan_messages tick will fire
+	// after at least 6 expire_sessions ticks.
+	type job struct {
+		name string
+		run  func(context.Context) error
+	}
+	jobs := []job{
+		{JobFireDueWills, j.fireDueWills},
+		{JobExpireSessions, j.expireSessions},
+		{JobExpireRetained, j.expireRetained},
+		{JobSweepInboundQoS2, j.sweepInboundQoS2},
+		{JobSweepOrphanDeliveries, j.sweepOrphanDeliveries},
+		{JobRefreshDeliveriesGauge, j.refreshDeliveriesGauge},
+		{JobRefreshStateGauges, j.refreshStateGauges},
+		{JobSweepOrphanMessages, j.sweepOrphanMessages},
+	}
+	var firstErr error
+	for _, jb := range jobs {
+		if !j.shouldRun(jb.name, now) {
+			continue
+		}
+		err := j.timed(jb.name, func() error { return jb.run(ctx) })
+		j.markRun(jb.name, now)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // timed runs f and records its duration + error on the per-job metrics.

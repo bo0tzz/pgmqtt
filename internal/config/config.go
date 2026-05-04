@@ -117,12 +117,12 @@ type Config struct {
 	// (exact match, no globbing).
 	WSAllowedOrigins []string
 
-	// JanitorInterval is how often this Pod's janitor runs the per-tick
-	// suite (find-dead-brokers, fire-due-wills, expire-sessions, expire-
-	// retained, sweep-orphans, refresh-gauges). Default 5s. Lower values
-	// trade idle DB churn for tighter precision on time-bound ops: at
-	// N pods × 11 jobs/tick × 1Hz, a leaderless cluster does 11N queries/
-	// sec at zero traffic. 0 leaves the janitor's own default (5s).
+	// JanitorInterval is the base tick frequency (the GCD of stratified
+	// per-job intervals). 1s default. fire_due_wills runs at this cadence
+	// (Paho v5 test_will_delay asserts will-fire within 1s of WillDelay-
+	// Interval); cleanup jobs run on stratified 5s/10s/30s cadences
+	// internally, so idle DB churn is ~5× lower than naive "every-job-
+	// every-tick". 0 leaves the janitor's own default (1s).
 	JanitorInterval time.Duration
 }
 

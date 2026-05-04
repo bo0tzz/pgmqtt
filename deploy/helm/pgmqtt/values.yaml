@@ -330,14 +330,13 @@ operator:
   ## broker's `users` table. Library default is 10.
   bcryptCost: 10
 
-## Janitor tick frequency. Each Pod runs the per-tick suite (find-dead-
-## brokers, fire-due-wills, expire-sessions, expire-retained, sweep-
-## orphans, refresh-gauges) at this cadence. 1s default — the Paho v5
-## conformance suite (test_will_delay) asserts will-fire within 1s of
-## the configured WillDelayInterval; coarser ticks blow that. A
-## stratified-job follow-up will let cleanup jobs run on a slower
-## cadence than fire_due_wills, dropping idle DB churn without losing
-## time-bound precision. 0 leaves the broker's compiled-in default (1s).
+## Janitor base tick frequency (the GCD of per-job stratified intervals).
+## 1s default. fire_due_wills runs at this cadence (Paho v5 test_will_delay
+## asserts will-fire within 1s of WillDelayInterval); cleanup jobs run on
+## stratified 5s/10s/30s cadences internally, so idle DB churn is roughly
+## 5× lower than naive "every-job-every-tick". Lowering this also lowers
+## the per-job intervals' resolution. 0 leaves the broker's compiled-in
+## default (1s).
 janitor:
   intervalMs: 1000
 

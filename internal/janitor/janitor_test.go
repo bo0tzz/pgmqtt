@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/google/uuid"
@@ -402,6 +403,91 @@ func TestJanitorConcurrentHandleDeadBrokerLockExclusive(t *testing.T) {
 	}
 	if brokerID != nil {
 		t.Errorf("broker_id not cleared: %v", brokerID)
+	}
+}
+
+// TestJanitorStratifiedIntervals pins the per-job stratification contract:
+// each sub-job fires only when (now - lastRun) >= its configured interval,
+// not on every base tick. We use a fake clock that advances 1s per Tick
+// and assert that, over a 12s window, fast jobs fire 12× while slow jobs
+// fire fewer times in proportion to their interval.
+func TestJanitorStratifiedIntervals(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+
+	mtx := metrics.New()
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetMetrics(mtx)
+
+	// Configure non-default intervals to make the contract obvious:
+	// fast=1s, mid=3s, slow=6s. We'll tick 12× at 1s steps and assert
+	// fire counts of 12, 4, 2 respectively.
+	jt.SetJobIntervals(map[string]time.Duration{
+		janitor.JobFireDueWills:           1 * time.Second,
+		janitor.JobFindDeadBrokers:        3 * time.Second,
+		janitor.JobExpireSessions:         3 * time.Second,
+		janitor.JobExpireRetained:         3 * time.Second,
+		janitor.JobRefreshDeliveriesGauge: 3 * time.Second,
+		janitor.JobRefreshStateGauges:     3 * time.Second,
+		janitor.JobSweepInboundQoS2:       6 * time.Second,
+		janitor.JobSweepOrphanDeliveries:  6 * time.Second,
+		janitor.JobSweepOrphanMessages:    6 * time.Second,
+	})
+
+	// Fake clock starts at a fixed point and advances 1s each Tick.
+	base := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var step int64
+	jt.SetNowForTest(func() time.Time {
+		// Caller advances `step` between ticks; we read whatever it's set to.
+		return base.Add(time.Duration(step) * time.Second)
+	})
+
+	const ticks = 12
+	for i := 0; i < ticks; i++ {
+		step = int64(i)
+		if err := jt.Tick(context.Background()); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+
+	// Read per-job fire counts off pgmqtt_janitor_tick_seconds{job}'s
+	// SampleCount. Each timed() call records one observation, so the
+	// histogram count == number of fires.
+	type expectation struct {
+		job  string
+		want uint64
+	}
+	want := []expectation{
+		{janitor.JobFireDueWills, 12},          // every tick (1s, ticks 0,1,2,...,11 → 12)
+		{janitor.JobFindDeadBrokers, 4},        // 3s interval → ticks 0,3,6,9 → 4
+		{janitor.JobExpireSessions, 4},         // 3s interval
+		{janitor.JobExpireRetained, 4},         // 3s interval
+		{janitor.JobRefreshDeliveriesGauge, 4}, // 3s interval
+		{janitor.JobRefreshStateGauges, 4},     // 3s interval
+		{janitor.JobSweepInboundQoS2, 2},       // 6s interval → ticks 0,6 → 2
+		{janitor.JobSweepOrphanDeliveries, 2},  // 6s interval
+		{janitor.JobSweepOrphanMessages, 2},    // 6s interval
+	}
+	for _, w := range want {
+		h, err := mtx.JanitorTickSeconds.GetMetricWithLabelValues(w.job)
+		if err != nil {
+			t.Fatalf("%s: %v", w.job, err)
+		}
+		var pb dto.Metric
+		// prometheus.Histogram implements prometheus.Metric (Write).
+		if err := h.(prometheus.Metric).Write(&pb); err != nil {
+			t.Fatalf("%s: %v", w.job, err)
+		}
+		if got := pb.GetHistogram().GetSampleCount(); got != w.want {
+			t.Errorf("%s fired %d times, want %d", w.job, got, w.want)
+		}
 	}
 }
 

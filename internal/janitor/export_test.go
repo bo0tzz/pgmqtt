@@ -2,6 +2,7 @@ package janitor
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -17,4 +18,11 @@ func (j *Janitor) FireDueWillsForTest(ctx context.Context) error {
 // per-broker advisory lock and performed the takeover.
 func (j *Janitor) HandleDeadBrokerForTest(ctx context.Context, brokerID uuid.UUID) (bool, error) {
 	return j.handleDeadBroker(ctx, brokerID)
+}
+
+// SetNowForTest substitutes a fake clock function for the per-job
+// stratified-interval gate. Useful for tests that drive Tick() with
+// controlled wall-clock advances without real sleeps.
+func (j *Janitor) SetNowForTest(now func() time.Time) {
+	j.nowFn = now
 }
