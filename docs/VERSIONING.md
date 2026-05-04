@@ -8,7 +8,9 @@ across three surfaces, treated as a single product version:
    semantics).
 3. The Postgres schema, defined as a sequence of versioned migrations
    in `internal/db/migrations/` (currently `0001_init.sql` through
-   `0009_drop_next_packet_id.sql`).
+   `0011_fix_publish_cap_off_by_one.sql`). **This line is bumped per
+   migration** — if you're adding a migration, update the top filename
+   here in the same commit so future drift is obvious.
 
 The Helm chart version tracks the same `MAJOR.MINOR.PATCH` and is bumped
 in lockstep with the broker.

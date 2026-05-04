@@ -19,8 +19,11 @@ kubectl -n mqtt run -it --rm probe --image=ghcr.io/eclipse-mosquitto:2.0 \
 # Per-Pod liveness:
 kubectl -n mqtt get pods -l app.kubernetes.io/name=pgmqtt -o wide
 
-# Per-Pod broker UUID + leader status (from logs):
-kubectl -n mqtt logs -l app.kubernetes.io/name=pgmqtt --tail=50 | grep -E "broker|leader"
+# Per-Pod broker UUID + operator leader-election state (from logs):
+# (Operator leader-election lines come from controller-runtime's K8s
+# Lease implementation; the broker itself emits no "leader" line since
+# the leaderless refactor.)
+kubectl -n mqtt logs -l app.kubernetes.io/name=pgmqtt --tail=50 | grep -E "broker|leader_election"
 
 # Metrics (one Pod):
 kubectl -n mqtt port-forward $(kubectl -n mqtt get pod -l app.kubernetes.io/name=pgmqtt -o name | head -1) 9090:9090
@@ -198,8 +201,9 @@ growing fast.
 
 Migrations run on every Pod start. They acquire a different advisory
 lock (`migrateLockKey`) so concurrent Pod starts queue rather than
-race. Each migration is idempotent (`CREATE TABLE IF NOT EXISTS`,
-`CREATE OR REPLACE FUNCTION`, etc.).
+race. Each migration is recorded in `schema_migrations` and skipped
+on re-apply; do not re-run migration SQL by hand (most files use bare
+`CREATE TABLE` / `ALTER TABLE` and will error on a populated DB).
 
 **What's safe:**
 

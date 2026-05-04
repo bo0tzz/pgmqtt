@@ -69,14 +69,12 @@ Scale **up** (more CPU/memory per Pod) when:
 Each Pod opens:
 
 - One dedicated `*pgx.Conn` for the listener (always-on).
-- One dedicated `*pgx.Conn` if it's currently the leader (advisory
-  lock 42).
 - A `pgxpool.Pool` whose max-conn is set via the
   `pool_max_conns` parameter on the connection string. Default is 5.
 
-So **two pods** on a leader+follower split → at most `2 × (1 + 5) + 1 = 13`
-connections. Multiply your `pool_max_conns` × replicas, plus `replicas + 1`
-for the listener / leader connections, and that's your minimum
+So **two pods** → at most `2 × (5 + 1) = 12` connections (each Pod's
+pool plus its listener conn). The general formula is
+`replicas × pool_max_conns + replicas`, and that's your minimum
 `max_connections` setting in `postgresql.conf`.
 
 Recommended starting points:
