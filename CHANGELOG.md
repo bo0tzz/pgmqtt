@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **DB password no longer leaks into pod logs.** `pgxpool.ParseConfig` and
+  `pgx.ConnectConfig` errors include the connection string on `%w` —
+  `logger.Error("db open", "err", err)` flushed the Postgres password to
+  stderr → kubectl logs on any startup-time DB hiccup. New
+  `db.ScrubURLError` substring-replaces the parsed password with
+  REDACTED before wrap; applied at all five connect-error sites.
+- **Pre-CONNECT packet size capped at 1 MiB.** Codec previously allocated
+  up to 256 MiB unconditionally on the announced packet length BEFORE
+  any auth check. With default MaxConnections=5000, an attacker
+  announcing 256 MiB per conn could balloon broker RAM by ~1.25 TiB.
+  New constant `preConnectMaxPacketSize = 1 MiB` enforces a hard cap
+  before the buffer alloc; raised to `min(client_max_v5,
+  PGMQTT_MAX_PACKET_SIZE)` after CONNECT lands.
+- **Per-IP CONNECT rate limit + auth-failure penalty box.** `acceptTCP`
+  and `serveWS` now meter CONNECTs by source IP via a token bucket
+  (`PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC`, default 5). A separate
+  auth-failure bucket (`PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN`,
+  default 30) puts an offending IP in a 60s penalty box where every
+  CONNECT is dropped pre-bcrypt. Mitigates bcrypt CPU DoS where a
+  single IP could pin ~3 cores by streaming failed CONNECTs at
+  cost-10 bcrypt cost. New `pgmqtt_connect_dropped_total{reason}`
+  counter (reasons: `rate_limit`, `penalty_box`).
+- **WS allowed-origins opt-in.** `ws.allowedOrigins` Helm value
+  (env: `PGMQTT_WS_ALLOWED_ORIGINS`) restricts the WebSocket
+  CheckOrigin handler to an exact-match list. Empty default
+  preserves historical "accept any Origin" behavior; setting it
+  closes off CSWSH on a publicly-reachable /mqtt endpoint. Logs a
+  one-time Warn at startup when unset.
+- **Operator-side ClusterRole secrets verbs deliberately remain
+  cluster-wide.** Initial audit recommended scoping; reverted to
+  preserve cross-namespace User CR support (Users land anywhere;
+  generated `<name>-mqtt-credentials` Secrets need to be writable
+  in the User's namespace). Trade-off documented in
+  `docs/SECURITY.md`.
+
+### Changed — operator correctness
+
+- **User reconciler password race during lease handoff.** Reconcile
+  used to: (1) read existing Secret password OR generate fresh
+  random, (2) bcrypt + write to PG, (3) CreateOrUpdate Secret.
+  During a ~15s lease handoff two managers could end up with
+  different randoms; loser's bcrypt landed in PG while winner's
+  password landed in Secret. Re-ordered: Secret CreateOrUpdate
+  first (server-side merge resolves the password), then re-Get
+  the resolved Secret before the bcrypt + PG write.
+- **Bcrypt cost knob now rehashes existing rows.** Previously,
+  bumping `operator.bcryptCost` from 10→14 left existing User
+  rows on cost-10 hashes forever (Reconcile short-circuited on
+  `user.Status.ObservedSecretHash == hash` regardless of cost).
+  Reconcile now parses the stored bcrypt cost and forces a
+  rehash when below configured. Plaintext is preserved; only the
+  hash changes. New `pgmqtt_user_rehash_total{reason}` metric
+  with reasons `cost_bump` and `rotation`.
+- **Operator startup outside K8s no longer surfaces a confusing
+  `unable to find leader election namespace` error.** When
+  `POD_NAMESPACE` is unset and the in-cluster service-account
+  file is absent (dev workstation pointing at a real cluster via
+  kubeconfig), `operator.Run` now logs
+  `"operator disabled: POD_NAMESPACE unset and not in-cluster"`
+  at Info and returns nil. Broker keeps serving MQTT.
+- **Listener reconnects on transient NOTIFY wait errors.**
+  Previously a non-EOF error in `WaitForNotification` exited
+  the dispatch loop silently — Pod kept serving :1883 but
+  cross-broker publishes silently dropped on the floor. Now
+  retries with exponential backoff (1→2→4→8→16s, 5 attempts),
+  re-acquiring the broker advisory lock + LISTEN registrations
+  on each attempt. Exhaustion calls `os.Exit(1)` so kubelet
+  replaces the Pod. New `pgmqtt_listener_restarts_total{reason}`
+  counter (reasons: `wait_error`, `ctx_cancel`,
+  `exhausted_retries`).
+
+### Fixed
+
+- **Migration 0011** fixes an off-by-one introduced by 0010's
+  publish-cap short-circuit. `EXISTS (... OFFSET p_max_queued LIMIT 1)`
+  evaluated `over_cap` as `depth >= p_max_queued + 1`, one row too
+  lenient. With cap=N and N rows queued the broker silently accepted
+  one more row before DISCONNECT 0x97. `OFFSET (p_max_queued - 1)
+  LIMIT 1` restores the intended `>= cap` boundary.
+  `engine_test.go::TestSlowSubscriberQuotaExceeded` catches this.
+- **Janitor tick frequency** lowered from 1s to 5s default
+  (`PGMQTT_JANITOR_INTERVAL_MS`, Helm `janitor.intervalMs`). The
+  prior 1s × 11 jobs × N pods generated ~33 PG queries/sec at idle
+  on a 3-replica cluster. The trade-off: will-fire / session-expire
+  / retained-expire latency rises by up to 4s — well within MQTT 5
+  spec tolerances. Lower for tighter precision, raise for less
+  churn at scale.
+- **`PGMQTT_LOG_LEVEL` honors warn/error.** README advertised
+  `debug|info|warn|error` but only `debug` was special-cased;
+  the rest mapped to info. Now parses via `slog.Level.UnmarshalText`
+  with a logged Warn fallback to info on parse error.
+
+### Added
+
+- **Helm `values.schema.json`** surfaces typo'd values at
+  `helm install` time. `additionalProperties: false` on the top
+  level catches `replicasCount` (vs `replicaCount`), and similar
+  per-section. Escape-hatch keys (`extraEnv`, `podAnnotations`,
+  `affinity`, `resources`, etc.) keep `additionalProperties: true`.
+- **Concurrent-Tick janitor tests.** Two tests pin the package-doc
+  concurrency-safety claim: `TestJanitorConcurrentFireDueWillsExactlyOnce`
+  (4 goroutines fire the same expired will, exactly one PUBLISH +
+  one counter increment lands) and `TestJanitorConcurrentHandleDeadBrokerLockExclusive`
+  (4 goroutines race for the per-broker advisory lock; exactly one
+  wins).
+- **Migration 0010+0011 boundary tests** (`TestPublishCapBoundary`)
+  pin cap-1, cap, and `state=3` exclusion semantics.
+- **`config: warn on un-parseable env values`.** `getenvInt` no
+  longer silently substitutes the default — it logs a Warn naming
+  the offending key and value, so operators spot typos.
+- **Migrations idempotency guards.** Bare CREATE TABLE / CREATE
+  INDEX / ALTER … DROP CONSTRAINT in migrations 0001/0006/0007/0008
+  now use `IF [NOT] EXISTS`. `schema_migrations` is still the
+  authoritative replay-prevention mechanism, but the SQL is
+  no longer hostile to manual-restore replay.
+
 ### Changed — modernization
 
 - **Helm chart distribution**: the chart is now published to
