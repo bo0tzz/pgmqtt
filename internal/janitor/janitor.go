@@ -7,7 +7,7 @@
 //   - fireDueWills uses SELECT … FOR UPDATE SKIP LOCKED so concurrent Pods
 //     don't double-fire the same will.
 //   - expireSessions uses SELECT … FOR UPDATE; the row locks serialise
-//     concurrent leaders and the DELETE is idempotent.
+//     concurrent janitors and the DELETE is idempotent.
 //   - expireRetained / sweepInboundQoS2 / sweepOrphanDeliveries /
 //     sweepOrphanMessages are pure idempotent DELETEs — each row is
 //     deleted at most once across Pods.
