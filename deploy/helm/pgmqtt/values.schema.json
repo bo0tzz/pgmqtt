@@ -376,7 +376,9 @@
         "maxQueuedDeliveriesPerClient": { "type": "integer", "minimum": 0 },
         "maxConnections": { "type": "integer", "minimum": 0 },
         "maxInboundMsgsPerSec": { "type": "integer", "minimum": 0 },
-        "maxPacketSize": { "type": "integer", "minimum": 0 }
+        "maxPacketSize": { "type": "integer", "minimum": 0 },
+        "maxConnectsPerIPPerSec": { "type": "integer", "minimum": 0 },
+        "maxAuthFailuresPerIPPerMin": { "type": "integer", "minimum": 0 }
       }
     }
   }
