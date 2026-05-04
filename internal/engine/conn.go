@@ -831,11 +831,18 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) error {
 	c.willTopic = "" // [MQTT-3.14.4-3]
 	// v5 [MQTT-3.14.2.2.2]: a DISCONNECT may override SessionExpiryInterval.
-	// Per spec, the server treats the packet as invalid if the original
-	// CONNECT had SessionExpiryInterval=0 and DISCONNECT supplies non-zero.
+	// Per spec, the server treats the packet as a Protocol Error if the
+	// original CONNECT had SessionExpiryInterval=0 (or was absent — spec
+	// default is 0) and DISCONNECT supplies non-zero. Treat nil
+	// (sessionExpiry property absent on CONNECT) the same as 0 so a
+	// client can't sneak an extension by simply omitting the property.
 	if c.protocol == mqttwire.ProtocolMQTT5 && pk.Properties.SessionExpiryIntervalFlag {
 		v := pk.Properties.SessionExpiryInterval
-		invalidIncrease := c.sessionExpiry != nil && *c.sessionExpiry == 0 && v != 0
+		current := uint32(0)
+		if c.sessionExpiry != nil {
+			current = *c.sessionExpiry
+		}
+		invalidIncrease := current == 0 && v != 0
 		if !invalidIncrease {
 			c.sessionExpiry = &v
 		}
@@ -923,6 +930,15 @@ func (c *Conn) handleUnsubscribe(ctx context.Context, pk *packets.Packet) error 
 	defer tx.Rollback(ctx)
 	codes := make([]byte, 0, len(pk.Filters))
 	for _, f := range pk.Filters {
+		// [MQTT-3.10.3-1]: malformed topic filter on UNSUBSCRIBE returns
+		// reason 0x8F (Topic Filter invalid). Previously we'd run a
+		// DELETE that couldn't possibly match and reported 0x11 (No
+		// subscription existed), which is the wrong code for a wire-
+		// level violation.
+		if err := mqttwire.ValidateTopicFilter(f.Filter); err != nil {
+			codes = append(codes, 0x8F)
+			continue
+		}
 		ct, err := tx.Exec(ctx,
 			`DELETE FROM subscriptions WHERE client_id=$1 AND topic_filter=$2`,
 			c.clientID, f.Filter)

@@ -26,6 +26,19 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	if err := mqttwire.ValidateTopicName(pk.TopicName); err != nil {
 		return err
 	}
+	// [MQTT-4.7.2-1]: clients MUST NOT publish to Topic Names beginning
+	// with "$". $SYS, $share, etc. are reserved for server / extension
+	// use. Reject with DISCONNECT 0x87 (Not authorized) on v5; v3.1.1
+	// has no v5 reason field, so just close.
+	if len(pk.TopicName) > 0 && pk.TopicName[0] == '$' {
+		if c.protocol == mqttwire.ProtocolMQTT5 {
+			_ = c.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x87, // Not authorized
+			})
+		}
+		return fmt.Errorf("client publish to reserved topic prefix: %q", pk.TopicName)
+	}
 	// v5 inbound flow control: enforce serverReceiveMaximum on un-ACKed QoS>0
 	// inbound PUBLISHes. [MQTT-3.3.4-9]. The counter is decremented at the
 	// receive-side ACK boundary: PUBACK for QoS 1, PUBCOMP for QoS 2 (which

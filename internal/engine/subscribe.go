@@ -30,7 +30,27 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 
 	subID := 0
 	if c.protocol == mqttwire.ProtocolMQTT5 && len(pk.Properties.SubscriptionIdentifier) > 0 {
-		subID = pk.Properties.SubscriptionIdentifier[0]
+		// [MQTT-3.8.2.1.2 / Reason Code 0x91]: a SUBSCRIBE Properties may
+		// carry at most one SubscriptionIdentifier, range 1..268435455.
+		// Multiple, zero, or out-of-range values are a Protocol Error
+		// → DISCONNECT 0x82. Previously we silently took [0] and ignored
+		// the rest, which gave non-conforming clients undefined dispatch.
+		if len(pk.Properties.SubscriptionIdentifier) > 1 {
+			_ = c.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x82, // Protocol Error
+			})
+			return errors.New("subscribe: multiple SubscriptionIdentifier")
+		}
+		v := pk.Properties.SubscriptionIdentifier[0]
+		if v <= 0 || v > 268435455 {
+			_ = c.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x82, // Protocol Error
+			})
+			return errors.New("subscribe: SubscriptionIdentifier out of range")
+		}
+		subID = v
 	}
 
 	codes := make([]byte, 0, len(pk.Filters))

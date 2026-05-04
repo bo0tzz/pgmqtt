@@ -48,15 +48,39 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 	c.protocol = pv
 
-	// Resolve client ID. Empty client id is allowed only if Clean=true and we
-	// generate one; v3.1.1 strict: zero-byte client id => session-resume false.
+	// Resolve client ID.
+	//
+	// v3.1.1 [MQTT-3.1.3-7]: empty client id is allowed only if Clean=1.
+	// v5    [MQTT-3.1.3-6]:  empty client id requires CleanStart=1 AND
+	//                       SessionExpiryInterval == 0 (or absent).
+	//                       The server then assigns one and reflects it
+	//                       back via AssignedClientIdentifier.
 	clientID := pk.Connect.ClientIdentifier
 	if clientID == "" {
-		if !pk.Connect.Clean {
-			_ = c.writeConnackReject(pv, cackClientIDInvalid)
-			return fmt.Errorf("empty client id with clean=false")
+		switch pv {
+		case mqttwire.ProtocolMQTT5:
+			seNonZero := pk.Properties.SessionExpiryIntervalFlag &&
+				pk.Properties.SessionExpiryInterval != 0
+			if !pk.Connect.Clean || seNonZero {
+				_ = c.writeConnackReject(pv, cackClientIDInvalid)
+				return fmt.Errorf("empty client id with clean_start=%v session_expiry=%v",
+					pk.Connect.Clean, pk.Properties.SessionExpiryInterval)
+			}
+		default:
+			if !pk.Connect.Clean {
+				_ = c.writeConnackReject(pv, cackClientIDInvalid)
+				return fmt.Errorf("empty client id with clean=false")
+			}
 		}
 		clientID = "auto-" + uuid.NewString()
+	}
+	// Cap client_id length defensively. MQTT-5 allows arbitrary UTF-8
+	// length, but storing absurd lengths bloats sessions/subscriptions
+	// indexes and would push pg_notify payloads (which carry the
+	// client_id for takeover/quota signals) past the 8 KB hard limit.
+	if len(clientID) > 256 {
+		_ = c.writeConnackReject(pv, cackClientIDInvalid)
+		return fmt.Errorf("client id too long: %d bytes", len(clientID))
 	}
 	c.clientID = clientID
 	c.cleanStart = pk.Connect.Clean
@@ -143,7 +167,16 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	if c.receiveMaximum == 0 {
 		c.receiveMaximum = 65535 // [MQTT-3.1.2-26] default
 	}
-	c.inflight = make(chan struct{}, c.receiveMaximum)
+	// Honor the client's ReceiveMaximum but never allocate more than
+	// `maxConcurrentInflight` slots — even at the spec default of 65535
+	// per v5 Conn, this is purely server-side memory and a runaway
+	// outbound queue is a bigger risk than capping a client's
+	// theoretical inflight ceiling.
+	inflightCap := int(c.receiveMaximum)
+	if inflightCap > maxConcurrentInflight {
+		inflightCap = maxConcurrentInflight
+	}
+	c.inflight = make(chan struct{}, inflightCap)
 	c.drainKick = make(chan struct{}, 1)
 
 	// Lift the codec's pre-CONNECT 1 MiB inbound size cap to the configured
@@ -249,6 +282,13 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		}
 		cack.Properties.ReceiveMaximum = c.eng.serverReceiveMaximum()
 		cack.Properties.TopicAliasMaximum = c.eng.serverTopicAliasMaximum()
+		// Advertise our inbound MaximumPacketSize so well-behaved
+		// clients don't blast a 50 MiB PUBLISH and then get a surprise
+		// DISCONNECT 0x95. Spec default if absent is 256 MiB; we cap
+		// well below that. Skip advertising when policy is "no cap".
+		if cap := c.eng.maxPacketSize(); cap > 0 {
+			cack.Properties.MaximumPacketSize = uint32(cap)
+		}
 	}
 	if err := c.write(cack); err != nil {
 		return err
@@ -274,12 +314,21 @@ func (c *Conn) writeConnackReject(pv byte, reason byte) error {
 	if c.eng.metrics != nil {
 		c.eng.metrics.AuthFailuresTotal.WithLabelValues(authReasonLabel(reason)).Inc()
 	}
+	// Per [MQTT-3.1.4-5], when the protocol version is unsupported or
+	// otherwise unknown, send a v3.1.1-shaped CONNACK with reason 0x01.
+	// Echoing back the client's raw `pv` byte (which could be 0xFF or any
+	// garbage) would produce a malformed wire CONNACK from the client's
+	// point of view, so coerce to a valid version for the encoder.
+	wirePV := pv
+	if wirePV != mqttwire.ProtocolMQTT311 && wirePV != mqttwire.ProtocolMQTT5 {
+		wirePV = mqttwire.ProtocolMQTT311
+	}
 	pk := &packets.Packet{
 		FixedHeader:     packets.FixedHeader{Type: packets.Connack},
-		ProtocolVersion: pv,
+		ProtocolVersion: wirePV,
 		ReasonCode:      reason,
 	}
-	if pv != mqttwire.ProtocolMQTT5 {
+	if wirePV != mqttwire.ProtocolMQTT5 {
 		// v3.1.1 has its own CONNACK return-code enum; map a few.
 		switch reason {
 		case cackBadCredentials:
@@ -294,7 +343,7 @@ func (c *Conn) writeConnackReject(pv byte, reason byte) error {
 			pk.ReasonCode = 0x03
 		}
 	}
-	c.protocol = pv
+	c.protocol = wirePV
 	return c.write(pk)
 }
 
