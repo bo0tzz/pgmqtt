@@ -187,7 +187,10 @@ func TestWillDelayCancelledByReconnectBeforeFire(t *testing.T) {
 		p.Connect.WillTopic = "lwt/cancel"
 		p.Connect.WillPayload = []byte("would-fire-without-cancel")
 		p.Connect.WillQos = 1
-		p.Properties.WillDelayInterval = 30
+		// WillDelayInterval is a *Will property*, separate from CONNECT
+		// properties. mochi keeps them on Connect.WillProperties; setting
+		// p.Properties.WillDelayInterval is silently ignored.
+		p.Connect.WillProperties.WillDelayInterval = 30
 		// SessionExpiry must exceed WillDelay or the latter is clamped
 		// to zero per MQTT-3.1.3-9 (we min(delay, expiry)).
 		p.Properties.SessionExpiryInterval = 60
