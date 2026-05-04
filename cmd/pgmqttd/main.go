@@ -115,6 +115,7 @@ func main() {
 		logger.Error("listener", "err", err)
 		os.Exit(1)
 	}
+	lst.SetMetrics(mtx)
 	defer lst.Stop()
 	eng.SetBrokerID(lst.BrokerID())
 	// Publish-side pg_notify is emitted inside publishCore's tx for atomic
