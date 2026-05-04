@@ -1,0 +1,116 @@
+name: soak-weekly
+
+# Tier-3 soak: in-cluster traffic generator + multi-broker paho conformance.
+# Mondays 04:00 UTC. The packet-cap=1-byte regression that escaped prior to
+# 0010 would have been caught here — multi-pod fanout hammered with sustained
+# QoS-1 publishes, parsed for loss/dups in the JSON output.
+
+on:
+  schedule:
+    # Mondays 04:00 UTC: weekly is enough for a soak (each run is ~10–15m
+    # of cluster time + image build + helm install). Tier-2 nightly already
+    # covers protocol drift; this catches deploy-shape + sustained-load bugs.
+    - cron: '0 4 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  soak-incluster:
+    name: soak (kind + helm + in-cluster pod)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: pgmqtt-soak
+          # Single-node is fine: we test cross-pod fanout via 3 broker
+          # replicas, all on this one node.
+          wait: 60s
+
+      - name: install postgres
+        run: |
+          kubectl create namespace mqtt
+          kubectl -n mqtt apply -f .github/ci/postgres.yaml
+          kubectl -n mqtt rollout status statefulset/postgres --timeout=180s
+
+      - name: build broker image into kind
+        run: |
+          docker build -t pgmqtt:soak .
+          kind load docker-image pgmqtt:soak --name pgmqtt-soak
+
+      - name: helm install (3 replicas, allowAnonymous)
+        run: |
+          helm install pgmqtt deploy/helm/pgmqtt \
+            --namespace mqtt \
+            --set image.repository=pgmqtt \
+            --set image.tag=soak \
+            --set image.pullPolicy=IfNotPresent \
+            --set replicaCount=3 \
+            --set auth.allowAnonymous=true \
+            --set limits.maxQueuedDeliveriesPerClient=0 \
+            --set limits.maxConnections=0 \
+            --set limits.maxInboundMsgsPerSec=0 \
+            --set operator.bcryptCost=4 \
+            --set database.url='postgres://pgmqtt:pgmqtt@postgres.mqtt.svc:5432/pgmqtt?sslmode=disable'
+          kubectl -n mqtt rollout status deployment/pgmqtt --timeout=180s
+
+      - name: in-cluster soak (60s × 1000 msg/s × QoS 1)
+        # The script builds + side-loads the pgmqtt-soak image, runs the
+        # Pod, follows logs, and exits non-zero on lost/dups for QoS≥1.
+        # This is the bug-class the kubectl port-forward path mis-reported.
+        run: |
+          bash scripts/soak-incluster.sh \
+            --cluster pgmqtt-soak \
+            --namespace mqtt \
+            --duration 60s \
+            --rate 1000 \
+            --pubs 3 --subs 3 \
+            --inflight 25 \
+            --qos 1
+
+      - name: tier3 multi-broker paho (optional)
+        # The existing tier3 helper spins its own kind cluster (it predates
+        # this workflow). We run it after the soak so a soak failure surfaces
+        # quickly even if paho would also flake. Best-effort: a paho run
+        # red here is informational, the soak verdict is the gate.
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 -m pip install paho-mqtt
+          git clone --depth 1 https://github.com/eclipse/paho.mqtt.testing /tmp/paho
+          bash scripts/paho-multi-broker.sh --paho /tmp/paho --version both
+
+      - name: collect cluster diagnostics on failure
+        if: failure()
+        run: |
+          echo '=== pods ==='
+          kubectl -n mqtt get pods -o wide || true
+          echo '=== pgmqtt logs ==='
+          kubectl -n mqtt logs -l app.kubernetes.io/name=pgmqtt --tail=500 || true
+          echo '=== events ==='
+          kubectl -n mqtt get events --sort-by=.lastTimestamp | tail -50 || true
+
+      - name: upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}
+          path: |
+            /tmp/soak-incluster-*.json
+            /tmp/soak-incluster-*.log
+            /tmp/paho-multi-results.txt
+          if-no-files-found: warn
+          retention-days: 30
