@@ -54,20 +54,29 @@ spec:
                 username:
                   description: |
                     MQTT username. Defaults to `metadata.name` when empty.
+                    Restricted to `[A-Za-z0-9._-]{1,128}` so a malformed
+                    name can't bloat broker storage or push the
+                    pg_notify takeover/quota payloads (which carry the
+                    username) past Postgres' 8 KB per-NOTIFY hard limit.
                   type: string
+                  maxLength: 128
+                  pattern: "^[A-Za-z0-9._-]+$"
                 passwordSecretRef:
                   description: |
                     References an existing Secret holding the password.
                     Omit to have the reconciler generate a credentials Secret
                     named `<metadata.name>-mqtt-credentials` containing
                     `username`, `password`, `host`, `port`, `ws-port`,
-                    `uri`, and `ws-uri`.
+                    `uri`, and `ws-uri` (plus `tls-host`/`tls-port`/
+                    `mqtts-uri` when the operator has a TLSHost configured).
                   type: object
                   properties:
                     name:
                       type: string
+                      maxLength: 253
                     key:
                       type: string
+                      maxLength: 253
                     optional:
                       type: boolean
                   required:

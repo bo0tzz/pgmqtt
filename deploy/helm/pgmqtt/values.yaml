@@ -101,6 +101,13 @@ serviceMonitor:
   interval: 30s
   ## Optional path; default /metrics matches the broker's exposed handler.
   path: /metrics
+  ## Extra labels merged into ServiceMonitor.metadata.labels. Many
+  ## prometheus-operator installs select on a release-specific label
+  ## (e.g. `release: prometheus`). Set this to whatever your install
+  ## requires; without it the SM renders but never gets scraped.
+  ##   labels:
+  ##     release: prometheus
+  labels: {}
 
 metrics:
   enabled: true

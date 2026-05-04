@@ -25,6 +25,16 @@
         }
       }
     },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string" },
+        "path": { "type": "string" },
+        "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
     "database": {
       "type": "object",
       "additionalProperties": false,
@@ -109,15 +119,6 @@
           "type": "array",
           "items": { "type": "string" }
         }
-      }
-    },
-    "serviceMonitor": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": { "type": "boolean" },
-        "interval": { "type": "string" },
-        "path": { "type": "string" }
       }
     },
     "metrics": {

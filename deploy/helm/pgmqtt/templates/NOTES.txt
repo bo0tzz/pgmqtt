@@ -1,0 +1,69 @@
+{{- /*
+NOTES.txt — printed after `helm install`/`helm upgrade`. Operators read
+this; keep it about the things they actually need to act on.
+*/ -}}
+pgmqtt {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+
+Reach the broker:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pgmqtt.fullname" . }} 1883:{{ .Values.listeners.tcp.port }}
+  mosquitto_sub -h 127.0.0.1 -t test -u <user> -P <pass> -d
+
+Create an MQTT user (the broker reads from Postgres via the operator):
+  cat <<EOF | kubectl apply -f -
+  apiVersion: pgmqtt.io/v1alpha1
+  kind: User
+  metadata:
+    name: ha
+    namespace: {{ .Release.Namespace }}
+  EOF
+  # The reconciler creates a Secret <name>-mqtt-credentials with
+  # username/password/host/port/uri keys. Wire it into your app.
+
+{{- if not .Values.networkPolicy.enabled }}
+
+⚠  NetworkPolicy is OFF.
+   The chart's ClusterRole grants the broker SA read access to Secrets
+   cluster-wide (so the operator can resolve passwordSecretRef across
+   namespaces). With no NetworkPolicy, an RCE on the broker pod would
+   expose every Secret in the cluster.
+
+   For homelab/production: enable networkPolicy with `egress.postgres`
+   pinned to your CNPG/postgres-operator selector and review
+   docs/SECURITY.md before exposing the broker outside its VLAN.
+{{- end }}
+
+{{- if and (not .Values.database.url) (not .Values.database.existingSecret) }}
+
+⚠  database.url AND database.existingSecret are both empty.
+   The broker won't start. Set one of:
+     --set database.url='postgres://USER:PASS@HOST/DB'
+     --set database.existingSecret=<name-of-secret-with-url-key>
+{{- end }}
+
+{{- if and .Values.serviceMonitor.enabled (not .Values.serviceMonitor.labels) }}
+
+ℹ  serviceMonitor.enabled=true but serviceMonitor.labels is empty.
+   Many prometheus-operator installs filter ServiceMonitors by a
+   release label (e.g. `release: prometheus`). If your scrape never
+   appears, set:
+     --set serviceMonitor.labels.release=prometheus
+{{- end }}
+
+{{- if and .Values.tests.enabled (not .Values.tests.credentialsSecret) }}
+
+ℹ  helm test will spin up a mosquitto Pod that needs MQTT credentials.
+   Apply a User CR named e.g. `smoketest` (which auto-creates
+   `smoketest-mqtt-credentials`) BEFORE running `helm test`.
+{{- end }}
+
+{{- if and .Values.autoscaling.enabled (le (int .Values.replicaCount) 1) }}
+
+ℹ  autoscaling is enabled but replicaCount={{ .Values.replicaCount }}.
+   The HPA will adjust replicas, but Helm continues to template the
+   manifest with the static replicaCount; subsequent `helm upgrade`
+   may fight the HPA. Either drop replicaCount: 1 to a comment, or
+   configure the HPA's minReplicas to match.
+{{- end }}
+
+For ops runbooks see docs/OPS.md, sizing matrix in values.yaml comment
+above `resources:`, and TLS termination patterns in docs/TLS.md.
