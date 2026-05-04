@@ -14,8 +14,6 @@ Tests in code (run `go test ./... -count=1`):
 - [x] will suppressed on graceful disconnect
 - [x] cross-Pod fanout (`internal/listener/listener_test.go`)
 - [x] takeover closes the prior Pod's socket
-- [x] leader election: only one acquires; second promotes on first's stop
-  (`internal/leader/leader_test.go`)
 - [x] janitor fires will from a dead-broker session
 - [x] janitor sweeps orphan messages older than the grace
 - [x] reconciler — auto-generated Secret + bcrypt-upsert

@@ -14,8 +14,10 @@ safe — no Raft, no gossip, no embedded KV, no in-memory routing tables.
    pgmqttd pgmqttd pgmqttd               │    │    │   │ NOTIFY pgmqtt_<uuid>
        │     │     │                     │    │    │   │ NOTIFY pgmqtt_takeover_<uuid>
        └─────┴─────┴── pgxpool queries ──┘    │    │   ▼
-                                               └────┴── LISTEN +
-                                                        advisory-lock holder
+                                               └────┴── LISTEN holder
+                                                        (per-Pod broker UUID
+                                                         + advisory lock for
+                                                         dead-Pod liveness)
 ```
 
 ## Why?
@@ -30,16 +32,24 @@ Postgres you almost certainly already run.
 - **Stateless Pods.** Each `pgmqttd` Pod holds only TCP sockets, a per-Pod
   client_id→\*Conn map, a `pgxpool`, and one dedicated `*pgx.Conn` for
   `LISTEN` + `pg_advisory_lock`. Restart any Pod; clients reconnect.
-- **No bespoke clustering.** Postgres is the source of truth. Liveness
-  checking is "did the advisory lock release?". Cross-Pod fan-out is
-  `pg_notify`. Leader-elected work uses `pg_advisory_lock(42)`.
+- **No bespoke clustering.** Postgres is the source of truth. Per-Pod
+  liveness checking is "did the broker's advisory lock release?".
+  Cross-Pod fan-out is `pg_notify`. There is no singleton leader: the
+  janitor runs on every Pod and its sweeps are concurrency-safe by
+  construction (per-row locks, `SKIP LOCKED` claims, idempotent DELETEs,
+  per-resource `pg_try_advisory_lock`). The User-CR reconciler uses
+  controller-runtime's K8s Lease (`coordination.k8s.io/leases`) so
+  exactly one Pod reconciles at a time, with handoff handled inside
+  controller-runtime.
 - **MQTT 3.1.1 and 5.0** in the same daemon. The codec
   ([`mochi-mqtt/server/v2/packets`](https://pkg.go.dev/github.com/mochi-mqtt/server/v2/packets))
   covers both; we use only the codec subpackage, not the in-memory broker.
 - **CRD-driven users.** The only way to provision a user is a
-  `pgmqtt.io/v1alpha1.User` CR. The leader Pod runs an in-process
-  controller-runtime reconciler that materializes them into the `users`
-  table and (optionally) generates a credentials Secret per cnpg style.
+  `pgmqtt.io/v1alpha1.User` CR. Every Pod boots an in-process
+  controller-runtime manager; controller-runtime's K8s Lease elects
+  exactly one as the active reconciler, which materializes Users into
+  the `users` table and (optionally) generates a credentials Secret
+  per cnpg style.
 - **TLS lives outside.** Front pgmqtt with an L4 TLS terminator (Nginx
   `stream`, HAProxy TCP, ingress-nginx `tcp-services`) for `mqtts://1883` and
   any HTTPS proxy for `wss://8083/mqtt`.
@@ -51,8 +61,9 @@ verification checklist in [docs/VERIFY.md](docs/VERIFY.md).
 
 Operational docs:
 
-- [`docs/OPS.md`](docs/OPS.md) — runbook (leader-stuck, zombie ownership,
-  pool exhaustion, schema-migration safety, DB failover).
+- [`docs/OPS.md`](docs/OPS.md) — runbook (janitor / reconciler stalls,
+  zombie ownership, pool exhaustion, schema-migration safety, DB
+  failover).
 - [`docs/SIZING.md`](docs/SIZING.md) — Pod resources per N conns,
   `max_connections` per traffic level, when to consider ltree.
 - [`docs/SECURITY.md`](docs/SECURITY.md) — trust boundaries, what the

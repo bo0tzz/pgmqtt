@@ -22,9 +22,19 @@ import (
 )
 
 func main() {
+	// Parse PGMQTT_LOG_LEVEL via slog.Level.UnmarshalText so any level
+	// slog recognises (DEBUG / INFO / WARN / ERROR, case-insensitive)
+	// is honoured — previously only "debug" was special-cased and
+	// warn/error were silently mapped to info. Unset → info; an
+	// unparseable value falls back to info with a warning logged after
+	// the handler is up.
 	level := slog.LevelInfo
-	if os.Getenv("PGMQTT_LOG_LEVEL") == "debug" {
-		level = slog.LevelDebug
+	var levelParseErr error
+	if raw := os.Getenv("PGMQTT_LOG_LEVEL"); raw != "" {
+		if err := level.UnmarshalText([]byte(raw)); err != nil {
+			level = slog.LevelInfo
+			levelParseErr = err
+		}
 	}
 	// Pick the handler from PGMQTT_LOG_FORMAT (text|json). Read directly here
 	// — config.FromEnv runs after this point, but we want the same handler
@@ -41,6 +51,10 @@ func main() {
 	}
 	logger := slog.New(handler)
 	slog.SetDefault(logger)
+	if levelParseErr != nil {
+		logger.Warn("PGMQTT_LOG_LEVEL parse failed; falling back to info",
+			"value", os.Getenv("PGMQTT_LOG_LEVEL"), "err", levelParseErr)
+	}
 
 	cfg, err := config.FromEnv()
 	if err != nil {

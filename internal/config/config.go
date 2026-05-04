@@ -72,9 +72,9 @@ type Config struct {
 	// catch-up, lock storm) would otherwise hang publisher dispatch
 	// indefinitely — keepalive only re-arms between dispatch iterations,
 	// so a stuck COMMIT bypasses it. 0 disables the timeout (matches PG
-	// default). The dedicated listener and leader connections take the
-	// same setting; LISTEN itself is instant, so WaitForNotification is
-	// unaffected.
+	// default). The dedicated listener connection does not currently
+	// take this setting; LISTEN's WaitForNotification has no statement
+	// to time out anyway.
 	PGStatementTimeout time.Duration
 
 	// LogFormat selects the slog handler emitted on stderr. "text" (default)

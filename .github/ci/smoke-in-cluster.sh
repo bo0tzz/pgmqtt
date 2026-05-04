@@ -4,7 +4,7 @@ set -euo pipefail
 
 NS=mqtt
 
-# Apply a User; the leader Pod's reconciler mints a credentials Secret.
+# Apply a User; the elected reconciler Pod mints a credentials Secret.
 cat <<'EOF' | kubectl -n "$NS" apply -f -
 apiVersion: pgmqtt.io/v1alpha1
 kind: User

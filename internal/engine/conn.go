@@ -736,7 +736,7 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	// When we just fired the will, also NULL the will_* columns. Otherwise
 	// the row still has will_topic/will_payload set with the (about-to-be)
 	// stale broker_id; if this pod later dies before something else clears
-	// them, the leader's dead-broker scan would fire the same will a
+	// them, the janitor's dead-broker scan would fire the same will a
 	// second time. Clearing them here closes that window down to "between
 	// fireWill's commit and this UPDATE's commit" — eliminating it
 	// entirely would require an atomic publish+update tx, which the

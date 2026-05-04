@@ -30,7 +30,7 @@ spec:
         status: {}
       schema:
         openAPIV3Schema:
-          description: User configures an MQTT user account managed by pgmqttd. Exactly one Pod (the leader) reconciles each User into a row in the broker's Postgres `users` table.
+          description: User configures an MQTT user account managed by pgmqttd. controller-runtime's K8s Lease elects exactly one reconciler at a time across Pods; the elected Pod materialises each User into a row in the broker's Postgres `users` table.
           type: object
           properties:
             apiVersion:

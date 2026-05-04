@@ -54,6 +54,13 @@ instrumented. Cross-check against `process_cpu_seconds_total` and
 
 ## A measured baseline
 
+> **Postgres version note:** the numbers in this section were captured
+> against `postgres:16-alpine`. The repo's default has since bumped to
+> `postgres:18-alpine` (commit `f91c4df`); a re-measurement on PG18 is
+> pending. Until that lands, treat the figures here as
+> PG16-historical — directionally still useful for reading the
+> histograms, but the absolute means may shift on PG18.
+
 To avoid the "is my cluster broken or is this normal?" question, here's
 one calibrated point — an instrumented kind cluster running on a single
 Linux x86_64 host with NVMe storage. **Numbers below are from this

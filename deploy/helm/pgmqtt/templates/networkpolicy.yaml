@@ -67,7 +67,9 @@ spec:
           port: {{ $.Values.networkPolicy.egress.postgresPort }}
     {{- end }}
     {{- with .Values.networkPolicy.egress.kubernetesAPI }}
-    # Kubernetes API — required for the leader's User-CRD reconciler.
+    # Kubernetes API — required for the User-CRD reconciler (every Pod
+    # runs a controller-runtime manager; one wins the K8s Lease and
+    # reconciles, all need API access for the Lease + watch).
     - to:
         {{- toYaml . | nindent 8 }}
       ports:
