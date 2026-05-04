@@ -7,6 +7,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Production-readiness review (2026-05-05)
+
+A multi-agent review covering concurrency, SQL/migrations, MQTT 5
+spec, performance, security, K8s/Helm, chaos modes, and test gaps.
+Findings landed as small focused commits; the largest categories:
+
+#### MQTT 5 spec corrections (4 CRITICAL + 6 HIGH)
+
+- **Keepalive read-deadline is 1.5× keepalive (was: keepalive+1500ms).**
+  `internal/engine/conn.go::armReadDeadline`. The previous additive
+  grace meant a Paho client with the default 60 s keepalive was torn
+  down at 61.5 s instead of 90 s — so HA + Z2M (both Paho) saw spurious
+  disconnect/reconnect churn on healthy connections. Renamed
+  `Engine.KeepAliveGrace time.Duration` → `KeepAliveMultiplier float64`
+  (default 1.5). Regression test:
+  `TestKeepAliveDeadlineUses1Point5xMultiplier`.
+- **PUBREC negative-reason now ends the QoS-2 handshake.** Previously
+  we sent PUBREL regardless of reason code; spec [MQTT-4.3.3] says
+  reason ≥0x80 means "treat as completed, do NOT send PUBREL".
+- **PUBREL for unknown packet id returns PUBCOMP 0x92** on v5. Was
+  silent PUBCOMP success.
+- **Shared subscriptions ($share/...) rejected with SUBACK 0x9E.**
+  CONNACK advertises SharedSubAvailable=0; spec then mandates 0x9E
+  rather than silently subscribing to the underlying filter.
+- **CONNACK now advertises MaximumPacketSize** when policy is set.
+- **Inflight semaphore capped at maxConcurrentInflight=1024** —
+  previously a v5 client that didn't send ReceiveMaximum got a
+  65535-slot channel.
+- **DISCONNECT extending SE-from-0** check treats absent
+  SessionExpiryInterval as 0 (was: only explicit 0).
+- **Multiple/zero-out-of-range SubscriptionIdentifier** → DISCONNECT
+  0x82 (Protocol Error). Was: silently took [0].
+- **UNSUBSCRIBE invalid topic filter** returns reason 0x8F (Topic
+  Filter invalid). Was: 0x11 (No subscription existed).
+- **writeConnackReject** coerces unknown protocol versions to v3.1.1
+  on the wire so a 0xFF garbage client `pv` doesn't produce a
+  malformed CONNACK.
+- **v5 empty client_id** allowed when CleanStart=1 AND
+  SessionExpiryInterval=0 (per [MQTT-3.1.3-6]); was: rejected
+  unconditionally with Clean=0.
+
+#### Concurrency / chaos hardening
+
+- **Stale takeover NOTIFY can no longer kill a freshly-reconnected
+  Conn.** Listener notifies now carry the pre-rotation
+  session_token in addition to the client_id; the receiver only
+  shuts down the local Conn when its stored token matches. Test:
+  `TestStaleTakeoverNotifyDoesNotKillFreshConn`.
+- **WillDelayInterval respected on dead-broker scan.** janitor's
+  `handleDeadBroker` previously fired ALL wills for the dead broker
+  immediately, ignoring will_delay; for v5 clients with delay=30s a
+  Z2M restart surfaced as instant "device went offline" on HA. Now
+  delayed wills are scheduled via will_fire_at and fireDueWills
+  publishes them at the right time. Test:
+  `TestJanitorWillDelayRespectedAcrossDeadBroker`.
+- **Publish path bounded by 5 s timeout + DISCONNECT 0x88 on PG
+  errors.** Wedged Postgres now classifies a v5 reason instead of
+  hanging the conn until TCP keepalive kills it minutes later.
+- **Drain goroutine registered on engine WaitGroup** — shutdown no
+  longer races pool.Close() against an in-flight drain query.
+- **Inbound flow-control slot no longer leaks** on QoS-2 duplicate
+  PUBLISH or generic publishCore errors. After enough retransmits a
+  healthy client previously got DISCONNECT 0x93.
+
+#### Security
+
+- **Username-enumeration timing oracle fixed.** auth.go's no-rows
+  path runs a fixed-cost dummy bcrypt comparison so it takes the
+  same wall-clock as the wrong-password path. CWE-208.
+- **WS frame size capped at MaxPacketSize+64** via `ws.SetReadLimit`
+  immediately after Upgrade.
+- **client_id capped at 256 bytes** on CONNECT — defensive: bloats
+  storage AND would push pg_notify takeover/quota payloads (which
+  carry the client_id) past Postgres' 8 KB hard limit.
+- **User CR Status messages scrubbed.** Operator's reconciler used
+  to reflect raw pgx text, leaking schema names and
+  connection-string fragments. New `scrubReason` classifies
+  errors and only the classification reaches Conditions[].Message.
+- **User CRD validation tightened.** username pattern
+  `^[A-Za-z0-9._-]+$` with maxLength=128;
+  passwordSecretRef.name/.key with maxLength=253.
+
+#### Observability
+
+- **`/healthz/live` and `/healthz/ready` HTTP endpoints** on the
+  metrics port. Readiness pings `pool.Ping(ctx)` with 1.5 s timeout
+  so a wedged Postgres flips the Pod out of the Service instead of
+  silently failing every CONNECT on a still-up TCP listener.
+  Liveness is process-alive only.
+- **Helm probes migrated to httpGet** when metrics is enabled.
+  startupProbe (TCP, 30×5 s = 150 s) gives migrations + listener
+  bind room before liveness can fire.
+- **`pgmqtt_pg_notify_queue_usage_ratio`** gauge sampled every 10 s
+  by janitor's new `refresh_notify_queue` sub-job. PG's NOTIFY queue
+  is shared-memory and capped; full = every committing tx in the
+  cluster errors at COMMIT. Largest cause of "lights are slow
+  tonight" in multi-pod deploys, previously invisible until the
+  cliff. Alert above ~0.5.
+
+#### Helm chart
+
+- **Resource defaults: 256 MiB request / 1 GiB limit.** 512 MiB was
+  tight for the documented `limits.maxConnections=5000`; reconnect
+  storms could OOMKill before HPA reacted. Sizing matrix documented
+  inline.
+- **lifecycle.preStop** (default httpGet /healthz/live) so
+  kube-proxy has time to remove this Pod's endpoint from the Service
+  before the listener closes — eliminates the 1–3 s "connection
+  refused" window during rolling upgrades.
+- **PDB minAvailable rendered as 0 when replicaCount<=1** so
+  single-replica installs can be drained without `would violate PDB`.
+- **NetworkPolicy.egress.kubernetesAPI** defaults to allowing
+  443/6443 to `kube-system` + `default/component=apiserver` when
+  NP is enabled with the value left empty (operator otherwise
+  silently lost API access).
+- **`image.digest` knob** for digest-pinned deploys.
+- **`serviceMonitor.labels`** knob (e.g. `release: prometheus`).
+- **NOTES.txt** added with operator-time guidance on NetworkPolicy-
+  disabled blast radius, missing database config, ServiceMonitor
+  labels, helm-test User-CR pre-req, and HPA-vs-replicaCount.
+
+#### Operator
+
+- **TLS-aware User Secret.** When `TLSHost` is set, the
+  auto-generated Secret gains `tls-host`, `tls-port`, `mqtts-uri`
+  (and optionally `wss-port` / `wss-uri`) so consuming apps have an
+  opinionated path to the encrypted listener.
+
+#### Performance
+
+- **pgxpool MaxConnLifetimeJitter=5min** on top of the 30min
+  lifetime so a fleet's connections don't all expire at the same
+  instant.
+- **Properties JSON marshalled once.** propsToJSON previously
+  marshalled twice on every PUBLISH carrying any v5 property.
+- **expireSessions janitor** uses `FOR UPDATE SKIP LOCKED`.
+
+#### Schema
+
+- **0013_drop_dead_subscriptions_filter_idx.sql** — drops
+  `subscriptions_filter_idx`. No query in the codebase predicated on
+  topic_filter alone; the index paid INSERT/UPDATE cost on every
+  SUBSCRIBE for zero benefit.
+
+#### Tests
+
+- `FuzzValidateTopicName`, `FuzzValidateTopicFilter`,
+  `FuzzSharedSubscription` in `internal/mqtt/topic_fuzz_test.go`.
+  Topic validation is the largest unverified surface; the fuzzers
+  guard against panics, infinite loops, unbounded allocation. 2 s
+  surfaces ~35-40 new interesting inputs per fuzzer with no
+  failures.
+
 ### Security
 
 - **DB password no longer leaks into pod logs.** `pgxpool.ParseConfig` and
