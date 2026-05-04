@@ -120,6 +120,19 @@ type Metrics struct {
 	// maxConnections, refreshed each engine ownership-sweep tick.
 	// HPA-style scale-out signal.
 	ConnectionsCapacityRatio prometheus.Gauge
+
+	// ListenerRestartsTotal counts dedicated-listener-conn reconnect
+	// events, labelled by reason. Reasons:
+	//   wait_error        — WaitForNotification returned a non-EOF, non-
+	//                       net.ErrClosed error; the listener tore down
+	//                       its conn, slept with backoff, and re-acquired
+	//                       LISTEN + advisory-lock.
+	//   ctx_cancel        — parent context cancelled mid-loop (Stop()).
+	//                       Recorded only for completeness; not an error.
+	//   exhausted_retries — all reconnect attempts failed; the Pod is
+	//                       about to os.Exit(1) so the kubelet replaces
+	//                       it. Alert: any non-zero increment.
+	ListenerRestartsTotal *prometheus.CounterVec
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -246,6 +259,13 @@ func New() *Metrics {
 			Help: "Current accepted connections / maxConnections cap (per Pod). " +
 				"HPA scale-out signal; sustained > .8 calls for capacity bump or scale-out.",
 		}),
+		ListenerRestartsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_listener_restarts_total",
+			Help: "Dedicated-listener-connection reconnect events. " +
+				"Reasons: wait_error (NOTIFY wait returned non-EOF error; conn was rebuilt), " +
+				"ctx_cancel (parent context cancelled mid-loop), " +
+				"exhausted_retries (reconnect failed N times; Pod exiting for kubelet replacement).",
+		}, []string{"reason"}),
 	}
 
 	reg.MustRegister(
@@ -274,6 +294,7 @@ func New() *Metrics {
 		m.WillFireLatenessSeconds,
 		m.OutboundInflightSaturation,
 		m.ConnectionsCapacityRatio,
+		m.ListenerRestartsTotal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

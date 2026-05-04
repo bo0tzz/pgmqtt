@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
 const (
@@ -35,7 +37,22 @@ const (
 	tcpKeepaliveIdle     = 10 // seconds
 	tcpKeepaliveInterval = 5
 	tcpKeepaliveCount    = 3
+
+	// Reconnect backoff. On a non-EOF NOTIFY wait error we tear down the
+	// dedicated conn (which auto-releases the advisory lock), sleep, and
+	// re-acquire LISTEN + lock. Backoff doubles 1→2→4→8→16 s; the loop
+	// gives up after reconnectMaxAttempts and the Pod exits so kubelet
+	// replaces it (advisory lock + LISTEN registration are per-conn so
+	// the new Pod gets a clean state).
+	reconnectInitialBackoff = 1 * time.Second
+	reconnectMaxBackoff     = 16 * time.Second
+	reconnectMaxAttempts    = 5
 )
+
+// osExit is a package-level indirection over os.Exit so tests can replace
+// it without actually killing the test process. Production callers see the
+// stdlib behaviour.
+var osExit = os.Exit
 
 // Listener owns one dedicated Postgres connection used purely for the Pod's
 // LISTEN + advisory-lock identity. Stop it to release the lock and disconnect.
@@ -43,16 +60,47 @@ type Listener struct {
 	uuid      uuid.UUID
 	logger    *slog.Logger
 	eng       *engine.Engine
+	url       string
 	cancel    context.CancelFunc
 	doneCh    chan struct{}
 	closeOnce sync.Once
+	mu        sync.Mutex // guards conn — swapped on reconnect.
 	conn      *pgx.Conn
+	mtx       *metrics.Metrics
 }
+
+// SetMetrics installs a Metrics for listener counters. Call before Start
+// returns or shortly after; nil is tolerated by every observation site.
+func (l *Listener) SetMetrics(m *metrics.Metrics) { l.mtx = m }
 
 // Start opens a dedicated *pgx.Conn against url, takes the broker advisory
 // lock, registers LISTEN, and starts the dispatch goroutine. Returns once the
 // lock is held and the LISTEN is registered.
 func Start(parentCtx context.Context, url string, eng *engine.Engine, logger *slog.Logger) (*Listener, error) {
+	id := uuid.New()
+	conn, err := dialAndRegister(parentCtx, url, id)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(parentCtx)
+	l := &Listener{
+		uuid:   id,
+		logger: logger,
+		eng:    eng,
+		url:    url,
+		cancel: cancel,
+		doneCh: make(chan struct{}),
+		conn:   conn,
+	}
+	go l.run(ctx)
+	return l, nil
+}
+
+// dialAndRegister opens a fresh pgx conn, takes the per-broker advisory lock
+// (using the supplied id), and registers all three LISTEN channels. Caller
+// owns the returned conn's lifetime. Used by Start and by reconnect.
+func dialAndRegister(ctx context.Context, url string, id uuid.UUID) (*pgx.Conn, error) {
 	cfg, err := pgx.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", db.ScrubURLError(err, url))
@@ -67,41 +115,29 @@ func Start(parentCtx context.Context, url string, eng *engine.Engine, logger *sl
 	// Client-side TCP keepalives on the Go end of the socket as well.
 	cfg.DialFunc = keepalivedDialer
 
-	conn, err := pgx.ConnectConfig(parentCtx, cfg)
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", db.ScrubURLError(err, url))
 	}
 
-	id := uuid.New()
-	if err := acquireBrokerLock(parentCtx, conn, id); err != nil {
-		_ = conn.Close(parentCtx)
+	if err := acquireBrokerLock(ctx, conn, id); err != nil {
+		_ = conn.Close(ctx)
 		return nil, err
 	}
 
-	if _, err := conn.Exec(parentCtx, `LISTEN `+pubChannel(id)); err != nil {
-		_ = conn.Close(parentCtx)
+	if _, err := conn.Exec(ctx, `LISTEN `+pubChannel(id)); err != nil {
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("listen pub: %w", err)
 	}
-	if _, err := conn.Exec(parentCtx, `LISTEN `+takeoverChannel(id)); err != nil {
-		_ = conn.Close(parentCtx)
+	if _, err := conn.Exec(ctx, `LISTEN `+takeoverChannel(id)); err != nil {
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("listen takeover: %w", err)
 	}
-	if _, err := conn.Exec(parentCtx, `LISTEN `+quotaChannel(id)); err != nil {
-		_ = conn.Close(parentCtx)
+	if _, err := conn.Exec(ctx, `LISTEN `+quotaChannel(id)); err != nil {
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("listen quota: %w", err)
 	}
-
-	ctx, cancel := context.WithCancel(parentCtx)
-	l := &Listener{
-		uuid:   id,
-		logger: logger,
-		eng:    eng,
-		cancel: cancel,
-		doneCh: make(chan struct{}),
-		conn:   conn,
-	}
-	go l.run(ctx)
-	return l, nil
+	return conn, nil
 }
 
 // BrokerID returns the per-Pod UUID. Pass into engine.SetBrokerID.
@@ -116,7 +152,12 @@ func (l *Listener) Stop() {
 		// Use a fresh context so close still runs after parent cancellation.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = l.conn.Close(ctx)
+		l.mu.Lock()
+		conn := l.conn
+		l.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close(ctx)
+		}
 	})
 }
 
@@ -133,19 +174,89 @@ func (l *Listener) run(ctx context.Context) {
 	quotaCh := unquotedQuota(l.uuid)
 
 	for {
-		notif, err := l.conn.WaitForNotification(ctx)
+		l.mu.Lock()
+		conn := l.conn
+		l.mu.Unlock()
+		notif, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
+				if l.mtx != nil {
+					l.mtx.ListenerRestartsTotal.WithLabelValues("ctx_cancel").Inc()
+				}
 				return
 			}
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			l.logger.Warn("listener wait", "err", err)
-			return
+			// Non-EOF, non-cancellation wait error. Tear down the conn
+			// (releases the advisory lock as a side-effect) and try to
+			// reconnect with exponential backoff. If reconnect succeeds
+			// we resume the loop on the new conn; if all attempts fail
+			// we exit the process so the kubelet replaces this Pod.
+			l.logger.Warn("listener wait; reconnecting", "err", err)
+			if l.mtx != nil {
+				l.mtx.ListenerRestartsTotal.WithLabelValues("wait_error").Inc()
+			}
+			if !l.reconnect(ctx) {
+				if l.mtx != nil {
+					l.mtx.ListenerRestartsTotal.WithLabelValues("exhausted_retries").Inc()
+				}
+				l.logger.Error("listener reconnect exhausted; exiting for kubelet replacement",
+					"broker", l.uuid)
+				osExit(1)
+				return
+			}
+			continue
 		}
 		l.dispatchNotification(ctx, notif, pubCh, takeoverCh, quotaCh)
 	}
+}
+
+// reconnect tears down the current conn and tries to bring up a fresh one
+// (re-acquiring the broker advisory lock + LISTEN registrations). Returns
+// true if a new conn is in place. The per-broker UUID is preserved across
+// reconnect — the previous conn's death released the advisory lock so the
+// new conn's pg_advisory_lock attempt either succeeds (clean reacquire) or
+// blocks until any peer racing a takeover finishes.
+func (l *Listener) reconnect(ctx context.Context) bool {
+	// Tear down the dead conn so the advisory lock + listen registrations
+	// are released cleanly.
+	l.mu.Lock()
+	old := l.conn
+	l.conn = nil
+	l.mu.Unlock()
+	if old != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = old.Close(closeCtx)
+		cancel()
+	}
+
+	backoff := reconnectInitialBackoff
+	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
+		// Sleep first (so we don't hammer PG immediately on the same
+		// transient failure), respecting context cancellation.
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		newConn, err := dialAndRegister(ctx, l.url, l.uuid)
+		if err == nil {
+			l.mu.Lock()
+			l.conn = newConn
+			l.mu.Unlock()
+			l.logger.Info("listener reconnected", "broker", l.uuid, "attempt", attempt)
+			return true
+		}
+		l.logger.Warn("listener reconnect failed", "attempt", attempt, "err", err)
+		if backoff < reconnectMaxBackoff {
+			backoff *= 2
+			if backoff > reconnectMaxBackoff {
+				backoff = reconnectMaxBackoff
+			}
+		}
+	}
+	return false
 }
 
 // dispatchNotification handles a single NOTIFY. Wrapped in its own recover so

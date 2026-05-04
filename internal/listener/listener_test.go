@@ -2,15 +2,18 @@ package listener_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/mochi-mqtt/server/v2/packets"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
 func newPodLogger() *slog.Logger {
@@ -92,6 +95,132 @@ func TestSessionMigratesOnPodLoss(t *testing.T) {
 	pk := c2.Read(t, 3*time.Second)
 	if pk.FixedHeader.Type != packets.Publish || string(pk.Payload) != "alive" {
 		t.Fatalf("post-migration delivery failed: type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
+	}
+}
+
+// TestListenerReconnectsOnTransientError simulates a transient PG-side
+// failure by killing the listener's backend via pg_terminate_backend mid-
+// WaitForNotification, then asserts:
+//
+//   - the listener_restarts_total{reason="wait_error"} counter increments,
+//   - the listener resumes serving NOTIFYs (a publish on another conn
+//     reaches a subscriber pinned to the listener's pod).
+//
+// Catches the bug: pre-fix, the listener's run() loop returned on any
+// non-EOF wait error so subsequent cross-broker publishes silently
+// dropped without a metric or restart.
+func TestListenerReconnectsOnTransientError(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	mtxs := make([]*metrics.Metrics, len(mh.Pods))
+	for i, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		t.Cleanup(l.Stop)
+		mtxs[i] = metrics.New()
+		l.SetMetrics(mtxs[i])
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	// Subscriber lives on pod 0 — its delivery requires pod 0's listener
+	// to receive the cross-broker NOTIFY emitted by pod 1's publishCore.
+	sub := mh.Pods[0].Connect(t, "rcn-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "rcn/#", 1)
+
+	pub := mh.Pods[1].Connect(t, "rcn-pub")
+	defer pub.Close()
+
+	// Sanity: cross-broker publish works pre-disruption.
+	pub.Publish(t, "rcn/pre", []byte("pre"), 1, false)
+	pk := sub.Read(t, 3*time.Second)
+	if pk.FixedHeader.Type != packets.Publish || string(pk.Payload) != "pre" {
+		t.Fatalf("pre-kill: got type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
+	}
+
+	// Kill the listener backends. pg_listening_channels() only reports the
+	// *current* connection's channels so we can't filter per-pid by listen
+	// channel from a separate pool conn. The broad approach — terminate
+	// every backend with application_name='pgmqttd-listener' — is fine in
+	// the test rig: the other pod's listener will also reconnect (no-op
+	// for the assertion below, just slightly more disruption than needed).
+	if _, err := mh.Pool.Exec(context.Background(), `
+		SELECT pg_terminate_backend(pid)
+		  FROM pg_stat_activity
+		 WHERE application_name = 'pgmqttd-listener'
+		   AND pid <> pg_backend_pid()
+	`); err != nil {
+		t.Fatalf("pg_terminate_backend: %v", err)
+	}
+
+	// Wait for the listener to observe its conn dying and successfully
+	// reconnect. Reconnect-initial-backoff is 1 s so we give it generous
+	// headroom. Poll the metric.
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		var pb dto.Metric
+		if err := mtxs[0].ListenerRestartsTotal.WithLabelValues("wait_error").Write(&pb); err == nil {
+			if pb.GetCounter().GetValue() >= 1 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var pb dto.Metric
+	if err := mtxs[0].ListenerRestartsTotal.WithLabelValues("wait_error").Write(&pb); err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if got := pb.GetCounter().GetValue(); got < 1 {
+		t.Fatalf("listener_restarts_total{wait_error}: got %g, want >=1", got)
+	}
+
+	// Wait until the listener has actually re-registered LISTEN. The
+	// initial backoff is 1 s and dialAndRegister is a few ms, so 2 s is a
+	// safe upper bound. We poll pg_stat_activity for a fresh backend with
+	// our application_name; a successful reconnect appears as soon as
+	// pgx finishes the LISTEN sequence on the new conn.
+	deadline = time.Now().Add(8 * time.Second)
+	wantBackends := len(mh.Pods)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := mh.Pool.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			 WHERE application_name = 'pgmqttd-listener'
+			   AND state = 'idle'`).Scan(&n); err == nil && n >= wantBackends {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Post-reconnect: the cross-broker publish path must work again. Use a
+	// retry loop on the first publish to absorb the small window between
+	// "new backend visible in pg_stat_activity" and "PG NOTIFY routing
+	// table updated to include the new LISTEN registration". Each attempt
+	// publishes a fresh topic so a stuck deliver from a previous attempt
+	// can't accidentally satisfy the assertion.
+	pub2 := mh.Pods[1].Connect(t, "rcn-pub2")
+	defer pub2.Close()
+	const attempts = 10
+	gotPost := false
+	for i := 0; i < attempts; i++ {
+		topic := fmt.Sprintf("rcn/post/%d", i)
+		pub2.Publish(t, topic, []byte("post"), 1, false)
+		if err := sub.Conn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+			t.Fatalf("set deadline: %v", err)
+		}
+		next, err := sub.NextRaw()
+		_ = sub.Conn.SetReadDeadline(time.Time{})
+		if err == nil && next.FixedHeader.Type == packets.Publish && string(next.Payload) == "post" {
+			gotPost = true
+			break
+		}
+	}
+	if !gotPost {
+		t.Fatalf("post-reconnect publish never reached subscriber after %d attempts", attempts)
 	}
 }
 
