@@ -89,13 +89,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one more row before DISCONNECT 0x97. `OFFSET (p_max_queued - 1)
   LIMIT 1` restores the intended `>= cap` boundary.
   `engine_test.go::TestSlowSubscriberQuotaExceeded` catches this.
-- **Janitor tick frequency** lowered from 1s to 5s default
-  (`PGMQTT_JANITOR_INTERVAL_MS`, Helm `janitor.intervalMs`). The
-  prior 1s × 11 jobs × N pods generated ~33 PG queries/sec at idle
-  on a 3-replica cluster. The trade-off: will-fire / session-expire
-  / retained-expire latency rises by up to 4s — well within MQTT 5
-  spec tolerances. Lower for tighter precision, raise for less
-  churn at scale.
+- **Janitor tick interval is exposed via `PGMQTT_JANITOR_INTERVAL_MS`
+  and Helm `janitor.intervalMs`** (default still 1s). An earlier change
+  in this cycle bumped the default to 5s to reduce idle DB churn (the
+  prior 1s × 11 jobs × N pods generated ~33 PG queries/sec at idle on
+  a 3-replica cluster), but Paho v5 `test_will_delay` regressed by 4s:
+  the spec measures will-delay precision in seconds and the suite
+  asserts within 1s. Reverted the default to 1s; per-job stratification
+  (fire_due_wills @ 1s, cleanup jobs @ 5–30s) is the proper fix and is
+  tracked separately. Operators with low-traffic deployments can dial
+  the knob up themselves.
+- **Strict integer parsing for env vars + Helm `int` cast on numeric
+  values.** Before: `getenvInt` used `fmt.Sscanf("%d")` which
+  permissively parses just the leading integer prefix; combined with
+  Helm rendering large integers in Go's `%v` scientific notation
+  (`1.6777216e+07` for 16777216), `MAX_PACKET_SIZE` resolved to 1 byte
+  in production deploys, and the broker rejected every PUBLISH as
+  "packet too large". Soak surfaced the bug. Fix: `strconv.Atoi`
+  (strict) + `int` cast on every numeric value in
+  `deploy/helm/pgmqtt/templates/deployment.yaml` to force decimal-
+  integer rendering. Logged Warn now fires on un-parseable values.
 - **`PGMQTT_LOG_LEVEL` honors warn/error.** README advertised
   `debug|info|warn|error` but only `debug` was special-cased;
   the rest mapped to info. Now parses via `slog.Level.UnmarshalText`
