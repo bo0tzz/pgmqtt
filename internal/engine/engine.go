@@ -228,8 +228,26 @@ func (e *Engine) runOwnershipSweep(ctx context.Context) {
 			if err := e.sweepOrphanedSockets(ctx); err != nil {
 				e.logger.Warn("ownership sweep", "err", err)
 			}
+			e.updateCapacityGauge()
 		}
 	}
+}
+
+// updateCapacityGauge refreshes pgmqtt_connections_capacity_ratio. Cheap
+// enough to call from the ownership-sweep tick.
+func (e *Engine) updateCapacityGauge() {
+	if e.metrics == nil {
+		return
+	}
+	maxConns := e.maxConnsAtomic.Load()
+	if maxConns <= 0 {
+		// Cap is disabled (0 = unlimited). Report 0 so dashboards
+		// rendering this gauge don't divide by zero.
+		e.metrics.ConnectionsCapacityRatio.Set(0)
+		return
+	}
+	current := e.openConns.Load()
+	e.metrics.ConnectionsCapacityRatio.Set(float64(current) / float64(maxConns))
 }
 
 func (e *Engine) sweepOrphanedSockets(ctx context.Context) error {

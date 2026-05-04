@@ -94,6 +94,32 @@ type Metrics struct {
 	// distinguish "no retained existed" from "retained existed but
 	// failed to deliver."
 	RetainedDispatchFailedTotal prometheus.Counter
+
+	// DeliveryStageSeconds attributes time across the broker→subscriber
+	// fanout path. Stages:
+	//   total       — full Deliver() call duration (per NOTIFY)
+	//   scan        — the SELECT in Deliver() (matching deliveries lookup)
+	//   alloc       — per-row packet ID allocation + UPDATE
+	//   write       — per-row socket write (PUBLISH on the wire)
+	// The audit's outbound-side counterpart to PublishStageSeconds.
+	DeliveryStageSeconds *prometheus.HistogramVec
+
+	// WillFireLatenessSeconds — how late the janitor fired a delayed
+	// will, measured as (now - will_fire_at) at fire time. A bounded
+	// histogram so an operator can SLO "delayed wills fire within N s
+	// of scheduled."
+	WillFireLatenessSeconds prometheus.Histogram
+
+	// OutboundInflightSaturation — distribution of (in-flight slots in
+	// use) / (in-flight cap), sampled per-delivery. Slow-consumer
+	// detection: if this skews to 1.0, the subscriber is consistently
+	// at-or-above its ReceiveMaximum.
+	OutboundInflightSaturation prometheus.Histogram
+
+	// ConnectionsCapacityRatio — current accepted connections /
+	// maxConnections, refreshed each engine ownership-sweep tick.
+	// HPA-style scale-out signal.
+	ConnectionsCapacityRatio prometheus.Gauge
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -194,6 +220,32 @@ func New() *Metrics {
 			Name: "pgmqtt_retained_dispatch_failed_total",
 			Help: "Per-filter retained-message dispatch failures during SUBSCRIBE handling, post-SUBACK.",
 		}),
+		DeliveryStageSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "pgmqtt_delivery_seconds",
+			Help: "Time spent in each stage of the broker→subscriber fanout path. " +
+				"Stages: total (whole Deliver call), scan (SELECT), alloc (packet ID + UPDATE), write (socket write).",
+			Buckets: []float64{
+				.0001, .0002, .0005, .001, .002, .005,
+				.01, .02, .05, .1, .25, .5, 1, 2.5, 5,
+			},
+		}, []string{"stage"}),
+		WillFireLatenessSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "pgmqtt_will_fire_lateness_seconds",
+			Help: "How late the janitor fired a delayed will (now - will_fire_at). " +
+				"SLO: delayed wills should fire within ~1 s of their scheduled time at default tick interval.",
+			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300},
+		}),
+		OutboundInflightSaturation: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "pgmqtt_outbound_inflight_saturation",
+			Help: "Per-delivery sample of (in-flight slots in use) / (in-flight cap). " +
+				"Skews towards 1.0 = subscriber consistently at ReceiveMaximum (slow consumer).",
+			Buckets: []float64{.1, .25, .5, .75, .9, .95, .99, 1},
+		}),
+		ConnectionsCapacityRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_connections_capacity_ratio",
+			Help: "Current accepted connections / maxConnections cap (per Pod). " +
+				"HPA scale-out signal; sustained > .8 calls for capacity bump or scale-out.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -218,10 +270,23 @@ func New() *Metrics {
 		m.InboundQoS2Pending,
 		m.WillsNotifyFailedTotal,
 		m.RetainedDispatchFailedTotal,
+		m.DeliveryStageSeconds,
+		m.WillFireLatenessSeconds,
+		m.OutboundInflightSaturation,
+		m.ConnectionsCapacityRatio,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	return m
+}
+
+// ObserveDeliveryStage records a duration sample for one stage of the
+// broker→subscriber fanout path. Safe to call when m is nil.
+func (m *Metrics) ObserveDeliveryStage(stage string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.DeliveryStageSeconds.WithLabelValues(stage).Observe(d.Seconds())
 }
 
 // ObservePublishStage records a duration sample for one stage of the publish

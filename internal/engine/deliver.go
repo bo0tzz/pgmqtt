@@ -21,7 +21,12 @@ import (
 // non-null id — sufficient for v5 conformance since we already deduplicate
 // to one delivery per client.
 func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
+	totalStart := time.Now()
+	defer func() {
+		e.metrics.ObserveDeliveryStage("total", time.Since(totalStart))
+	}()
 	self := e.BrokerID()
+	scanStart := time.Now()
 	rows, err := e.pool.Query(ctx, `
 		SELECT d.id, d.client_id, d.qos, d.state, d.packet_id,
 		       m.topic, m.payload, m.properties, m.retain, m.expires_at,
@@ -50,6 +55,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		return err
 	}
 	defer rows.Close()
+	e.metrics.ObserveDeliveryStage("scan", time.Since(scanStart))
 
 	type item struct {
 		deliveryID         int64
@@ -190,6 +196,7 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 			// The state=0→1 UPDATE below remains the race-safe claim — if
 			// RowsAffected==0 someone else already claimed the delivery,
 			// so we release the slot and skip.
+			allocStart := time.Now()
 			allocated, err := conn.AllocPacketID(ctx)
 			if err != nil {
 				conn.returnInflight()
@@ -199,6 +206,7 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 				UPDATE deliveries SET packet_id=$1, state=1
 				 WHERE id=$2 AND state=0
 			`, int(allocated), deliveryID)
+			e.metrics.ObserveDeliveryStage("alloc", time.Since(allocStart))
 			if err != nil {
 				conn.returnInflight()
 				return false, err
@@ -212,7 +220,19 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		pk.PacketID = pid
 	}
 
-	if err := conn.write(pk); err != nil {
+	// Saturation sample at the slot we just acquired (or at delivery time
+	// for QoS-0 / resumed-inflight paths). For non-acquiring paths the
+	// length-vs-cap ratio still reflects backpressure shape.
+	if e.metrics != nil {
+		if c := cap(conn.inflight); c > 0 {
+			e.metrics.OutboundInflightSaturation.Observe(float64(len(conn.inflight)) / float64(c))
+		}
+	}
+
+	writeStart := time.Now()
+	err = conn.write(pk)
+	e.metrics.ObserveDeliveryStage("write", time.Since(writeStart))
+	if err != nil {
 		if qos > 0 {
 			conn.returnInflight()
 		}

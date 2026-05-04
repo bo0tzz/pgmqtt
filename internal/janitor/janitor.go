@@ -264,7 +264,7 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 	defer tx.Rollback(ctx)
 
 	rows, err := tx.Query(ctx, `
-		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties
+		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties, will_fire_at
 		  FROM sessions
 		 WHERE will_fire_at IS NOT NULL
 		   AND will_fire_at <= now()
@@ -275,17 +275,18 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 		return err
 	}
 	type w struct {
-		client  string
-		topic   string
-		payload []byte
-		qos     int
-		retain  bool
-		props   []byte
+		client    string
+		topic     string
+		payload   []byte
+		qos       int
+		retain    bool
+		props     []byte
+		fireAt    time.Time
 	}
 	var wills []w
 	for rows.Next() {
 		var x w
-		if err := rows.Scan(&x.client, &x.topic, &x.payload, &x.qos, &x.retain, &x.props); err != nil {
+		if err := rows.Scan(&x.client, &x.topic, &x.payload, &x.qos, &x.retain, &x.props, &x.fireAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -321,6 +322,15 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 		}
 		if j.metrics != nil {
 			j.metrics.WillsFiredTotal.Inc()
+			// Lateness = (now - will_fire_at). Negative would indicate
+			// firing-too-early which the WHERE clause forbids; clamp to
+			// 0 just in case clocks skew or the SELECT/UPDATE window
+			// lets `now()` regress behind the row's will_fire_at value.
+			lateness := time.Since(w.fireAt).Seconds()
+			if lateness < 0 {
+				lateness = 0
+			}
+			j.metrics.WillFireLatenessSeconds.Observe(lateness)
 		}
 	}
 
