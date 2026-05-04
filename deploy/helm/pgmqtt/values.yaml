@@ -359,6 +359,17 @@ limits:
   maxQueuedDeliveriesPerClient: 10000
   maxConnections: 5000
   maxInboundMsgsPerSec: 1000
+  ## Per-source-IP CONNECT rate (and burst). Over-rate connections are
+  ## dropped pre-CONNACK with a hard socket close — sending CONNACK
+  ## fans attacker retries. Mitigates bcrypt-CPU DoS where a single
+  ## IP can pin cores by streaming CONNECTs at cost-10 bcrypt cost
+  ## (~80 ms CPU each). 0 disables.
+  maxConnectsPerIPPerSec: 5
+  ## Per-source-IP cap on bcrypt failures before the IP enters a 60s
+  ## penalty box — every CONNECT from that IP is dropped pre-bcrypt
+  ## for the cool-off. Pairs with maxConnectsPerIPPerSec to blunt
+  ## unauthenticated CPU-pinning attacks. 0 disables.
+  maxAuthFailuresPerIPPerMin: 30
   ## Post-CONNECT cap on inbound MQTT packet size (bytes). The codec
   ## hardcodes a 1 MiB cap before CONNECT to bound DoS allocations from
   ## unauthenticated peers; once CONNECT lands the cap is lifted to this

@@ -105,6 +105,10 @@ spec:
               value: {{ .Values.limits.maxConnections | quote }}
             - name: PGMQTT_MAX_INBOUND_MSGS_PER_SEC
               value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
+            - name: PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC
+              value: {{ .Values.limits.maxConnectsPerIPPerSec | quote }}
+            - name: PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN
+              value: {{ .Values.limits.maxAuthFailuresPerIPPerMin | quote }}
             - name: PGMQTT_MAX_PACKET_SIZE
               value: {{ .Values.limits.maxPacketSize | quote }}
             - name: PGMQTT_PG_STATEMENT_TIMEOUT_MS
