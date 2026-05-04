@@ -2,6 +2,8 @@ package operator_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"os"
@@ -1315,6 +1317,147 @@ func assertSecretMatchesDB(t *testing.T, cli client.Client, pool *pgxpool.Pool, 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), sec.Data["password"]); err != nil {
 		t.Errorf("invariant violated: bcrypt(secret.password) does not verify DB hash: %v\n  secret.password=%q\n  hash=%q",
 			err, sec.Data["password"], hash)
+	}
+}
+
+// TestRehashOnCostBump verifies the operator re-bcrypts an existing
+// User row when the configured BcryptCost is higher than the cost
+// embedded in the stored hash. Without this, bumping
+// operator.bcryptCost (10 → 14) would leave existing rows on the old
+// cost forever, since the password-cleartext-unchanged short-circuit
+// would fire before any rehash. The metric
+// pgmqtt_user_rehash_total{reason="cost_bump"} fires once per
+// reconcile that rewrites a row for this reason.
+//
+// Setup: seed a User row with a cost-4 hash via direct PG insert
+// (bypassing the reconciler so we can pin the cost). Configure the
+// reconciler with BcryptCost=10 and a credentials Secret already
+// holding the cleartext that produced the cost-4 hash, with the User
+// CR's Status.ObservedSecretHash matching sha256(cleartext) so the
+// short-circuit *would* trigger. Run Reconcile.
+//
+// Expected post-condition: stored hash now has cost prefix "$2a$10$"
+// AND the metric counter for reason="cost_bump" incremented by 1.
+func TestRehashOnCostBump(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+
+	const username = "rehash-target"
+	const cleartext = "static-password"
+
+	// Seed a cost-4 row. bcrypt.MinCost=4 so this is the cheapest
+	// pre-existing hash we can plant; the configured cost of 10 must
+	// trigger a rehash.
+	weak, err := bcrypt.GenerateFromPassword([]byte(cleartext), 4)
+	if err != nil {
+		t.Fatalf("seed bcrypt: %v", err)
+	}
+	if !strings.HasPrefix(string(weak), "$2a$04$") {
+		t.Fatalf("seed cost prefix: %q", weak[:7])
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users(username, password_hash) VALUES($1, $2)`,
+		username, string(weak)); err != nil {
+		t.Fatalf("seed users row: %v", err)
+	}
+
+	// Build the corresponding K8s state: a User CR + auto-gen Secret with
+	// the same cleartext, plus a populated Status that would normally
+	// short-circuit (ObservedSecretHash matches sha256(cleartext)).
+	hashSum := sha256.Sum256([]byte(cleartext))
+	observedHash := hex.EncodeToString(hashSum[:])
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       username,
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Status: pgmqttv1alpha1.UserStatus{
+			ObservedSecretHash:   observedHash,
+			CredentialsSecretRef: &corev1.LocalObjectReference{Name: username + "-mqtt-credentials"},
+		},
+	}
+	credSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      username + "-mqtt-credentials",
+			Namespace: "mqtt",
+		},
+		Data: map[string][]byte{"password": []byte(cleartext)},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, credSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost:  10,
+	}
+
+	before := operator.UserRehashTotalForTest("cost_bump")
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: username}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// Post-condition 1: stored hash now at cost 10.
+	var stored string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !strings.HasPrefix(stored, "$2a$10$") {
+		t.Errorf("expected post-rehash cost 10, got prefix %q", stored[:7])
+	}
+	// The new hash must still verify the same cleartext — we rehashed,
+	// not rotated.
+	if err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(cleartext)); err != nil {
+		t.Errorf("post-rehash bcrypt verify failed: %v", err)
+	}
+
+	// Post-condition 2: cost_bump metric incremented exactly once.
+	after := operator.UserRehashTotalForTest("cost_bump")
+	if after-before != 1 {
+		t.Errorf("cost_bump metric delta: got %v, want 1", after-before)
+	}
+}
+
+// TestRehashCostBumpHonoredAtNoOpReconcile verifies that a no-op reconcile
+// (cleartext unchanged AND stored hash already at configured cost) does
+// NOT increment the cost_bump metric. The short-circuit must fire.
+func TestRehashCostBumpHonoredAtNoOpReconcile(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "noop-user", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost:  6,
+	}
+	// Run twice to settle finalizer + initial provision (rotation +1).
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "noop-user"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	beforeCost := operator.UserRehashTotalForTest("cost_bump")
+	beforeRot := operator.UserRehashTotalForTest("rotation")
+	// Third reconcile is a true no-op.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "noop-user"}}); err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
+	if got := operator.UserRehashTotalForTest("cost_bump") - beforeCost; got != 0 {
+		t.Errorf("cost_bump incremented on no-op reconcile: delta=%v", got)
+	}
+	if got := operator.UserRehashTotalForTest("rotation") - beforeRot; got != 0 {
+		t.Errorf("rotation incremented on no-op reconcile: delta=%v", got)
 	}
 }
 

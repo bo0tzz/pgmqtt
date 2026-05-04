@@ -10,10 +10,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -127,18 +129,38 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	hash := sha256Hex(password)
-	if user.Status.ObservedSecretHash == hash &&
-		user.Status.CredentialsSecretRef != nil &&
-		user.Status.CredentialsSecretRef.Name == secret.Name {
-		setReady(&user, true, "Reconciled", "")
-		return ctrl.Result{}, r.Status().Update(ctx, &user)
-	}
-
 	cost := r.BcryptCost
 	if cost == 0 {
 		cost = bcrypt.DefaultCost
 	}
+
+	// Decide whether the short-circuit applies. The cleartext-unchanged
+	// branch fires when ObservedSecretHash matches AND the stored bcrypt
+	// row is at-or-above the configured cost. Bumping operator.bcryptCost
+	// must NOT leave existing rows on the old cost forever — see
+	// pgmqtt_user_rehash_total{reason="cost_bump"} for rollout tracking.
+	hash := sha256Hex(password)
+	rehashReason := ""
+	if user.Status.ObservedSecretHash == hash &&
+		user.Status.CredentialsSecretRef != nil &&
+		user.Status.CredentialsSecretRef.Name == secret.Name {
+		// Cleartext is unchanged — still need to verify the stored hash
+		// is at the configured cost. A miss here means an operator bumped
+		// bcryptCost since the last reconcile; we re-bcrypt the same
+		// password at the new cost.
+		storedCost, err := r.storedBcryptCost(ctx, username)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
+		}
+		if storedCost >= cost {
+			setReady(&user, true, "Reconciled", "")
+			return ctrl.Result{}, r.Status().Update(ctx, &user)
+		}
+		rehashReason = "cost_bump"
+	} else {
+		rehashReason = "rotation"
+	}
+
 	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("bcrypt: %w", err)
@@ -152,6 +174,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		_ = r.Status().Update(ctx, &user)
 		return ctrl.Result{}, err
 	}
+	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
 	user.Status.ObservedSecretHash = hash
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
@@ -159,8 +182,35 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Status().Update(ctx, &user); err != nil {
 		return ctrl.Result{}, err
 	}
-	logger.Info("user upserted", "username", username, "secret", secret.Name)
+	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
 	return ctrl.Result{}, nil
+}
+
+// storedBcryptCost returns the cost parameter encoded in the user row's
+// password_hash, or 0 if the row does not exist (caller should treat as
+// "needs initial hash"). Returns -1 only on a DB error so the caller can
+// distinguish "no row" (proceed with rehash branch via the reason path)
+// from "PG unavailable" (return error).
+//
+// The pgx ErrNoRows case is mapped to (0, nil) — the row will be inserted
+// by the upsert below, so a stored cost of 0 reliably falls under any
+// configured cost (which is at least bcrypt.MinCost = 4).
+func (r *UserReconciler) storedBcryptCost(ctx context.Context, username string) (int, error) {
+	var stored string
+	err := r.Pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return -1, err
+	}
+	c, err := bcrypt.Cost([]byte(stored))
+	if err != nil {
+		// Stored hash is unparseable (corrupted or non-bcrypt). Treat as
+		// cost=0 so the rehash branch fires and replaces it.
+		return 0, nil
+	}
+	return c, nil
 }
 
 func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alpha1.User) (ctrl.Result, error) {
