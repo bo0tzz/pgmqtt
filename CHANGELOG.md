@@ -82,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stale handleDisconnect no longer wipes a peer takeover.** Migration
+  0012 adds `sessions.session_token` (UUID, default `gen_random_uuid()`).
+  takeOwnership rotates it on every CONNECT (both INSERT and UPDATE
+  paths); Conn captures the new value at takeOwnership commit time.
+  handleDisconnect's session-DELETE guards on (client_id, session_token)
+  — if a peer takeover rotated the token between takeOwnership and
+  the stale handleDisconnect, the DELETE matches 0 rows and the whole
+  cleanup tx rolls back so the new conn's deliveries also survive.
+  Surfaced by Paho v5 `test_session_expiry` intermittently failing on
+  immediate-reconnect after `SessionExpiryInterval=0` disconnect.
+  Test_session_expiry removed from `--known-flaky` — any regression
+  now hard-fails tier3.
 - **Migration 0011** fixes an off-by-one introduced by 0010's
   publish-cap short-circuit. `EXISTS (... OFFSET p_max_queued LIMIT 1)`
   evaluated `over_cap` as `depth >= p_max_queued + 1`, one row too
