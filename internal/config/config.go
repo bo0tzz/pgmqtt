@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -91,6 +92,15 @@ type Config struct {
 	// aggregation systems (Loki, Elasticsearch, Datadog, …) parse without
 	// a dedicated text-format extractor. Anything else is rejected.
 	LogFormat string
+
+	// WSAllowedOrigins restricts the Origin header on websocket upgrades.
+	// Empty (default) allows any origin — matches the historical behavior
+	// and is fine for the typical "broker behind an L4/L7 terminator" shape
+	// where browsers can't reach the broker directly. When operators want
+	// to mitigate cross-site WebSocket hijacking on a publicly-reachable
+	// /mqtt endpoint, set a comma-separated list of allowed Origin values
+	// (exact match, no globbing).
+	WSAllowedOrigins []string
 }
 
 func FromEnv() (*Config, error) {
@@ -115,6 +125,7 @@ func FromEnv() (*Config, error) {
 		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
 		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
+		WSAllowedOrigins:             splitTrimmed(os.Getenv("PGMQTT_WS_ALLOWED_ORIGINS"), ","),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")
@@ -162,6 +173,26 @@ func getenvDefaultEmpty(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitTrimmed splits s on sep and returns non-empty trimmed parts.
+// Returns nil for empty input so callers see a clean "unconfigured" sentinel.
+func splitTrimmed(s, sep string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, sep)
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func getenvInt(key string, def int) int {

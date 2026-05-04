@@ -83,6 +83,10 @@ spec:
               value: {{ if .Values.listeners.tcp.enabled }}":{{ .Values.listeners.tcp.port }}"{{ else }}""{{ end }}
             - name: PGMQTT_WS_ADDR
               value: {{ if .Values.listeners.ws.enabled }}":{{ .Values.listeners.ws.port }}"{{ else }}""{{ end }}
+            {{- with .Values.listeners.ws.allowedOrigins }}
+            - name: PGMQTT_WS_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
             - name: PGMQTT_SERVICE_HOST
               value: {{ include "pgmqtt.serviceHost" . | quote }}
             - name: PGMQTT_SERVICE_PORT

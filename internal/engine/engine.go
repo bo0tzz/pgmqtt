@@ -358,9 +358,25 @@ func (e *Engine) acceptTCP(ctx context.Context, ln net.Listener) {
 
 func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 	defer e.wg.Done()
+	allowed := e.cfg.WSAllowedOrigins
+	if len(allowed) == 0 {
+		e.logger.Warn("websocket: WSAllowedOrigins unset; accepting any Origin",
+			"hint", "set PGMQTT_WS_ALLOWED_ORIGINS to a comma-separated list to mitigate CSWSH on a publicly-reachable /mqtt endpoint")
+	}
 	upgrader := websocket.Upgrader{
 		Subprotocols: []string{"mqtt", "mqttv3.1", "mqttv3.11"},
-		CheckOrigin:  func(_ *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool {
+			if len(allowed) == 0 {
+				return true
+			}
+			origin := r.Header.Get("Origin")
+			for _, a := range allowed {
+				if a == origin {
+					return true
+				}
+			}
+			return false
+		},
 	}
 	mux := http.NewServeMux()
 	handler := func(w http.ResponseWriter, r *http.Request) {

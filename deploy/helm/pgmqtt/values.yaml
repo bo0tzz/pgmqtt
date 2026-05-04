@@ -60,6 +60,11 @@ listeners:
   ws:
     enabled: true
     port: 8083
+    ## Comma-separated Origin allow-list for the gorilla/websocket
+    ## CheckOrigin handler. Empty (default) allows any Origin — fine when
+    ## the broker sits behind an L4/L7 terminator. Set to mitigate CSWSH
+    ## if the /mqtt endpoint is browser-reachable directly.
+    allowedOrigins: []
 
 ## Service exposing the broker. Use ClusterIP behind your TLS terminator
 ## (Nginx stream / HAProxy / ingress-nginx tcp-services) for tls://1883;
