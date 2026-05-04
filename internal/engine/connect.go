@@ -306,7 +306,15 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 
 	// Background drain loop: when PUBACK/PUBCOMP frees an in-flight slot it
 	// kicks drainKick; we re-scan state=0 deliveries and send what fits.
-	go c.runDrainLoop(ctx)
+	// Register on the engine WaitGroup so shutdownGracefully waits for the
+	// goroutine to exit before pool.Close() runs — otherwise a drain
+	// query can land on a closing pool and emit a noisy warning at every
+	// shutdown.
+	c.eng.wg.Add(1)
+	go func() {
+		defer c.eng.wg.Done()
+		c.runDrainLoop(ctx)
+	}()
 	return nil
 }
 

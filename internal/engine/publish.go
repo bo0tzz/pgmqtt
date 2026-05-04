@@ -44,15 +44,29 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	// receive-side ACK boundary: PUBACK for QoS 1, PUBCOMP for QoS 2 (which
 	// only happens after PUBREL is received). Decrement-after-defer would
 	// effectively mean "always 1" so flow control would never trip.
+	// Track whether the inbound-flow-control slot stays held until the
+	// peer ACKs (QoS-1 PUBACK / QoS-2 PUBREL). Default: release on early
+	// return so dup-PUBLISH and generic errors don't leak slots and
+	// eventually trip "Receive Maximum exceeded" against a healthy
+	// client. Set this to true only on the success paths where the
+	// matching ACK handler is responsible for the decrement.
+	releaseInbound := false
 	if pk.FixedHeader.Qos > 0 && c.protocol == mqttwire.ProtocolMQTT5 {
 		current := c.inboundInflight.Add(1)
+		releaseInbound = true
 		if uint16(current) > c.eng.serverReceiveMaximum() {
 			_ = c.write(&packets.Packet{
 				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
 				ReasonCode:  0x93, // Receive Maximum exceeded
 			})
+			c.inboundInflight.Add(-1)
 			return fmt.Errorf("receive maximum exceeded: %d", current)
 		}
+		defer func() {
+			if releaseInbound {
+				c.inboundInflight.Add(-1)
+			}
+		}()
 	}
 
 	// v5 inbound TopicAlias validation. We advertise serverTopicAliasMaximum=0
@@ -118,19 +132,21 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	case 0:
 		return nil
 	case 1:
-		// PUBACK closes the inbound flow-control slot for QoS 1.
+		// PUBACK closes the inbound flow-control slot for QoS 1 — the
+		// deferred release above handles the decrement, so don't keep
+		// the slot held past this point.
 		startWrite := time.Now()
 		err := c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Puback},
 			PacketID:    pk.PacketID,
 		})
 		c.eng.metrics.ObservePublishStage("response_write", time.Since(startWrite))
-		c.inboundInflight.Add(-1)
 		return err
 	case 2:
 		// PUBREC alone doesn't close the slot — we're still waiting for
-		// PUBREL (which triggers PUBCOMP). The slot is released in
-		// handlePubrel.
+		// PUBREL. handlePubrel does the decrement; suppress the deferred
+		// release here.
+		releaseInbound = false
 		startWrite := time.Now()
 		err := c.write(&packets.Packet{
 			FixedHeader: packets.FixedHeader{Type: packets.Pubrec},

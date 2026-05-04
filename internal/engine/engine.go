@@ -437,6 +437,16 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 			e.logger.Warn("ws upgrade", "err", err)
 			return
 		}
+		// Bound the WS read frame at the configured server max packet
+		// size + a small header allowance. Without this, gorilla
+		// happily buffers attacker-controlled frames (announced sizes
+		// up to int64) BEFORE the MQTT codec layer sees them — a
+		// 100 MiB binary frame would allocate fully then get rejected.
+		// SetReadLimit also caps `read` to avoid unbounded grow on a
+		// single message.
+		if cap := e.maxPacketSize(); cap > 0 {
+			ws.SetReadLimit(int64(cap) + 64)
+		}
 		nc := &wsConnAdapter{ws: ws}
 		if !e.tryReserveConn() {
 			e.logger.Warn("max connections reached; rejecting WS", "remote", r.RemoteAddr)

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -124,7 +125,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
-		setReady(&user, false, "SecretError", err.Error())
+		setReady(&user, false, "SecretError", scrubReason(err))
 		_ = r.Status().Update(ctx, &user)
 		return ctrl.Result{}, err
 	}
@@ -170,7 +171,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		INSERT INTO users(username, password_hash) VALUES($1, $2)
 		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
 	`, username, string(bcryptHash)); err != nil {
-		setReady(&user, false, "DBError", err.Error())
+		setReady(&user, false, "DBError", scrubReason(err))
 		_ = r.Status().Update(ctx, &user)
 		return ctrl.Result{}, err
 	}
@@ -345,6 +346,38 @@ func generatePassword() (string, error) {
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// scrubReason produces a User-CR-Status-safe summary of an error. We
+// classify by SQLSTATE / common substrings rather than reflecting raw
+// pgx error text — those messages can contain query fragments, schema
+// names, and (when the connection string is in the error) plaintext
+// credentials. CWE-209.
+func scrubReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "no rows"):
+		return "not found"
+	case strings.Contains(s, "duplicate key"),
+		strings.Contains(s, "23505"):
+		return "duplicate"
+	case strings.Contains(s, "23502"):
+		return "constraint violation"
+	case strings.Contains(s, "context deadline exceeded"),
+		strings.Contains(s, "i/o timeout"),
+		strings.Contains(s, "connection refused"),
+		strings.Contains(s, "connection reset"),
+		strings.Contains(s, "EOF"):
+		return "transient connectivity"
+	case strings.Contains(s, "permission denied"),
+		strings.Contains(s, "42501"):
+		return "permission denied"
+	default:
+		return "internal error"
+	}
 }
 
 func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
