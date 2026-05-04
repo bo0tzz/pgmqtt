@@ -11,6 +11,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
+	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
 
 var _ net.Conn = (*net.TCPConn)(nil)
@@ -522,5 +523,57 @@ func TestSlowSubscriberQuotaExceeded(t *testing.T) {
 	}
 	if pk.ReasonCode != 0x97 {
 		t.Fatalf("expected reason 0x97 (Quota Exceeded), got 0x%X", pk.ReasonCode)
+	}
+}
+
+// TestConnectWithAuthenticationMethodRejected verifies that a v5 CONNECT
+// with AuthenticationMethod set is rejected with CONNACK 0x8C (Bad
+// authentication method). pgmqtt does not advertise an enhanced-auth
+// method on CONNACK, so per MQTT-4.12.0-1 the server may reject
+// AuthenticationMethod-bearing CONNECTs; previously we silently
+// downgraded to password auth.
+func TestConnectWithAuthenticationMethodRejected(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	c, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte("MQTT"),
+			Clean:            true,
+			Keepalive:        60,
+			ClientIdentifier: "auth-method-client",
+			Username:         []byte("test"),
+			UsernameFlag:     true,
+			Password:         []byte("test"),
+			PasswordFlag:     true,
+		},
+	}
+	pk.Properties.AuthenticationMethod = "SCRAM-SHA-256"
+
+	if err := mqttwire.Write(c, pk); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	r := mqttwire.NewReader(c)
+	r.ProtocolVersion = mqttwire.ProtocolMQTT5
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	resp, err := r.Read()
+	if err != nil {
+		t.Fatalf("read connack: %v", err)
+	}
+	if resp.FixedHeader.Type != packets.Connack {
+		t.Fatalf("expected CONNACK, got %d", resp.FixedHeader.Type)
+	}
+	if resp.ReasonCode != 0x8C {
+		t.Fatalf("expected CONNACK 0x8C (bad auth method), got 0x%X", resp.ReasonCode)
 	}
 }
