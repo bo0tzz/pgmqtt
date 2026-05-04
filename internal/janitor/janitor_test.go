@@ -7,12 +7,15 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/google/uuid"
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
 	"github.com/bo0tzz/pgmqtt/internal/janitor"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
 func warnLogger() *slog.Logger {
@@ -200,6 +203,83 @@ func TestJanitorInboundQoS2Sweep(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("row %d: got %v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestJanitorRefreshStateGauges seeds rows in sessions / subscriptions /
+// retained / inbound_qos2 and asserts the per-table cardinality gauges
+// reflect the counts after one Tick. Guards against the metric set
+// silently regressing if a future schema change breaks the COUNT(*) query.
+func TestJanitorRefreshStateGauges(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+
+	ctx := context.Background()
+	// Seed: 3 sessions (2 connected, 1 not), 5 subscriptions across them,
+	// 2 retained messages, 4 inbound_qos2 tombstones.
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start)
+		VALUES
+		  ('c1', $1, true, 5, false),
+		  ('c2', $1, true, 5, false),
+		  ('c3', NULL, false, 5, false)
+	`, l.BrokerID()); err != nil {
+		t.Fatalf("seed sessions: %v", err)
+	}
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO subscriptions(client_id, topic_filter, qos)
+		VALUES ('c1', 'a/+', 1), ('c1', 'b/+', 1),
+		       ('c2', 'a/+', 0), ('c2', 'c/#', 2),
+		       ('c3', '+/+', 1)
+	`); err != nil {
+		t.Fatalf("seed subscriptions: %v", err)
+	}
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO retained(topic, payload, qos)
+		VALUES ('r/1', 'p1', 0), ('r/2', 'p2', 1)
+	`); err != nil {
+		t.Fatalf("seed retained: %v", err)
+	}
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO inbound_qos2(client_id, packet_id, received_at)
+		VALUES ('c1', 1, now()), ('c1', 2, now()),
+		       ('c2', 1, now()), ('c3', 1, now())
+	`); err != nil {
+		t.Fatalf("seed inbound_qos2: %v", err)
+	}
+
+	mtx := metrics.New()
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetMetrics(mtx)
+	if err := jt.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	checks := []struct {
+		name string
+		g    interface{ Write(*dto.Metric) error }
+		want float64
+	}{
+		{"pgmqtt_sessions", mtx.Sessions, 3},
+		{"pgmqtt_subscriptions", mtx.Subscriptions, 5},
+		{"pgmqtt_retained_count", mtx.RetainedCount, 2},
+		{"pgmqtt_inbound_qos2_pending", mtx.InboundQoS2Pending, 4},
+	}
+	for _, c := range checks {
+		var pb dto.Metric
+		if err := c.g.Write(&pb); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := pb.GetGauge().GetValue(); got != c.want {
+			t.Errorf("%s: got %g, want %g", c.name, got, c.want)
 		}
 	}
 }
