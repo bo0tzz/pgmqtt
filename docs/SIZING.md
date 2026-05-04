@@ -5,6 +5,12 @@ limits, and when to consider non-default indexes. **All numbers are
 order-of-magnitude on a homelab profile** (sub-millisecond Postgres
 latency, average payload < 1 KB). Re-measure for production traffic.
 
+For per-stage attribution of inbound and outbound latency on your
+own hardware, see [`PERF.md`](PERF.md). The histograms there
+(`pgmqtt_publish_seconds`, `pgmqtt_delivery_seconds`,
+`pgmqtt_janitor_tick_seconds`) make the rules of thumb here checkable
+against measurement.
+
 ## Pod sizing
 
 The broker is mostly I/O-bound (TCP read/write + Postgres queries) and
@@ -28,8 +34,16 @@ per Pod on a modern x86_64 core. Doubling either dimension wants:
   goroutines/stacks at ~8 KB → another 80 MB. Bump request to 256 Mi
   if you cross 10k conns.
 - Messages/s: each PUBLISH is one Postgres `mqtt_publish` round-trip.
-  ~5 ms p99 at 1k msg/s steady state on Postgres-on-localhost; at
-  10k msg/s expect to see Postgres saturating before the broker does.
+  After the v0.1.x perf round (FK drop in migration 0006, partial
+  indexes in 0007/0008, in-broker packet ID counter in 2B), the
+  homelab/idle-Postgres ceiling is bounded by the
+  `mqtt_publish_query` stage's tail latency and the per-Conn write
+  goroutine's CPU. At 1k msg/s the publish stage is sub-ms; at 10k+
+  msg/s expect Postgres to saturate on `pg_xact_commit` before the
+  broker does. See `PERF.md` for what each histogram bucket actually
+  measured on a contended kind run, and recalibrate from
+  `pgmqtt_publish_seconds` and `pgmqtt_delivery_seconds` on your own
+  hardware before treating these as targets.
 
 ## When to scale out vs. up
 
@@ -141,3 +155,17 @@ If you're building a sizing test, the targets we use internally:
 - A 30-second `kubectl delete pod pgmqttd-0 && pgmqttd-1` rotation
   during traffic — no QoS-1 loss, QoS-2 no duplicates (verify via
   client-side counters).
+
+## Calibration measurements actually taken
+
+The numbers above are derived from the v0.1.x perf work plus the
+post-FK-drop re-measurement; they are **not** the result of running
+the smoke targets above as a calibrated benchmark. PERF.md records
+what was actually measured (a contended kind cluster, ~287 msg/s
+post-fix on the soak shape, with the bottleneck shifted from
+MultiXact SLRU thrash to the resume-scan path that 0008 then
+addressed). A clean dedicated-host re-measurement on the same shape
+is filed as a separate task and will replace the order-of-magnitude
+numbers above with measured ones once it lands. Until then, treat
+this guide as a starting point and confirm with `pgmqtt_*_seconds`
+histograms on your deployment.
