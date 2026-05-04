@@ -212,6 +212,79 @@ func TestWillDelayCancelledByReconnectBeforeFire(t *testing.T) {
 	}
 }
 
+// TestSessionExpiryDisconnectExtension reproduces a slice of Paho's
+// test_session_expiry: connect with SE=N, then DISCONNECT carrying a
+// larger SE value should extend the session, NOT be silently dropped.
+// Connect with SE=0 then DISCONNECT with SE>0 is the only invalid
+// case (per [MQTT-3.14.2.2.2]) — that should still get rejected.
+func TestSessionExpiryDisconnectExtension(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	ctx := context.Background()
+
+	clientID := "se-ext-1"
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 1
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := h.Connect(t, clientID, persistent)
+	c1.Subscribe(t, "se/x", 1)
+
+	// DISCONNECT carrying SE=10 (extending from 1).
+	c1.Disconnect(t, func(p *packets.Packet) {
+		p.Properties.SessionExpiryInterval = 10
+		p.Properties.SessionExpiryIntervalFlag = true
+	})
+
+	var expiresAt *time.Time
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT session_expires_at FROM sessions WHERE client_id=$1`, clientID).Scan(&expiresAt); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if expiresAt == nil {
+		t.Fatalf("session_expires_at must be set after DISCONNECT with SE>0")
+	}
+	delta := time.Until(*expiresAt)
+	if delta < 8*time.Second || delta > 12*time.Second {
+		t.Errorf("session_expires_at delta = %v; want ~10s", delta)
+	}
+}
+
+// TestSessionExpiryDisconnectCancellation reproduces the cancel slice
+// of Paho's test_session_expiry: connect with SE=N>0, DISCONNECT with
+// SE=0 cancels the session immediately. The session row MUST be
+// deleted on disconnect so a subsequent CONNECT cleanstart=False sees
+// sessionPresent=False.
+func TestSessionExpiryDisconnectCancellation(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	ctx := context.Background()
+
+	clientID := "se-cancel-1"
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 60
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := h.Connect(t, clientID, persistent)
+	c1.Subscribe(t, "se/y", 1)
+	// DISCONNECT carrying SE=0 cancels the persistent session.
+	c1.Disconnect(t, func(p *packets.Packet) {
+		p.Properties.SessionExpiryInterval = 0
+		p.Properties.SessionExpiryIntervalFlag = true
+	})
+
+	var n int
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE client_id=$1`, clientID).Scan(&n); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("session row not deleted after DISCONNECT SE=0; count=%d", n)
+	}
+}
+
 func TestWillFiresOnUngraceful(t *testing.T) {
 	t.Parallel()
 	h := enginetest.NewHarness(t)

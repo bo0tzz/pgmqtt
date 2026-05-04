@@ -430,6 +430,29 @@ func (c *TestClient) Read(t *testing.T, timeout time.Duration) packets.Packet {
 	}
 }
 
+// Disconnect sends a v5 DISCONNECT (with optional property customisation
+// via the variadic opts) before closing the socket. Use this when the
+// test needs to exercise DISCONNECT property handling — for vanilla
+// graceful close call Close.
+func (c *TestClient) Disconnect(t *testing.T, opts ...func(*packets.Packet)) {
+	t.Helper()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: c.r.ProtocolVersion,
+	}
+	for _, opt := range opts {
+		opt(pk)
+	}
+	if err := mqttwire.Write(c.Conn, pk); err != nil {
+		t.Fatalf("write disconnect: %v", err)
+	}
+	_ = c.Conn.Close()
+}
+
 // Close politely sends DISCONNECT and closes the socket.
 func (c *TestClient) Close() {
 	if c.closed {
