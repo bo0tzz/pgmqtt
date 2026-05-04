@@ -207,3 +207,72 @@ done. When every box above is ticked, do *not* declare the project shipped
 freshly-introduced dead code, missing tests, conformance/CI status) and
 add fresh items to this file. Production-ready is a property of the
 software, not of the checklist.
+
+## 8. Post-tag round 2 (after the v0.1.0 retag)
+
+Driven by repeated audits of the post-tag tree (a transactional-
+consistency audit, a dead-wiring audit, a perf round, an MQTT 5 spec
+walk-through, a metrics-completeness audit, and a Helm-knobs audit).
+Each found real material; the items below are the ones that landed.
+See `CHANGELOG.md [Unreleased]` for the list and reasoning per
+change.
+
+- [x] **Atomicity / correctness round 1.** publishCore single-tx
+      (covers retain + qos2 dedup + insert + fanout + pg_notify),
+      cleanStart cleanup tx, will-fire ordering inversion, immediate-
+      will column NULL after fire, dead-broker pg_try_advisory_lock,
+      janitor.expireSessions in one tx with explicit deliveries DELETE.
+- [x] **Atomicity / correctness round 2.** inbound_qos2 leak across
+      cleanStart=true reconnect, AUTH packet silent drop, sessionExpiry
+      uint32 narrowing + presence flag, panic recovery at every
+      long-lived goroutine boundary (per-Conn run + drainLoop, listener
+      run + per-NOTIFY dispatch, janitor RunWith + per-tick, metrics
+      serve, operator.Run), tick context cancels on leader.Lost(),
+      ownership sweep closes orphaned sockets after silent takeover.
+- [x] **Perf.** Drop deliveries.client_id FK (MultiXact thrash), partial
+      index for inflight scan (0007), partial index for resume scan
+      (0008), in-broker per-Conn packet ID counter (0009 drops the
+      sessions.next_packet_id column + the SQL function). Re-measure
+      showed 2.79× throughput post-FK-drop alone.
+- [x] **Operability — broker.** delivery_seconds histogram, auth_failures
+      counter, janitor per-job timing + errors, table-cardinality
+      gauges, will-fire lateness, outbound-inflight saturation,
+      connections-capacity-ratio, controller-runtime metrics on our
+      /metrics endpoint, JSON log handler.
+- [x] **Operability — Helm.** podAntiAffinity preset, imagePullSecrets,
+      podLabels, extraVolumes, priorityClassName,
+      topologySpreadConstraints, terminationGracePeriodSeconds,
+      probe tunability (delays/thresholds), extraEnvFrom, service LB
+      knobs, hostNetwork / dnsPolicy / dnsConfig / runtimeClassName,
+      automountServiceAccountToken: false default.
+- [x] **Leader.** Crash-loop on unexpected leader-loss (kubelet
+      restarts the pod), bounded-exposure documentation of the fence
+      window (10s Ping interval mitigated by row-level locking in
+      expireSessions, advisory_lock in handleDeadBroker, idempotent
+      writes in operator).
+- [x] **Docs.** PERF.md, VERSIONING.md migration policy, BACKUP.md
+      schema audit, CONFORMANCE.md v5 spec omissions, OPS.md
+      crash-loop-on-leader-loss, SIZING.md recalibration pointer.
+
+### 8a. Round 2 — deferred
+
+Real but lower-impact than what landed:
+
+- [ ] **Strict leader-write fence.** Today's bounded-exposure
+      analysis is correct but leans on row-level locking and
+      idempotent writes for safety. A real fence (epoch column CAS
+      or routing all leader writes through `l.conn`) would eliminate
+      the 10s window. Worth doing before a strong-correctness claim.
+- [ ] **Real-hardware perf re-measure.** All current numbers in
+      PERF.md are from a contended kind cluster. A clean dedicated-
+      host run on the same shape (5 pubs × inflight=50 × 5000/s ×
+      90s) closes the loop.
+- [ ] **Long-soak validation.** A 12h soak run validating WAL
+      bloat / autovacuum behavior over hours is run-once and worth
+      recording.
+- [ ] **Sub-disconnect investigation at high rate.** The post-FK-drop
+      perf re-measure observed `drainSessionQueue` ~5/sec/sub at
+      5pubs × inflight=50 × 5000/s. The 100 msg/s soak run at v0.1.x
+      HEAD shows zero churn, so the high-rate observation needs its
+      own investigation with the new metrics. Filed as
+      task #108 (drain_session_queue_total{reason} counter).

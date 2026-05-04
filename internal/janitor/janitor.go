@@ -82,11 +82,15 @@ func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
 		}
 	}()
 
+	j.logger.Info("janitor waiting for leadership")
 	select {
 	case <-ctx.Done():
+		j.logger.Info("janitor exiting before leadership (ctx done)")
 		return
 	case <-leader.Acquired():
+		j.logger.Info("janitor leadership acquired; starting tick loop", "interval", j.interval)
 	case <-leader.Lost():
+		j.logger.Info("janitor exiting before leadership (lost)")
 		return
 	}
 
