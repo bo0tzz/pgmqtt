@@ -55,4 +55,4 @@ validate:
 	@bash scripts/validate.sh $(TIER) $(if $(PAHO),--paho $(PAHO))
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) coverage.out coverage.txt
