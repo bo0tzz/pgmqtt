@@ -329,6 +329,12 @@ func (j *Janitor) timed(job string, f func() error) error {
 // (subscriptions, sessions, retained, inbound_qos2). Cheap (one
 // indexed COUNT each) and gives operators a continuous view of
 // session/topic accumulation without touching the broker hot path.
+//
+// Note: at the homelab/HA-Z2M scale these tables are O(100-1000)
+// rows, so count(*) is microseconds. Switching to
+// pg_stat_user_tables.n_live_tup would be free but stale (relies on
+// autovacuum/ANALYZE to be useful) — only worth doing if these
+// tables ever grow into the millions.
 func (j *Janitor) refreshStateGauges(ctx context.Context) error {
 	if j.metrics == nil {
 		return nil
@@ -502,7 +508,7 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 		 WHERE connected = false
 		   AND session_expires_at IS NOT NULL
 		   AND session_expires_at <= now()
-		 FOR UPDATE
+		 FOR UPDATE SKIP LOCKED
 	`)
 	if err != nil {
 		return err
