@@ -8,14 +8,11 @@ import (
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -110,22 +107,6 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
 	log.SetLogger(zap.New(zap.UseDevMode(false)))
 
-	// Constrain the controller-runtime cache for Secrets to the operator's
-	// own namespace. The default (cluster-wide) cache requires cluster-
-	// scoped Secret read/list/watch RBAC — a pod-compromise blast radius
-	// not justified by the actual feature: Users live in this namespace
-	// and their generated Secrets land here too. Multi-namespace User
-	// support would need per-namespace Roles + a wider cache; that's an
-	// explicit follow-up if it ever lands.
-	cacheOpts := cache.Options{
-		ByObject: map[client.Object]cache.ByObject{
-			&corev1.Secret{}: {
-				Namespaces: map[string]cache.Config{
-					opts.LeaderElectionNamespace: {},
-				},
-			},
-		},
-	}
 	mgr, err := ctrl.NewManager(cfg, manager.Options{
 		Scheme: scheme,
 		// K8s Lease leader election. Exactly one pod's manager runs the
@@ -137,7 +118,10 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 		LeaderElectionReleaseOnCancel: true,
 		HealthProbeBindAddress:        ":0",
 		Metrics:                       metricsserver.Options{BindAddress: "0"},
-		Cache:                         cacheOpts,
+		// Cache is unconstrained by namespace: Users live anywhere and
+		// their generated Secrets need to land in the same namespace as
+		// the CR. The chart's ClusterRole grants matching cluster-wide
+		// Secret RBAC; the trade-off is documented in docs/SECURITY.md.
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)

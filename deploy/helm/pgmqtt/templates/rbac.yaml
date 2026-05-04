@@ -1,8 +1,12 @@
-# ClusterRole: cluster-wide watch on User CRs (the User CRD is namespaced
-# but the operator watches every namespace). Notably does NOT include
-# `secrets` verbs — see the Role below for that. A pod compromise on this
-# ClusterRole grants observability of Users only, not the ability to read
-# arbitrary Secrets cluster-wide.
+# ClusterRole: cluster-wide watch on User CRs and create/update of the
+# generated <name>-mqtt-credentials Secret in the same namespace as the
+# User CR. The User CRD is namespaced and intentionally lives anywhere —
+# operators put Users in whatever namespace makes sense for their
+# workload (per-app, per-team, etc.). Cross-namespace Secret RBAC is the
+# trade-off for that flexibility; the threat is documented in
+# docs/SECURITY.md (compromised broker pod can read any Secret cluster-
+# wide). To narrow scope, fork the chart and replace this ClusterRole
+# with a per-namespace Role wherever Users live.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -19,6 +23,9 @@ rules:
   - apiGroups: ["pgmqtt.io"]
     resources: ["users/finalizers"]
     verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -30,42 +37,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ include "pgmqtt.fullname" . }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "pgmqtt.fullname" . }}
-    namespace: {{ .Release.Namespace }}
----
-# Namespace-scoped Role: Secret CRUD lives here. The operator's
-# controller-runtime cache is constrained to this same namespace
-# (internal/operator/manager.go), so it never reads Secrets outside
-# the release namespace at runtime either. User CRs in other namespaces
-# will reconcile but their Secret writes will fail with an RBAC error —
-# that's deliberate. Multi-namespace User support would need per-
-# namespace Roles + a widened cache, which is an explicit follow-up
-# rather than a blanket cluster grant.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ include "pgmqtt.fullname" . }}-secrets
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "pgmqtt.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "pgmqtt.fullname" . }}-secrets
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "pgmqtt.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {{ include "pgmqtt.fullname" . }}-secrets
 subjects:
   - kind: ServiceAccount
     name: {{ include "pgmqtt.fullname" . }}
