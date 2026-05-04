@@ -148,27 +148,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added — broker resilience
 
 - Goroutine panic recovery at every long-lived background boundary:
-  janitor.RunWith + per-tick (one panic in any sub-job no longer
-  takes the broker down), listener.run + per-NOTIFY dispatch,
-  per-Conn `run()`, `runDrainLoop`, the metrics serve goroutine,
-  and the operator.Run goroutine. All log a stack at ERROR before
-  returning. Per-iteration recovery means a malformed payload or
-  panic on one event doesn't kill the loop for subsequent ones.
-- Janitor tick context is now derived from the leader's lifecycle:
-  a watcher goroutine cancels the tick context when leader.Lost()
-  fires, so an in-flight tick's PG queries don't keep running on
-  an ex-leader pod.
-- Crash-loop policy on unexpected leader-loss: cmd/pgmqttd watches
-  `leader.Lost()`. If it fires while ctx is still live, the process
-  exits non-zero ("leader lost outside of shutdown — exiting for
-  restart") and kubelet restarts the pod. A fresh leader.Start in
-  the new process re-races for the advisory lock.
+  janitor.Run + per-tick (one panic in any sub-job no longer takes
+  the broker down), listener.run + per-NOTIFY dispatch, per-Conn
+  `run()`, `runDrainLoop`, the metrics serve goroutine, and the
+  operator.Run goroutine. All log a stack at ERROR before returning.
+  Per-iteration recovery means a malformed payload or panic on one
+  event doesn't kill the loop for subsequent ones.
 - New per-engine ownership-sweep goroutine reconciles the local
   conns map against `sessions.broker_id` every 5 s. Sockets we
   still hold for client_ids the DB now attributes to a different
   broker get `Shutdown()`ed. Closes the takeover-NOTIFY-fire-and-
   forget gap where an orphaned socket could keep PUBLISHing
   duplicates after a silent ownership transfer.
+
+### Changed — leaderless coordination
+
+The post-tag rounds explored several flavours of singleton-leader
+fencing and crash-loop policy. The architecturally cleaner answer
+turned out to be: **don't have a singleton.** Every leader-gated
+janitor operation is already concurrency-safe by construction, and
+the operator can use controller-runtime's K8s Lease leader election.
+This release ships that refactor:
+
+- **Janitor**: every Pod runs an independent Tick loop. Sweep
+  operations are concurrency-safe by construction —
+  `pg_try_advisory_lock` per dead broker, `SELECT … FOR UPDATE
+  [SKIP LOCKED]` for wills/expiries, idempotent DELETEs for retained
+  / inbound_qos2 / orphan rows. See `internal/janitor/janitor.go`
+  package doc for the per-job analysis.
+- **Operator**: `manager.Options.LeaderElection: true` with a
+  namespaced `pgmqtt-operator` Lease. controller-runtime handles
+  acquisition + reconciliation gating + handoff internally. On loss
+  the manager exits and a peer Pod takes over — no Pod restart, no
+  re-arm code in our tree.
+- **`internal/leader/` package deleted**, along with the
+  PG-advisory-lock based `leader.Start`, the watchdog goroutine in
+  cmd/pgmqttd that crashed the pod on `Lost()`, and the
+  Lost-cancellable-tick wiring in janitor.RunWith. None of those
+  failure modes can happen anymore.
+- New Helm RBAC: namespaced Role + RoleBinding granting
+  `coordination.k8s.io/leases` and `events` on the broker SA in the
+  release namespace. `automountServiceAccountToken` defaults flipped
+  back to `true` (operator now genuinely needs the SA token).
+- New `POD_NAMESPACE` env (Downward API) used as the Lease
+  namespace. Empty falls back to controller-runtime's in-cluster
+  auto-detect.
+
+This closes audit findings L1 (CRITICAL leader-write fence), L2
+(HIGH re-arm), and L4 (LOW lost-cancellable tick) at the source
+rather than retrofitting fences onto the singleton model.
+
+### Fixed — janitor
+
+- `handleDeadBroker` advisory-lock leak across pgxpool conns: the
+  `pg_try_advisory_lock` and the deferred `pg_advisory_unlock`
+  could land on different conns (pgxpool auto-acquires per call),
+  and `pg_advisory_unlock` from a different session is a no-op.
+  Fix: `pool.Acquire` one conn for the entire lock + work + unlock
+  sequence, defer `Release`. The metric increment also moved into
+  the claimed-true branch (previously over-counted on transient
+  errors).
 
 ### Added — docs
 
