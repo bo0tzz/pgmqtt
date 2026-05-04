@@ -97,7 +97,13 @@ type Engine struct {
 	shutdown     chan struct{}
 
 	// Tunables — exposed for tests.
-	KeepAliveGrace time.Duration // multiplier applied to keepalive when arming read deadlines (default 1.5)
+	//
+	// KeepAliveMultiplier sets the read-deadline as
+	// `keepalive * KeepAliveMultiplier`. Spec [MQTT-3.1.2-22] says the
+	// server MAY disconnect after 1.5× the negotiated keepalive without
+	// hearing from the client. Tests can shrink this to make timeouts
+	// deterministic.
+	KeepAliveMultiplier float64
 }
 
 // New constructs an Engine. SetBrokerID must be called before Serve so
@@ -109,7 +115,7 @@ func New(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *sl
 		logger:         logger,
 		conns:          make(map[string]*Conn),
 		shutdown:       make(chan struct{}),
-		KeepAliveGrace: 1500 * time.Millisecond,
+		KeepAliveMultiplier: 1.5,
 		notify:         &localNotifier{},
 		takeover:       noopTakeover{},
 		quota:          noopQuota{},

@@ -205,7 +205,11 @@ func (c *Conn) armReadDeadline() error {
 	if c.keepalive == 0 {
 		return c.nc.SetReadDeadline(time.Time{})
 	}
-	return c.nc.SetReadDeadline(time.Now().Add(c.keepalive + c.eng.KeepAliveGrace))
+	mult := c.eng.KeepAliveMultiplier
+	if mult <= 0 {
+		mult = 1.5
+	}
+	return c.nc.SetReadDeadline(time.Now().Add(time.Duration(float64(c.keepalive) * mult)))
 }
 
 func (c *Conn) dispatch(ctx context.Context, pk *packets.Packet) error {

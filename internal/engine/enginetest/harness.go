@@ -37,6 +37,13 @@ type Harness struct {
 // NewHarness boots a single-pod broker with InProcessNotifier and a default
 // user "test"/"test". Use Connect to obtain TestClient instances.
 func NewHarness(t *testing.T) *Harness {
+	return NewHarnessWith(t, nil)
+}
+
+// NewHarnessWith is NewHarness plus a hook that runs against the *engine.Engine
+// before Serve is called. Use it to override engine tunables (e.g.
+// KeepAliveMultiplier) for a single test.
+func NewHarnessWith(t *testing.T, customise PodSetup) *Harness {
 	t.Helper()
 	url := dbtest.FreshURL(t)
 	pool, err := pgxpoolOpen(t, url)
@@ -45,7 +52,7 @@ func NewHarness(t *testing.T) *Harness {
 	}
 	seedUser(t, pool, "test", "test")
 
-	eng, brokerID, addr, cancel, done := startBroker(t, pool, url, nil)
+	eng, brokerID, addr, cancel, done := startBroker(t, pool, url, customise)
 	h := &Harness{
 		T:         t,
 		Pool:      pool,

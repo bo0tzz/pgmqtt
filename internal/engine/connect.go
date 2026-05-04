@@ -62,12 +62,16 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	c.cleanStart = pk.Connect.Clean
 	clientKeepalive := time.Duration(pk.Connect.Keepalive) * time.Second
 	c.keepalive = clientKeepalive
-	if c.keepalive == 0 {
-		c.keepalive = defaultKeepalive
-	}
 	// Server policy cap — for v5 we advertise the override via ServerKeepAlive.
 	maxAllowedKeepalive := c.eng.maxAllowedKeepalive()
 	keepaliveOverridden := false
+	if c.keepalive == 0 {
+		// Spec: keepalive=0 means "no enforcement". We don't honor that
+		// (orphan-conn cleanup needs a deadline), so override to a sane
+		// default and tell the v5 client via ServerKeepAlive.
+		c.keepalive = defaultKeepalive
+		keepaliveOverridden = true
+	}
 	if c.keepalive > maxAllowedKeepalive {
 		c.keepalive = maxAllowedKeepalive
 		keepaliveOverridden = true
