@@ -4,6 +4,11 @@ go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0
+	// gorilla/websocket: pseudo-version is intentional. The latest tagged
+	// release is v1.5.3, but `k8s.io/*` v0.36 transitively pulls this newer
+	// post-v1.5.3 commit (March 2025). Downgrading to v1.5.3 here would
+	// rewind the resolved version for k8s deps too. Re-pin to a tag once
+	// the gorilla/websocket project cuts v1.5.4 (or later).
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/mochi-mqtt/server/v2 v2.7.9

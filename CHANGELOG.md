@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — modernization
+
+- **Helm chart distribution**: the chart is now published to
+  `oci://ghcr.io/bo0tzz/charts/pgmqtt` by `.github/workflows/chart-release.yml`
+  on every `vX.Y.Z` tag push. There is no HTTP-hosted chart repo;
+  `helm install pgmqtt oci://ghcr.io/bo0tzz/charts/pgmqtt --version X.Y.Z`
+  is the supported install path. README + docs/TODO.md updated.
+- **CI helm pin**: `azure/setup-helm@v4` was pinned to v3.16.1 (Sep 2024)
+  in the `helm-lint` and `smoke` jobs; both now pin `version: latest`,
+  matching the new `chart-release.yml` workflow.
+- **Container base**: `Dockerfile` now uses
+  `gcr.io/distroless/static-debian13:nonroot` (was `debian12:nonroot`).
+  Pure rebase to the current distroless major; no library surface change.
+- **go.mod hygiene**: `prometheus/client_model` was listed as
+  `// indirect` even though `internal/metrics` imports its `dto`
+  subpackage directly; promoted to a direct require. Added a comment
+  next to the `gorilla/websocket` pseudo-version explaining why we
+  keep it (k8s.io/* v0.36 pulls a post-v1.5.3 commit transitively;
+  downgrading to v1.5.3 would rewind shared resolution).
+
+No production code paths changed in this round; `go test ./...` and
+`go test ./... -race` are green, and `govulncheck ./...` reports no
+known vulnerabilities at the current resolution.
+
 ### Fixed — broker correctness
 
 - Migration **0011** fixes an off-by-one introduced by migration 0010's
