@@ -4,10 +4,16 @@ go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0
+	// gorilla/websocket: pseudo-version is intentional. The latest tagged
+	// release is v1.5.3, but `k8s.io/*` v0.36 transitively pulls this newer
+	// post-v1.5.3 commit (March 2025). Downgrading to v1.5.3 here would
+	// rewind the resolved version for k8s deps too. Re-pin to a tag once
+	// the gorilla/websocket project cuts v1.5.4 (or later).
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	golang.org/x/crypto v0.50.0
@@ -72,7 +78,6 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
