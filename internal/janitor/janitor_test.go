@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -204,6 +205,203 @@ func TestJanitorInboundQoS2Sweep(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("row %d: got %v want %v", i, got[i], want[i])
 		}
+	}
+}
+
+// TestJanitorConcurrentFireDueWillsExactlyOnce seeds a single session whose
+// will_fire_at is in the past, then calls fireDueWills from N goroutines
+// simultaneously. The SELECT … FOR UPDATE SKIP LOCKED gate plus the
+// publish-then-clear-will-columns sequence inside one tx must serialise
+// such that exactly one publish is emitted and the WillsFiredTotal counter
+// increments exactly once.
+func TestJanitorConcurrentFireDueWillsExactlyOnce(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	// Subscribe so we can count delivered will messages on the wire.
+	observer := pod.Connect(t, "obs-conc-will")
+	defer observer.Close()
+	observer.Subscribe(t, "lwt/conc/+", 1)
+
+	// Seed a session row with a will whose fire-at is already in the past.
+	// connected=false so the session isn't expected to be alive on this Pod;
+	// fireDueWills uses SKIP LOCKED on the will_fire_at predicate, not on
+	// the connected flag.
+	if _, err := mh.Pool.Exec(context.Background(), `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start,
+		    will_topic, will_payload, will_qos, will_retain,
+		    will_fire_at)
+		VALUES ($1, NULL, false, 5, false, 'lwt/conc/x', $2, 1, false,
+		    now() - interval '1 second')
+	`, "conc-willer", []byte("payload-conc")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	mtx := metrics.New()
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetMetrics(mtx)
+
+	// Fire fireDueWills from N goroutines concurrently. Use a start barrier
+	// so the threads release together, maximising the contention window.
+	const n = 4
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := jt.FireDueWillsForTest(context.Background()); err != nil {
+				t.Errorf("fireDueWills: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Assert: messages table holds exactly one row for this topic.
+	var msgCount int
+	if err := mh.Pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM messages WHERE topic='lwt/conc/x'`).Scan(&msgCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if msgCount != 1 {
+		t.Errorf("messages for will: got %d, want 1", msgCount)
+	}
+
+	// Assert: the WillsFiredTotal counter incremented exactly once.
+	var pb dto.Metric
+	if err := mtx.WillsFiredTotal.Write(&pb); err != nil {
+		t.Fatalf("read WillsFiredTotal: %v", err)
+	}
+	if got := pb.GetCounter().GetValue(); got != 1 {
+		t.Errorf("WillsFiredTotal: got %g, want 1", got)
+	}
+
+	// Assert: the session row's will_* columns are cleared.
+	var willTopic *string
+	if err := mh.Pool.QueryRow(context.Background(),
+		`SELECT will_topic FROM sessions WHERE client_id='conc-willer'`).Scan(&willTopic); err != nil {
+		t.Fatalf("query session: %v", err)
+	}
+	if willTopic != nil {
+		t.Errorf("will_topic not cleared: %v", *willTopic)
+	}
+
+	// Drain the observer (one PUBLISH expected) so the engine doesn't
+	// stall on per-conn outbound flow at test shutdown.
+	pk := observer.Read(t, 3*time.Second)
+	if pk.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected publish, got %d", pk.FixedHeader.Type)
+	}
+	if pk.TopicName != "lwt/conc/x" || string(pk.Payload) != "payload-conc" {
+		t.Errorf("got %q/%q", pk.TopicName, pk.Payload)
+	}
+}
+
+// TestJanitorConcurrentHandleDeadBrokerLockExclusive seeds a sessions row
+// pointing at a fabricated broker UUID and calls handleDeadBroker from N
+// goroutines. The pg_try_advisory_lock(per-broker key) must serialise such
+// that exactly one caller observes claimed=true; concurrent callers see
+// claimed=false. The metric DeadBrokersTotal increments exactly once.
+func TestJanitorConcurrentHandleDeadBrokerLockExclusive(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	// Insert a session pointing at a fabricated broker UUID — no real
+	// listener holds the per-broker advisory lock for this UUID, so
+	// pg_try_advisory_lock will succeed for whichever caller wins the
+	// race.
+	deadBroker := uuid.New()
+	if _, err := mh.Pool.Exec(context.Background(), `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start,
+		    will_topic, will_payload, will_qos, will_retain)
+		VALUES ($1, $2, true, 5, false, 'lwt/dead/conc', $3, 1, false)
+	`, "ghost-conc", deadBroker, []byte("ghost-conc-died")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	mtx := metrics.New()
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetMetrics(mtx)
+
+	const n = 4
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	var (
+		mu       sync.Mutex
+		claimedN int
+		errN     int
+	)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			claimed, err := jt.HandleDeadBrokerForTest(context.Background(), deadBroker)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errN++
+				t.Errorf("handleDeadBroker: %v", err)
+				return
+			}
+			if claimed {
+				claimedN++
+				// Caller-side metric increment is what Tick() does after
+				// a successful claim; mirror it here so we can assert on
+				// the metric end-to-end.
+				mtx.DeadBrokersTotal.Inc()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if errN != 0 {
+		t.Fatalf("got %d handleDeadBroker errors", errN)
+	}
+	if claimedN != 1 {
+		t.Errorf("claimed count: got %d, want 1", claimedN)
+	}
+
+	var pb dto.Metric
+	if err := mtx.DeadBrokersTotal.Write(&pb); err != nil {
+		t.Fatalf("read DeadBrokersTotal: %v", err)
+	}
+	if got := pb.GetCounter().GetValue(); got != 1 {
+		t.Errorf("DeadBrokersTotal: got %g, want 1", got)
+	}
+
+	// Sessions row's broker_id must be NULL (cleared by the winning
+	// claimant exactly once).
+	var brokerID *uuid.UUID
+	if err := mh.Pool.QueryRow(context.Background(),
+		`SELECT broker_id FROM sessions WHERE client_id='ghost-conc'`).Scan(&brokerID); err != nil {
+		t.Fatalf("query session: %v", err)
+	}
+	if brokerID != nil {
+		t.Errorf("broker_id not cleared: %v", brokerID)
 	}
 }
 
