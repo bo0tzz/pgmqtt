@@ -142,22 +142,25 @@ func (j *Janitor) tickWithRecover(ctx context.Context) (err error) {
 // is timed and any error is counted on the per-job metrics, so an operator
 // can alert on a specific job degrading without parsing logs.
 func (j *Janitor) Tick(ctx context.Context) error {
-	var dead []uuid.UUID
+	var candidates []uuid.UUID
 	if err := j.timed("find_dead_brokers", func() error {
 		var err error
-		dead, err = j.findDeadBrokers(ctx)
+		candidates, err = j.findDeadBrokerCandidates(ctx)
 		return err
 	}); err != nil {
 		return err
 	}
-	for _, id := range dead {
+	for _, id := range candidates {
+		var claimed bool
 		if err := j.timed("handle_dead_broker", func() error {
-			return j.handleDeadBroker(ctx, id)
+			var err error
+			claimed, err = j.handleDeadBroker(ctx, id)
+			return err
 		}); err != nil {
 			j.logger.Warn("dead broker handling", "broker", id, "err", err)
 			continue
 		}
-		if j.metrics != nil {
+		if claimed && j.metrics != nil {
 			j.metrics.DeadBrokersTotal.Inc()
 		}
 	}
@@ -447,10 +450,11 @@ func (j *Janitor) sweepInboundQoS2(ctx context.Context) error {
 	return nil
 }
 
-// findDeadBrokers selects every distinct broker_id currently referenced in
-// sessions and tries pg_try_advisory_lock per id. A successful try means the
-// owning Pod is gone.
-func (j *Janitor) findDeadBrokers(ctx context.Context) ([]uuid.UUID, error) {
+// findDeadBrokerCandidates returns every distinct broker_id currently
+// referenced in sessions. The caller filters to actually-dead ones via
+// pg_try_advisory_lock on a single acquired conn (so lock+unlock land on
+// the same Postgres session).
+func (j *Janitor) findDeadBrokerCandidates(ctx context.Context) ([]uuid.UUID, error) {
 	rows, err := j.pool.Query(ctx,
 		`SELECT DISTINCT broker_id FROM sessions WHERE broker_id IS NOT NULL`)
 	if err != nil {
@@ -465,46 +469,48 @@ func (j *Janitor) findDeadBrokers(ctx context.Context) ([]uuid.UUID, error) {
 		}
 		candidates = append(candidates, id)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	var dead []uuid.UUID
-	for _, id := range candidates {
-		var got bool
-		err := j.pool.QueryRow(ctx,
-			`SELECT pg_try_advisory_lock(hashtextextended($1, 0))`,
-			"pgmqtt:broker:"+id.String()).Scan(&got)
-		if err != nil {
-			j.logger.Warn("try lock", "broker", id, "err", err)
-			continue
-		}
-		if got {
-			dead = append(dead, id)
-		}
-	}
-	return dead, nil
+	return candidates, rows.Err()
 }
 
-// handleDeadBroker fires wills for sessions owned by a dead broker, clears
-// ownership, and releases the temporarily-held advisory lock.
-func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) error {
+// handleDeadBroker tries to claim a per-broker advisory lock and, if
+// successful, fires wills + clears ownership for sessions owned by that
+// broker. Lock acquisition + work + unlock all run on a single acquired
+// conn so the unlock lands on the same Postgres session that holds the
+// lock — going through pool.Exec for both lets pgxpool route them to
+// different conns and the unlock becomes a no-op.
+//
+// Returns true if we claimed the broker (caller increments the metric);
+// false if another pod beat us to it.
+func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (claimed bool, err error) {
+	conn, err := j.pool.Acquire(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Release()
+
+	lockKey := "pgmqtt:broker:" + brokerID.String()
+	var got bool
+	if err := conn.QueryRow(ctx,
+		`SELECT pg_try_advisory_lock(hashtextextended($1, 0))`, lockKey).Scan(&got); err != nil {
+		return false, err
+	}
+	if !got {
+		return false, nil
+	}
 	defer func() {
-		_, _ = j.pool.Exec(ctx,
-			`SELECT pg_advisory_unlock(hashtextextended($1, 0))`,
-			"pgmqtt:broker:"+brokerID.String())
+		_, _ = conn.Exec(ctx,
+			`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey)
 	}()
 
-	rows, err := j.pool.Query(ctx, `
+	rows, err := conn.Query(ctx, `
 		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties
 		  FROM sessions
 		 WHERE broker_id = $1
 		   AND will_topic IS NOT NULL
 	`, brokerID)
 	if err != nil {
-		return err
+		return true, err
 	}
-	defer rows.Close()
 	type will struct {
 		client  string
 		topic   string
@@ -517,12 +523,14 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) erro
 	for rows.Next() {
 		var w will
 		if err := rows.Scan(&w.client, &w.topic, &w.payload, &w.qos, &w.retain, &w.props); err != nil {
-			return err
+			rows.Close()
+			return true, err
 		}
 		wills = append(wills, w)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		rows.Close()
+		return true, err
 	}
 	rows.Close()
 
@@ -532,12 +540,12 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) erro
 		}
 	}
 
-	_, err = j.pool.Exec(ctx,
+	_, err = conn.Exec(ctx,
 		`UPDATE sessions SET connected=false, broker_id=NULL,
 		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
 		    will_retain=NULL, will_delay=NULL, will_properties=NULL
 		 WHERE broker_id=$1`, brokerID)
-	return err
+	return true, err
 }
 
 // sweepOrphanMessages deletes messages with no referencing deliveries that are
