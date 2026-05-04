@@ -93,28 +93,34 @@ spec:
               value: {{ .Values.listeners.tcp.port | quote }}
             - name: PGMQTT_SERVICE_WS_PORT
               value: {{ .Values.listeners.ws.port | quote }}
+            # Numeric env values pipe through `int` before quote because helm
+            # / sprig render large integers (≥ 16M-ish) in Go's %v scientific
+            # notation ("1.6777216e+07"), which the broker's strconv.Atoi
+            # rejects. `int` forces decimal-integer rendering. Smaller knobs
+            # (bcryptCost, replicaCount) don't trip the format threshold but
+            # are cast for consistency.
             - name: PGMQTT_RECEIVE_MAXIMUM
-              value: {{ .Values.v5.receiveMaximum | quote }}
+              value: {{ int .Values.v5.receiveMaximum | quote }}
             - name: PGMQTT_KEEPALIVE_MAX_SEC
-              value: {{ .Values.v5.keepaliveMaxSec | quote }}
+              value: {{ int .Values.v5.keepaliveMaxSec | quote }}
             - name: PGMQTT_BCRYPT_COST
-              value: {{ .Values.operator.bcryptCost | quote }}
+              value: {{ int .Values.operator.bcryptCost | quote }}
             - name: PGMQTT_JANITOR_INTERVAL_MS
-              value: {{ .Values.janitor.intervalMs | quote }}
+              value: {{ int .Values.janitor.intervalMs | quote }}
             - name: PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT
-              value: {{ .Values.limits.maxQueuedDeliveriesPerClient | quote }}
+              value: {{ int .Values.limits.maxQueuedDeliveriesPerClient | quote }}
             - name: PGMQTT_MAX_CONNECTIONS
-              value: {{ .Values.limits.maxConnections | quote }}
+              value: {{ int .Values.limits.maxConnections | quote }}
             - name: PGMQTT_MAX_INBOUND_MSGS_PER_SEC
-              value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
+              value: {{ int .Values.limits.maxInboundMsgsPerSec | quote }}
             - name: PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC
-              value: {{ .Values.limits.maxConnectsPerIPPerSec | quote }}
+              value: {{ int .Values.limits.maxConnectsPerIPPerSec | quote }}
             - name: PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN
-              value: {{ .Values.limits.maxAuthFailuresPerIPPerMin | quote }}
+              value: {{ int .Values.limits.maxAuthFailuresPerIPPerMin | quote }}
             - name: PGMQTT_MAX_PACKET_SIZE
-              value: {{ .Values.limits.maxPacketSize | quote }}
+              value: {{ int .Values.limits.maxPacketSize | quote }}
             - name: PGMQTT_PG_STATEMENT_TIMEOUT_MS
-              value: {{ .Values.database.statementTimeoutMs | quote }}
+              value: {{ int .Values.database.statementTimeoutMs | quote }}
             - name: PGMQTT_LOG_FORMAT
               value: {{ .Values.logging.format | quote }}
             {{- if .Values.auth.allowAnonymous }}

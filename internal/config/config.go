@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -228,8 +229,14 @@ func splitTrimmed(s, sep string) []string {
 
 func getenvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
-		var n int
-		_, err := fmt.Sscanf(v, "%d", &n)
+		// strconv.Atoi is strict: "1.6777216e+07" → error, "16777216" → ok.
+		// fmt.Sscanf("%d") was previously used here but it accepts a leading
+		// integer prefix and silently discards the rest, which let
+		// helm-rendered scientific-notation values like "1.6777216e+07" be
+		// silently truncated to 1. This bit production: a broker pod ran
+		// with MaxPacketSize=1 (one byte) and rejected every PUBLISH as
+		// "packet too large".
+		n, err := strconv.Atoi(v)
 		if err == nil {
 			return n
 		}
