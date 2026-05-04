@@ -43,8 +43,8 @@ type Conn struct {
 	willQoS         byte
 	willRetain      bool
 	willProps       []byte // jsonb-serialised v5 will properties
-	willDelay       *int32 // v5 WillDelayInterval (seconds); nil for v3.1.1
-	sessionExpiry   *int32 // v5 SessionExpiryInterval (seconds); nil = "no value sent"
+	willDelay     *uint32 // v5 WillDelayInterval (seconds); nil for v3.1.1
+	sessionExpiry *uint32 // v5 SessionExpiryInterval (seconds); nil = "absent property" (≡ 0 per spec)
 	maxPacketSize   uint32 // v5 MaximumPacketSize the client will accept; 0 = no limit
 	receiveMaximum  uint16 // v5 ReceiveMaximum the client will accept; 65535 if unset
 	inflight        chan struct{} // token-bucket; capacity = receiveMaximum
@@ -667,7 +667,7 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		switch c.protocol {
 		case mqttwire.ProtocolMQTT5:
 			delay := c.willDelay
-			if expiry := c.sessionExpiry; expiry != nil && (delay == nil || int64(*expiry) < int64(*delay)) {
+			if expiry := c.sessionExpiry; expiry != nil && (delay == nil || *expiry < *delay) {
 				delay = expiry
 			}
 			if delay == nil || *delay == 0 {
@@ -690,8 +690,11 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	case mqttwire.ProtocolMQTT5:
 		if c.sessionExpiry == nil || *c.sessionExpiry == 0 {
 			deleteSession = true
-		} else if *c.sessionExpiry != math.MaxInt32 && *c.sessionExpiry != -1 {
-			t := time.Now().Add(time.Duration(*c.sessionExpiry) * time.Second)
+		} else if *c.sessionExpiry != math.MaxUint32 {
+			// 0xFFFFFFFF = "session never expires" per [MQTT-3.1.2.11.2].
+			// Any other value: persist with absolute expiry. Going through
+			// uint64 keeps time.Duration math safe even for large values.
+			t := time.Now().Add(time.Duration(uint64(*c.sessionExpiry)) * time.Second)
 			persistExpiresAt = &t
 		}
 	}
@@ -768,7 +771,7 @@ func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) e
 	// Per spec, the server treats the packet as invalid if the original
 	// CONNECT had SessionExpiryInterval=0 and DISCONNECT supplies non-zero.
 	if c.protocol == mqttwire.ProtocolMQTT5 && pk.Properties.SessionExpiryIntervalFlag {
-		v := int32(pk.Properties.SessionExpiryInterval)
+		v := pk.Properties.SessionExpiryInterval
 		invalidIncrease := c.sessionExpiry != nil && *c.sessionExpiry == 0 && v != 0
 		if !invalidIncrease {
 			c.sessionExpiry = &v

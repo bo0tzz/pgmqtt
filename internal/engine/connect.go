@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -106,14 +107,21 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			if err == nil && string(b) != "{}" && string(b) != "null" {
 				c.willProps = b
 			}
-			d := int32(pk.Connect.WillProperties.WillDelayInterval)
+			d := pk.Connect.WillProperties.WillDelayInterval
 			c.willDelay = &d
 		}
 	}
 	// SessionExpiryInterval / ReceiveMaximum / MaximumPacketSize / TopicAliasMaximum (v5).
 	if pv == mqttwire.ProtocolMQTT5 {
-		v := int32(pk.Properties.SessionExpiryInterval)
-		c.sessionExpiry = &v
+		// Only set sessionExpiry when the property was actually present
+		// in the CONNECT — nil distinguishes "client said nothing" (which
+		// the spec defines as 0) from "client said 0 explicitly," which
+		// matters for the DISCONNECT increase-from-0 invalid-flag check
+		// in handleGracefulDisconnect.
+		if pk.Properties.SessionExpiryIntervalFlag {
+			v := pk.Properties.SessionExpiryInterval
+			c.sessionExpiry = &v
+		}
 		c.maxPacketSize = pk.Properties.MaximumPacketSize
 		c.receiveMaximum = pk.Properties.ReceiveMaximum
 		c.topicAliasMaximumOut = pk.Properties.TopicAliasMaximum
@@ -360,7 +368,11 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 func defaultExpiryFor(pk *packets.Packet) *int32 {
 	if pk.ProtocolVersion == mqttwire.ProtocolMQTT5 {
 		// v5 SessionExpiryInterval; 0 = no persistence beyond network connection.
-		v := int32(pk.Properties.SessionExpiryInterval)
+		// Spec field is uint32. The DB column expiry_interval is INT (int32);
+		// values > MaxInt32 are absurd in practice (~68 years) so clamp to
+		// MaxInt32. The in-memory sessionExpiry preserves the full uint32
+		// range — this just bounds what we persist for record-keeping.
+		v := clampUint32ToInt32(pk.Properties.SessionExpiryInterval)
 		return &v
 	}
 	if pk.Connect.Clean {
@@ -377,8 +389,19 @@ func willDelaySeconds(pk *packets.Packet) *int32 {
 	if !pk.Connect.WillFlag {
 		return nil
 	}
-	v := int32(pk.Connect.WillProperties.WillDelayInterval)
+	v := clampUint32ToInt32(pk.Connect.WillProperties.WillDelayInterval)
 	return &v
+}
+
+// clampUint32ToInt32 clamps a uint32 to [0, MaxInt32] for storage in an
+// INT column. Any value above MaxInt32 (~68 years in seconds) becomes
+// MaxInt32 — for the SessionExpiryInterval / WillDelayInterval use case
+// this is functionally equivalent to "indefinite" anyway.
+func clampUint32ToInt32(v uint32) int32 {
+	if v > uint32(math.MaxInt32) {
+		return math.MaxInt32
+	}
+	return int32(v)
 }
 
 func nullStr(s string) any {

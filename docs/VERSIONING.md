@@ -8,10 +8,43 @@ across three surfaces, treated as a single product version:
    semantics).
 3. The Postgres schema, defined as a sequence of versioned migrations
    in `internal/db/migrations/` (currently `0001_init.sql` through
-   `0005_quota.sql`).
+   `0009_drop_next_packet_id.sql`).
 
 The Helm chart version tracks the same `MAJOR.MINOR.PATCH` and is bumped
 in lockstep with the broker.
+
+## Migration policy: rolling-deploy safety
+
+Postgres migrations apply unconditionally on broker startup. During a
+rolling Deployment update there is a window — typically seconds, but
+unbounded in degenerate cases — where one Pod runs the new binary
+(having applied any pending migrations) while N-1 Pods still run the
+old binary. **Any migration that removes a column, function, or table
+that the old binary still references will produce error spam from the
+old Pods until they finish rolling.**
+
+Mitigation: split removal-style schema changes across two releases.
+
+1. Release N: stop the broker code from depending on the soon-to-be-
+   removed schema item (e.g. drop the call to a SQL function in
+   favour of an in-memory implementation, or stop reading a column).
+   Keep the schema item itself.
+2. Release N+1: remove the schema item with a migration. By the time
+   this lands, no live broker pod is using it.
+
+A new `### Migration` callout in `CHANGELOG.md` should accompany any
+release that removes schema; explain the prior release that dropped
+the dependency. If a single release must do both (rare; usually only
+acceptable when no production user is on the prior version yet),
+flag it in the CHANGELOG and warn operators to scale the broker
+deployment to 1 replica before the upgrade.
+
+This policy is recorded after migration `0009` dropped
+`sessions.next_packet_id` + the `mqtt_next_packet_id()` SQL function
+in the same release that converted the broker to in-memory packet-id
+allocation. The change was safe because nothing was in production at
+that point, but the rolling-deploy error window was visible during
+internal soak rebuilds.
 
 ## What bumps which segment
 

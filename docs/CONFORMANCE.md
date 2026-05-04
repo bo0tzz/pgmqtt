@@ -93,6 +93,45 @@ v1 plan (ACLs).
 as a pass when timing favours it. 2 fails on documented out-of-scope
 features (shared subs, ACLs).
 
+## v5 spec areas not exercised by the Paho suite
+
+The Paho v5 conformance suite covers ~70% of the protocol surface
+practically used by MQTT clients in the wild. A spec walk-through
+identified these areas where pgmqtt's behaviour is conformant by
+*omission* rather than by passing a test:
+
+- **Enhanced authentication (3.15, 4.12).** AUTH packets and the
+  `AuthenticationMethod` / `AuthenticationData` properties are not
+  supported. CONNECT with `AuthenticationMethod` set is rejected with
+  CONNACK 0x8C (Bad authentication method); a stray AUTH packet
+  mid-connection elicits DISCONNECT 0x82 (Protocol error). Both are
+  spec-compliant rejections — the broker just doesn't advertise any
+  enhanced-auth method and so doesn't have to implement the protocol
+  flow.
+- **ResponseInformation (3.1.2.11.7 / 3.2.2.3.15).** The server is
+  permitted ("MAY") to return a ResponseInformation property in
+  CONNACK when the client sets `RequestResponseInformation=1`. We
+  return nothing — also compliant by MAY-omission. Useful for
+  brokers that publish a topic prefix for request/response patterns;
+  pgmqtt has no opinion on request/response topic conventions.
+- **`SessionExpiryInterval=0xFFFFFFFF` (3.1.2.11.2).** Honoured as
+  "session never expires." Internally stored as `*uint32`. Values in
+  the `[0x80000000, 0xFFFFFFFE]` range are also handled correctly
+  (previously a `*int32` cast made them appear negative); the
+  `expiry_interval` column on `sessions` clamps to `MaxInt32` for
+  storage but the in-memory authoritative value preserves the full
+  uint32 range.
+- **Will-publish MessageExpiryInterval after delay.** When a delayed
+  will fires (`WillDelayInterval > 0`, fired by janitor at
+  `will_fire_at`), the published message gets its full
+  `MessageExpiryInterval` from the firing point — i.e. the
+  delay-window time is *not* subtracted. Per spec 3.3.2.3.3 this is
+  defensible: the will message wasn't "waiting" during the delay, it
+  hadn't been published yet. Brokers that treat the will as
+  "received at CONNECT and held" would subtract; pgmqtt treats it as
+  "published when the delay elapses." Documented here so test riggers
+  and conformance-suite authors know which side we're on.
+
 ## Local kind smoke
 
 ```bash
