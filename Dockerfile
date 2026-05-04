@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -o /out/pgmqttd ./cmd/pgmqttd
 
 # Distroless static for a tiny attack surface.
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/pgmqttd /pgmqttd
 USER nonroot:nonroot
 EXPOSE 1883 8083
