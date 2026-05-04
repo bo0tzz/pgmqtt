@@ -74,8 +74,6 @@ def main() -> int:
             # Paho upstream `waitfor` typo (subscriber callback vs. publisher
             # callback) — documented in docs/CONFORMANCE.md.
             "test_request_response,test_subscribe_options,"
-            # session_expiry race; tracked as #143.
-            "test_session_expiry,"
             # Out-of-scope per docs/PLAN.md (no ACLs, no shared subs).
             "test_subscribe_failure,test_shared_subscriptions"
         ),
