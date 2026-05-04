@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/mochi-mqtt/server/v2/packets"
 
@@ -33,6 +34,13 @@ type Conn struct {
 
 	clientID string
 	protocol byte
+
+	// sessionToken is set by takeOwnership and used by handleDisconnect to
+	// scope its session-DELETE. Each takeOwnership rotates it via
+	// gen_random_uuid(); a stale disconnect whose handleDisconnect runs
+	// after a peer takeover will see 0 rows match and roll back rather
+	// than wipe the new conn's row. See migration 0012.
+	sessionToken uuid.UUID
 
 	writeMu sync.Mutex
 
@@ -744,18 +752,33 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		// migration 0006 to eliminate MultiXact SLRU thrash). Clean
 		// them explicitly in the same tx as the session DELETE so a
 		// fresh client_id reconnect can't see prior-incarnation rows.
+		//
+		// Token-scope the session DELETE so a peer takeover that
+		// rotated session_token (migration 0012) doesn't get its row
+		// wiped here. If the DELETE matches 0 rows, the row was
+		// already replaced by a takeover; rollback the deliveries
+		// delete too so the new conn's deliveries survive.
 		tx, err := c.eng.pool.BeginTx(bgCtx, pgx.TxOptions{})
 		if err != nil {
 			c.eng.logger.Warn("begin clean session", "client", c.clientID, "err", err)
 			return
 		}
 		defer tx.Rollback(bgCtx)
-		if _, err := tx.Exec(bgCtx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
-			c.eng.logger.Warn("delete clean session deliveries", "client", c.clientID, "err", err)
+		ct, err := tx.Exec(bgCtx,
+			`DELETE FROM sessions WHERE client_id=$1 AND session_token=$2`,
+			c.clientID, c.sessionToken)
+		if err != nil {
+			c.eng.logger.Warn("delete clean session", "client", c.clientID, "err", err)
 			return
 		}
-		if _, err := tx.Exec(bgCtx, `DELETE FROM sessions WHERE client_id=$1`, c.clientID); err != nil {
-			c.eng.logger.Warn("delete clean session", "client", c.clientID, "err", err)
+		if ct.RowsAffected() == 0 {
+			// Takeover landed first — the row in PG belongs to a
+			// peer Conn now. Leave it (and its deliveries) alone.
+			c.eng.logger.Debug("clean session skipped: takeover detected", "client", c.clientID)
+			return
+		}
+		if _, err := tx.Exec(bgCtx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
+			c.eng.logger.Warn("delete clean session deliveries", "client", c.clientID, "err", err)
 			return
 		}
 		if err := tx.Commit(bgCtx); err != nil {

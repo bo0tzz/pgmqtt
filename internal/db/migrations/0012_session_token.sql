@@ -1,0 +1,25 @@
+-- Add per-conn session_token to scope handleDisconnect's session-DELETE
+-- so a takeover-then-stale-disconnect can't wipe the new conn's row.
+--
+-- The race (#143): same-pod takeover where Conn A takes a session_id,
+-- then the client disconnects (handleDisconnect kicks off in A's
+-- read-goroutine). Before A's session-DELETE tx commits, the same client
+-- reconnects and Conn B's takeOwnership UPDATEs the row. Existing
+-- semantics: A's later DELETE FROM sessions WHERE client_id=$1 wipes
+-- B's session row. Test_session_expiry from Paho v5 surfaces this:
+-- second connect with cleanstart=false and SessionExpiryInterval=0
+-- intermittently reports sessionPresent=True (the row B just upserted).
+--
+-- Fix: every takeOwnership rotates the session_token; handleDisconnect's
+-- DELETE guards on the token captured at A's takeOwnership time. If B
+-- rotated it, the DELETE matches 0 rows and rolls back. B's session
+-- preserved.
+--
+-- Existing rows get a fresh token via the DEFAULT on column add. New
+-- rows get one via the same default. takeOwnership emits an explicit
+-- session_token=gen_random_uuid() in INSERT/UPDATE so the value rotates
+-- on every CONNECT, even if the row already existed.
+--
+-- gen_random_uuid() is built into PG13+; PG18 is our minimum.
+
+ALTER TABLE sessions ADD COLUMN session_token UUID NOT NULL DEFAULT gen_random_uuid();

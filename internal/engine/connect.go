@@ -309,6 +309,11 @@ func authReasonLabel(reason byte) string {
 
 // takeOwnership performs the CONNECT take-over upsert. Returns the previous
 // broker_id (uuid.Nil if first session) and whether this is a brand-new row.
+//
+// Every takeOwnership rotates the row's session_token so a peer's stale
+// handleDisconnect can guard its DELETE on the token captured at takeover
+// time and roll back instead of wiping the new conn's row. Token is stored
+// on Conn.sessionToken for handleDisconnect to read later.
 func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroker uuid.UUID, newSession bool, err error) {
 	self := c.eng.BrokerID()
 	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -341,8 +346,9 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 		willPayload = c.willPayload
 	}
 
+	var newToken uuid.UUID
 	if existed {
-		_, err = tx.Exec(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE sessions SET
 				broker_id=$2,
 				connected=true,
@@ -355,26 +361,30 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 				will_retain=$9,
 				will_delay=$10,
 				will_properties=$11,
+				session_token=gen_random_uuid(),
 				last_seen=now()
 			WHERE client_id=$1
+			RETURNING session_token
 		`,
 			c.clientID, self, c.protocol, c.cleanStart, expiry,
 			nullStr(c.willTopic), willPayload, nullByte(c.willQoS, c.willTopic != ""),
 			nullBool(c.willRetain, c.willTopic != ""), willDelaySeconds(pk),
 			nullJSON(c.willProps),
-		)
+		).Scan(&newToken)
 	} else {
-		_, err = tx.Exec(ctx, `
+		err = tx.QueryRow(ctx, `
 			INSERT INTO sessions
 			    (client_id, broker_id, connected, protocol_version, clean_start, expiry_interval,
-			     will_topic, will_payload, will_qos, will_retain, will_delay, will_properties)
-			VALUES ($1, $2, true, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			     will_topic, will_payload, will_qos, will_retain, will_delay, will_properties,
+			     session_token)
+			VALUES ($1, $2, true, $3, $4, $5, $6, $7, $8, $9, $10, $11, gen_random_uuid())
+			RETURNING session_token
 		`,
 			c.clientID, self, c.protocol, c.cleanStart, expiry,
 			nullStr(c.willTopic), willPayload, nullByte(c.willQoS, c.willTopic != ""),
 			nullBool(c.willRetain, c.willTopic != ""), willDelaySeconds(pk),
 			nullJSON(c.willProps),
-		)
+		).Scan(&newToken)
 	}
 	if err != nil {
 		return uuid.Nil, false, err
@@ -382,6 +392,7 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, false, err
 	}
+	c.sessionToken = newToken
 	return prevBroker, !existed, nil
 }
 
