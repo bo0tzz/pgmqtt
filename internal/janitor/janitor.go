@@ -63,11 +63,14 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 		pool:   pool,
 		eng:    eng,
 		logger: logger,
-		// 1s default. Time-bound operations (will-delay, session-expire,
-		// retained-expire) all key off this. The dead-broker advisory-lock
-		// scan rides along; it's a handful of point queries against an
-		// already-indexed `broker_id` column, so 1s is fine.
-		interval:         1 * time.Second,
+		// 5s default. Time-bound operations (will-delay, session-expire,
+		// retained-expire) tolerate up to 5s of trigger latency — the MQTT
+		// 5 spec measures these in seconds and a few seconds of overshoot
+		// is well within real-world SLOs. Lower values (down to 1s) trade
+		// idle DB churn for tighter precision: at 1s × 11 jobs × N pods
+		// the cluster does 11×N queries/sec at zero traffic. Override via
+		// PGMQTT_JANITOR_INTERVAL_MS or Janitor.SetInterval.
+		interval:         5 * time.Second,
 		orphanGrace:      10 * time.Minute,
 		inboundQoS2Grace: 1 * time.Hour,
 	}

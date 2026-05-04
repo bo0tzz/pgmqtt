@@ -115,6 +115,14 @@ type Config struct {
 	// /mqtt endpoint, set a comma-separated list of allowed Origin values
 	// (exact match, no globbing).
 	WSAllowedOrigins []string
+
+	// JanitorInterval is how often this Pod's janitor runs the per-tick
+	// suite (find-dead-brokers, fire-due-wills, expire-sessions, expire-
+	// retained, sweep-orphans, refresh-gauges). Default 5s. Lower values
+	// trade idle DB churn for tighter precision on time-bound ops: at
+	// N pods × 11 jobs/tick × 1Hz, a leaderless cluster does 11N queries/
+	// sec at zero traffic. 0 leaves the janitor's own default (5s).
+	JanitorInterval time.Duration
 }
 
 func FromEnv() (*Config, error) {
@@ -142,6 +150,7 @@ func FromEnv() (*Config, error) {
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
 		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
 		WSAllowedOrigins:             splitTrimmed(os.Getenv("PGMQTT_WS_ALLOWED_ORIGINS"), ","),
+		JanitorInterval:              time.Duration(getenvInt("PGMQTT_JANITOR_INTERVAL_MS", 5000)) * time.Millisecond,
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

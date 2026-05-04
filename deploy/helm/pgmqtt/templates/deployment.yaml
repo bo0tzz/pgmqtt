@@ -99,6 +99,8 @@ spec:
               value: {{ .Values.v5.keepaliveMaxSec | quote }}
             - name: PGMQTT_BCRYPT_COST
               value: {{ .Values.operator.bcryptCost | quote }}
+            - name: PGMQTT_JANITOR_INTERVAL_MS
+              value: {{ .Values.janitor.intervalMs | quote }}
             - name: PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT
               value: {{ .Values.limits.maxQueuedDeliveriesPerClient | quote }}
             - name: PGMQTT_MAX_CONNECTIONS

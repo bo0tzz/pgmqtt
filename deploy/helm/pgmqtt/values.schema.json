@@ -361,6 +361,13 @@
         "bcryptCost": { "type": "integer", "minimum": 4, "maximum": 31 }
       }
     },
+    "janitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "intervalMs": { "type": "integer", "minimum": 0 }
+      }
+    },
     "v5": {
       "type": "object",
       "additionalProperties": false,
