@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,11 +23,11 @@ func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
 func newTestLimiter(t *testing.T, connectsPerSec, authFailuresPerMin int) (*ipLimiter, *fakeClock) {
 	t.Helper()
 	clk := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	l := newIPLimiter(ctx, connectsPerSec, authFailuresPerMin)
+	// Build via the no-GC constructor so tests can mutate nowFunc /
+	// gcIdle without racing the production sweep goroutine. Tests drive
+	// gcOnce directly when they need eviction.
+	l := newIPLimiterNoGC(connectsPerSec, authFailuresPerMin)
 	l.nowFunc = clk.Now
-	// Tighten GC for tests so a single Advance + gcOnce reproduces eviction.
 	l.gcIdle = 100 * time.Millisecond
 	l.gcInterval = 10 * time.Millisecond
 	return l, clk

@@ -77,7 +77,20 @@ const (
 //
 // The caller passes a context that, when cancelled, stops the GC sweep.
 func newIPLimiter(ctx context.Context, connectsPerSec, authFailuresPerMin int) *ipLimiter {
-	l := &ipLimiter{
+	l := newIPLimiterNoGC(connectsPerSec, authFailuresPerMin)
+	if l.disabled() {
+		return l
+	}
+	go l.gcLoop(ctx)
+	return l
+}
+
+// newIPLimiterNoGC builds a limiter without starting the GC goroutine.
+// Test-only — production callers go through newIPLimiter so the sweep
+// runs. Splitting the constructor lets tests mutate nowFunc / gcIdle /
+// gcInterval without racing the sweep goroutine that production starts.
+func newIPLimiterNoGC(connectsPerSec, authFailuresPerMin int) *ipLimiter {
+	return &ipLimiter{
 		connectsPerSec:     connectsPerSec,
 		authFailuresPerMin: authFailuresPerMin,
 		penaltyDuration:    defaultPenaltyDuration,
@@ -85,11 +98,6 @@ func newIPLimiter(ctx context.Context, connectsPerSec, authFailuresPerMin int) *
 		gcInterval:         defaultGCInterval,
 		nowFunc:            time.Now,
 	}
-	if l.disabled() {
-		return l
-	}
-	go l.gcLoop(ctx)
-	return l
 }
 
 func (l *ipLimiter) disabled() bool {
