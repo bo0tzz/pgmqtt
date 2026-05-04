@@ -354,3 +354,10 @@ limits:
   maxQueuedDeliveriesPerClient: 10000
   maxConnections: 5000
   maxInboundMsgsPerSec: 1000
+  ## Post-CONNECT cap on inbound MQTT packet size (bytes). The codec
+  ## hardcodes a 1 MiB cap before CONNECT to bound DoS allocations from
+  ## unauthenticated peers; once CONNECT lands the cap is lifted to this
+  ## value. 0 disables the post-CONNECT cap (codec falls back to 256 MiB,
+  ## the protocol's variable-byte-integer max). Default 16 MiB suits
+  ## typical IoT/telemetry payloads with headroom for v5 properties.
+  maxPacketSize: 16777216

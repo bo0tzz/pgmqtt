@@ -526,6 +526,43 @@ func TestSlowSubscriberQuotaExceeded(t *testing.T) {
 	}
 }
 
+// TestPreConnectPacketSizeCapped verifies the broker hard-closes a
+// connection whose first framed packet declares a remaining length above
+// the codec's pre-CONNECT 1 MiB cap. Allocation must NOT happen for the
+// announced size — that's the DoS the cap exists to prevent.
+func TestPreConnectPacketSizeCapped(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	d, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer d.Close()
+
+	// CONNECT-shaped fixed header with remaining length = 2 MiB. The
+	// broker should reject before reading the body and hard-close.
+	frame := []byte{
+		0x10,                   // CONNECT, flags 0
+		0x80, 0x80, 0x80, 0x01, // remaining length = 2 MiB
+	}
+	if _, err := d.Write(frame); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Expect the broker to close the socket — read returns EOF (or other
+	// network err) without any CONNACK bytes coming back.
+	if err := d.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	buf := make([]byte, 4)
+	n, err := d.Read(buf)
+	if err == nil && n > 0 {
+		t.Fatalf("expected hard-close after oversize CONNECT, got % x", buf[:n])
+	}
+	// io.EOF or any net err is acceptable — the contract is "no CONNACK,
+	// socket closed".
+}
+
 // TestConnectWithAuthenticationMethodRejected verifies that a v5 CONNECT
 // with AuthenticationMethod set is rejected with CONNACK 0x8C (Bad
 // authentication method). pgmqtt does not advertise an enhanced-auth

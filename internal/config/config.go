@@ -63,6 +63,14 @@ type Config struct {
 	// 0x96 (Message Rate Too High). 0 disables the limit.
 	MaxInboundMsgsPerSec int
 
+	// MaxPacketSize is the post-CONNECT cap on the inbound packet size
+	// (bytes). The codec applies a hardcoded 1 MiB cap before CONNECT to
+	// bound DoS allocations from unauthenticated peers; once CONNECT lands
+	// the cap is raised to min(client_max_packet_size_v5, MaxPacketSize).
+	// 0 means "no override" — the codec falls back to the absolute upper
+	// bound (256 MiB) which is rarely what operators want. Default 16 MiB.
+	MaxPacketSize int
+
 	// MetricsAddr is the bind address for the Prometheus /metrics endpoint.
 	// Empty disables metrics serving entirely.
 	MetricsAddr string
@@ -102,6 +110,7 @@ func FromEnv() (*Config, error) {
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
 		MaxConnections:               getenvInt("PGMQTT_MAX_CONNECTIONS", 5000),
 		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
+		MaxPacketSize:                getenvInt("PGMQTT_MAX_PACKET_SIZE", 16*1024*1024),
 		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
 		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
@@ -120,6 +129,9 @@ func FromEnv() (*Config, error) {
 	}
 	if c.PGStatementTimeout < 0 {
 		return nil, fmt.Errorf("PGMQTT_PG_STATEMENT_TIMEOUT_MS must be >= 0")
+	}
+	if c.MaxPacketSize < 0 || c.MaxPacketSize > 268435455 {
+		return nil, fmt.Errorf("PGMQTT_MAX_PACKET_SIZE must be in [0, 268435455]")
 	}
 	switch c.LogFormat {
 	case "text", "json":

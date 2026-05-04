@@ -135,6 +135,16 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	c.inflight = make(chan struct{}, c.receiveMaximum)
 	c.drainKick = make(chan struct{}, 1)
 
+	// Lift the codec's pre-CONNECT 1 MiB inbound size cap to the configured
+	// server policy (PGMQTT_MAX_PACKET_SIZE; default 16 MiB). 0 leaves the
+	// codec's PreConnectMaxPacketSize cap in place. The client's CONNECT
+	// MaximumPacketSize property only governs what WE send TO them
+	// (handled in c.write), not what we accept from them; the inbound cap
+	// is purely server policy.
+	if cap := c.eng.maxPacketSize(); cap > 0 {
+		c.reader.SetMaxPacketSize(uint32(cap))
+	}
+
 	// Take ownership in a single transaction.
 	prevBroker, newSession, err := c.takeOwnership(ctx, pk)
 	if err != nil {
