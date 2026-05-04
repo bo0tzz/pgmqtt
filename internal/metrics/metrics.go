@@ -142,6 +142,16 @@ type Metrics struct {
 	//                       about to os.Exit(1) so the kubelet replaces
 	//                       it. Alert: any non-zero increment.
 	ListenerRestartsTotal *prometheus.CounterVec
+
+	// DrainSessionQueueTotal counts invocations of drainSessionQueue —
+	// the bulk re-send of state 0/1/2 deliveries to a resumed session
+	// after CONNACK. Labelled by reason so a soak operator can confirm
+	// "drain calls are bounded by reconnect rate" rather than firing
+	// spuriously from another path. Today's only call site is the
+	// CONNECT handler (reason=reconnect); the label exists so future
+	// drain triggers (NOTIFY-driven re-scan, SUBSCRIBE-driven retained
+	// fanout) can be distinguished without a metric rename.
+	DrainSessionQueueTotal *prometheus.CounterVec
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -281,7 +291,18 @@ func New() *Metrics {
 				"ctx_cancel (parent context cancelled mid-loop), " +
 				"exhausted_retries (reconnect failed N times; Pod exiting for kubelet replacement).",
 		}, []string{"reason"}),
+		DrainSessionQueueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_drain_session_queue_total",
+			Help: "drainSessionQueue invocations on this Pod, labelled by reason. " +
+				"Reasons: reconnect (CONNECT with cleanStart=false; resume queued/inflight " +
+				"deliveries for the returning session). " +
+				"Bounded by the reconnect rate; sustained spikes here indicate flapping clients.",
+		}, []string{"reason"}),
 	}
+
+	// Pre-create label series at zero so /metrics surfaces them before any
+	// traffic — cold-start visibility for dashboards and alerts.
+	m.DrainSessionQueueTotal.WithLabelValues("reconnect")
 
 	reg.MustRegister(
 		m.Connections,
@@ -311,6 +332,7 @@ func New() *Metrics {
 		m.OutboundInflightSaturation,
 		m.ConnectionsCapacityRatio,
 		m.ListenerRestartsTotal,
+		m.DrainSessionQueueTotal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

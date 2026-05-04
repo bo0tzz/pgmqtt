@@ -149,6 +149,59 @@ These are infrastructure responsibilities, by design:
   Postgres-role level (`pgmqtt` role gets only the privileges the
   broker actually needs; no `SUPERUSER`).
 
+## Operator RBAC trade-off
+
+The pgmqtt operator's ClusterRole grants
+`get/list/watch/create/update/patch` on `secrets` cluster-wide. This is
+deliberate and operators should understand the implication before
+deploying.
+
+**What's permitted.** The broker Pod's ServiceAccount can read and
+write any Secret in any namespace on the cluster — not just Secrets in
+its own namespace.
+
+**Why we accept it.** The whole point of the User CR is that operators
+put them anywhere they want — per-app, per-team, per-tenant. A User CR
+in namespace `team-alpha` causes the operator to create a
+`<name>-mqtt-credentials` Secret in `team-alpha` so the team's apps
+can mount it. Restricting Secret RBAC to the operator's own namespace
+would silently break every cross-namespace User reconcile: the
+operator would log an authorization error and the Secret would never
+appear next to the workload that needs it.
+
+**Threat.** A compromised `pgmqttd` container — RCE in the MQTT
+parser, malicious image swap, supply-chain compromise — can exfiltrate
+every Secret cluster-wide. That includes `kube-system` ServiceAccount
+tokens, CNPG superuser credentials, sealed-secrets controller
+outputs, TLS bundles, container-registry pull secrets, and anything
+else the cluster stores as a Secret. The broker has no business
+reading any of these, but the API permission grant doesn't
+distinguish.
+
+**Mitigations.** Pick the ones appropriate to your threat model:
+
+1. **Dedicated namespace + NetworkPolicy egress denylist.** Deploy
+   pgmqtt in its own namespace and apply a NetworkPolicy that allows
+   egress only to (a) the Kubernetes API server, (b) the Postgres
+   service, (c) any TLS terminator in front. Blocks data exfiltration
+   to attacker-controlled endpoints even if the Secret read succeeds.
+2. **Projected ServiceAccount tokens with short audience+expiration.**
+   Mount the operator's API credential as a projected token (audience
+   bound to `kubernetes.default.svc`, expirationSeconds ≈ 3600) rather
+   than the legacy long-lived Secret-backed token. Limits the blast
+   radius of a leaked token to one hour.
+3. **Per-namespace Roles for single-namespace deployments.** If you
+   genuinely run all User CRs in one namespace (the operator's), fork
+   the chart's RBAC template to use a `Role` + `RoleBinding` instead
+   of `ClusterRole` + `ClusterRoleBinding`. This is *not* the default
+   because it breaks the documented multi-tenant pattern, but it's a
+   reasonable hardening choice for a homelab where every User lives
+   alongside the broker.
+
+We don't ship option 3 by default because the silent-failure mode for
+cross-namespace Users is the worse outcome: a User CR sits Pending
+forever with no visible error in the namespace the operator owns.
+
 ## Reporting a vulnerability
 
 This is a personal/homelab-grade project. Email the maintainer

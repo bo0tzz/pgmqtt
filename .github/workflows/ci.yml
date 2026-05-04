@@ -25,6 +25,18 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: govulncheck
+        # Pinned to @latest deliberately. Unlike build-time tooling where
+        # reproducibility matters, a vulnerability scanner is *more* useful
+        # the newer it is — each release ships a larger known-vuln database
+        # and improved call-graph analysis. Pinning would mean missing
+        # disclosures published after the pinned tag. Currently locally
+        # clean (~10s); if a new disclosure lands in a transitive dep this
+        # turns red and blocks the PR until we bump or document.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
       - name: go test
         run: go test ./... -count=1 -timeout 5m
 
