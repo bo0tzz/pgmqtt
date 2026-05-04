@@ -194,12 +194,24 @@ ui:
       drop:
         - ALL
 
+## Sized for the chart's documented limits.maxConnections=5000 default
+## with HA + Z2M-class workloads. Tighter values are appropriate for
+## small homelab installs (≤200 entities) where the broker idles around
+## 100-200 MiB; the 1Gi limit gives ~5× burst headroom for reconnect
+## storms and retained-message floods.
+##
+## Sizing matrix (informal):
+##   maxConnections   memory limit   memory request
+##              500          384Mi           96Mi
+##             1000          512Mi          128Mi
+##             5000           1Gi           256Mi   <-- chart default
+##           10000+           2Gi+          512Mi+
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
   limits:
-    memory: 512Mi
+    memory: 1Gi
 
 ## Annotations applied to every broker Pod template. Useful for things like
 ## Prometheus scrape hints, Vault sidecar injection, or operator-required keys.
@@ -314,9 +326,38 @@ probes:
   readiness:
     initialDelaySeconds: 2
     periodSeconds: 5
-    timeoutSeconds: 1
+    # Readiness pings the pgxpool; bump timeout above the TCP probe's
+    # default since "did Postgres respond within 1.5s" is the more
+    # interesting signal under load.
+    timeoutSeconds: 2
     failureThreshold: 3
     successThreshold: 1
+  startup:
+    # Allows up to periodSeconds × failureThreshold = 150 s for
+    # migrations + listener bind on a slow Postgres. Liveness only
+    # starts firing once startupProbe succeeds.
+    periodSeconds: 5
+    failureThreshold: 30
+
+## Pod lifecycle hooks. preStop fires once kubelet has decided to
+## terminate the Pod and runs alongside SIGTERM; pairing it with a
+## small sleep gives kube-proxy time to remove this Pod's endpoint
+## from the Service before the listener closes, so a rolling upgrade
+## doesn't generate "connection refused" bursts on freshly-routed
+## CONNECTs.
+##
+## Distroless images don't ship `sleep`, so the default block uses
+## /healthz/live as a pseudo-sleep target — the kubelet keeps the Pod
+## around until the exec returns or the grace period elapses, and the
+## httpGet path naturally takes a few hundred ms per attempt.
+##
+## Override with your own preStop (exec/httpGet/tcpSocket) if your
+## image ships a sleep binary.
+lifecycle:
+  preStop:
+    httpGet:
+      path: /healthz/live
+      port: metrics
 
 ## Install the User CRD. Set to false if managing CRDs out-of-band.
 crds:

@@ -343,6 +343,24 @@
             "failureThreshold": { "type": "integer", "minimum": 1 },
             "successThreshold": { "type": "integer", "minimum": 1 }
           }
+        },
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "failureThreshold": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "preStop": {
+          "type": "object",
+          "additionalProperties": true
         }
       }
     },

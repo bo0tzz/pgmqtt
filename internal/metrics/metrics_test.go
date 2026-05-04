@@ -117,7 +117,7 @@ func TestServeBindsAndShutsDown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- m.Serve(ctx, addr) }()
+	go func() { errCh <- m.Serve(ctx, addr, nil) }()
 
 	// Poll briefly for the server to bind.
 	deadline := time.Now().Add(2 * time.Second)

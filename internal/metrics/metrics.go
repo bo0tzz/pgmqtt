@@ -425,11 +425,46 @@ func (d *dedupeGatherer) Gather() ([]*dto.MetricFamily, error) {
 	return out, nil
 }
 
+// Pinger is the minimal pgxpool surface needed to drive a readiness
+// probe. *pgxpool.Pool satisfies it without explicit declaration.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
 // Serve starts an HTTP server on addr with /metrics handled. Blocks until
 // ctx is cancelled. Logs are intentionally minimal — the caller wraps.
-func (m *Metrics) Serve(ctx context.Context, addr string) error {
+//
+// If pool is non-nil, /healthz/ready also pings the pool with a tight
+// timeout: the K8s readinessProbe wired to this endpoint flips the Pod
+// out of the Service when Postgres is unreachable, so traffic shifts to
+// healthy peers instead of stalling on a dead listener that still
+// accepts TCP.
+func (m *Metrics) Serve(ctx context.Context, addr string, pool Pinger) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
+	mux.HandleFunc("/healthz/live", func(w http.ResponseWriter, _ *http.Request) {
+		// Liveness only fails when the process is broken in a way K8s
+		// should restart through. We're alive iff the goroutine
+		// answering this request runs. Don't fail liveness on PG blips
+		// — there's nowhere to fail to.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/healthz/ready", func(w http.ResponseWriter, r *http.Request) {
+		if pool == nil {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(r.Context(), 1500*time.Millisecond)
+		defer cancel()
+		if err := pool.Ping(probeCtx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("postgres unavailable"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,

@@ -104,7 +104,7 @@ func main() {
 		go func() {
 			defer recoverPanic(logger, "metrics serve")
 			logger.Info("metrics listening", "addr", cfg.MetricsAddr)
-			if err := mtx.Serve(ctx, cfg.MetricsAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := mtx.Serve(ctx, cfg.MetricsAddr, pool); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Warn("metrics serve", "err", err)
 			}
 		}()

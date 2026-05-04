@@ -153,6 +153,46 @@ spec:
               protocol: TCP
             {{- end }}
           {{- if .Values.probes.enabled }}
+          {{- if .Values.metrics.enabled }}
+          # Liveness on /healthz/live: ALWAYS-OK while the process can
+          # answer HTTP. Don't fail liveness on PG outages — restarting
+          # would only churn replicas while peers are equally affected.
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+            successThreshold: {{ .Values.probes.liveness.successThreshold | default 1 }}
+          # Readiness on /healthz/ready: pings the pgxpool with a tight
+          # timeout. A wedged Postgres flips this Pod out of the
+          # Service, so traffic shifts to peers instead of stalling on
+          # a TCP listener that can still accept CONNECTs but can't
+          # actually authenticate or fan out.
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: metrics
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+            successThreshold: {{ .Values.probes.readiness.successThreshold | default 1 }}
+          # Startup on TCP socket: gives migrations + listener bind
+          # time on a slow PG (locks held by a previous broker pod) so
+          # liveness can't mass-restart during cold start.
+          startupProbe:
+            tcpSocket:
+              port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+          {{- else }}
+          # Metrics endpoint disabled — fall back to TCP socket probes.
+          # Note: liveness/readiness can't distinguish "PG wedged" from
+          # "broker healthy" without the HTTP endpoint; enable
+          # metrics.enabled for proper liveness semantics.
           livenessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
@@ -169,6 +209,22 @@ spec:
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
             successThreshold: {{ .Values.probes.readiness.successThreshold | default 1 }}
+          {{- end }}
+          # preStop: a tiny sleep gives kube-proxy time to remove this
+          # Pod's endpoint from the Service before our listener closes,
+          # so a rolling upgrade doesn't generate "connection refused"
+          # bursts on freshly-routed CONNECTs. Distroless ships no
+          # `sleep` binary; use the metrics endpoint as a no-op block
+          # via a wget-on-localhost approach is not portable either,
+          # so we use the kubelet's exec-with-sleep semantics. This
+          # will only work if your image has /bin/sleep — distroless
+          # does NOT ship it. For distroless, use a TCP-blocked sleep
+          # or set `lifecycle.preStop` to your own form.
+          {{- if .Values.lifecycle.preStop }}
+          lifecycle:
+            preStop:
+              {{- toYaml .Values.lifecycle.preStop | nindent 14 }}
+          {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
