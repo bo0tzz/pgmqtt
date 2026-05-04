@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — broker correctness
+
+- Migration **0011** fixes an off-by-one introduced by migration 0010's
+  publish-cap short-circuit. The `EXISTS (... OFFSET p_max_queued LIMIT 1)`
+  formulation evaluates `over_cap` as `depth >= p_max_queued + 1`, one row
+  too lenient relative to the original migration-0005 semantics
+  (`depth >= p_max_queued`). Concretely: with cap=N and N rows already
+  queued, the broker should DISCONNECT 0x97 the slow subscriber on the
+  next overflowing publish — instead it silently accepted one more row
+  before tripping. `OFFSET (p_max_queued - 1) LIMIT 1` restores the
+  intended `>= cap` boundary. The existing
+  `engine_test.go::TestSlowSubscriberQuotaExceeded` regression test
+  catches this exactly.
+
 ## [0.1.1] - 2026-05-04
 
 ### Changed — broker correctness
