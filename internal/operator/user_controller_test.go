@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1193,6 +1194,127 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 	}
 	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
 		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestUserReconcileLeaseHandoffPasswordRace exercises the lease-handoff
+// race where two managers both think they hold the operator Lease and
+// both reconcile the same User CR concurrently. The dangerous interleave:
+//
+//	t0 A.Get(secret) → NotFound; A generates password_A
+//	t0 B.Get(secret) → NotFound; B generates password_B
+//	t1 A bcrypt(A) → DB.UPSERT
+//	t2 B bcrypt(B) → DB.UPSERT          (DB now has bcrypt(B))
+//	t3 B Create(secret) with B          (Secret has B)
+//	t4 A's CreateOrUpdate retries: Get sees B → MutateFn overwrites with A
+//	    → final Secret has A
+//	   final state: Secret=A, DB=bcrypt(B). Auth fails forever.
+//
+// The fix re-orders Reconcile so each manager runs Secret CreateOrUpdate
+// FIRST (with a MutateFn that preserves any pre-existing data["password"]
+// rather than always overwriting), then re-Gets the merged Secret to read
+// the password that won the K8s API race, and finally bcrypts THAT before
+// writing PG. The post-condition is the system invariant:
+//
+//	bcrypt(secret.Data["password"]) verifies against the DB password_hash.
+//
+// We drive two reconciles in sequence: R_A goes first and creates the
+// Secret. We then simulate "peer manager B reached the K8s API faster
+// than R_A's view" by directly mutating the Secret's data["password"]
+// to a fresh value via the underlying client, then clear the User CR's
+// observed-secret-hash to force R_A through the non-short-circuit path.
+// R_A's next Reconcile must:
+//   - preserve the peer-set password (NOT overwrite with a fresh random),
+//   - re-Get to observe that password,
+//   - bcrypt THAT password into PG.
+//
+// The assertion checks the invariant holds after each reconcile, which
+// would have been violated by the OLD bcrypt-then-CreateOrUpdate ordering.
+func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "ha", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).
+		WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	// First pass adds the finalizer; second pass provisions the Secret + DB.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	assertSecretMatchesDB(t, cli, pool, "mqtt", "ha-mqtt-credentials", "ha")
+
+	// Simulate peer manager B writing a different password into the
+	// Secret during the lease-handoff window — modelling B's
+	// CreateOrUpdate landing AFTER R_A's previous CreateOrUpdate but
+	// BEFORE R_A's next reconcile sees the system. R_A must adopt the
+	// peer's value (NOT overwrite it with a fresh random) and bcrypt
+	// it into the DB so Secret and PG converge.
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	sec.Data["password"] = []byte("PEER-WROTE-LAST")
+	if err := cli.Update(context.Background(), &sec); err != nil {
+		t.Fatalf("simulate peer write: %v", err)
+	}
+	// Bypass the ObservedSecretHash short-circuit so reconcile re-runs
+	// the bcrypt+PG path.
+	var u pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha"}, &u); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	u.Status.ObservedSecretHash = ""
+	u.Status.CredentialsSecretRef = nil
+	if err := cli.Status().Update(context.Background(), &u); err != nil {
+		t.Fatalf("clear status: %v", err)
+	}
+
+	// R_A reconciles after the peer-write. With the fix's MutateFn
+	// preserving existing passwords, the peer's value must persist;
+	// without the re-Get-then-bcrypt ordering, the DB hash could lag
+	// behind. The post-condition is the invariant.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
+		t.Fatalf("reconcile post-peer-write: %v", err)
+	}
+	assertSecretMatchesDB(t, cli, pool, "mqtt", "ha-mqtt-credentials", "ha")
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret post-reconcile: %v", err)
+	}
+	if string(sec.Data["password"]) != "PEER-WROTE-LAST" {
+		t.Errorf("peer-set password was overwritten: got %q, want %q",
+			sec.Data["password"], "PEER-WROTE-LAST")
+	}
+}
+
+// assertSecretMatchesDB asserts the User's PG password_hash bcrypt-verifies
+// against the credentials Secret's data["password"]. This is the system
+// invariant the lease-handoff fix protects.
+func assertSecretMatchesDB(t *testing.T, cli client.Client, pool *pgxpool.Pool, namespace, secretName, username string) {
+	t.Helper()
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: secretName}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username=$1`, username).Scan(&hash); err != nil {
+		t.Fatalf("query users: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), sec.Data["password"]); err != nil {
+		t.Errorf("invariant violated: bcrypt(secret.password) does not verify DB hash: %v\n  secret.password=%q\n  hash=%q",
+			err, sec.Data["password"], hash)
 	}
 }
 
