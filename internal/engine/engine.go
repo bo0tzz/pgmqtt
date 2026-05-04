@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -178,10 +179,111 @@ func (e *Engine) Serve(ctx context.Context) error {
 		go e.serveWS(ctx, ln)
 	}
 
+	e.wg.Add(1)
+	go e.runOwnershipSweep(ctx)
+
 	// Block on context, then drain.
 	<-ctx.Done()
 	e.shutdownGracefully()
 	e.wg.Wait()
+	return nil
+}
+
+// runOwnershipSweep periodically reconciles the local conns map against
+// `sessions.broker_id` to close any sockets we still hold for client_ids
+// that the database now attributes to a different broker.
+//
+// Why: the takeover NOTIFY (`pgmqtt_takeover_<broker_id>`) is fire-and-
+// forget and only delivers to currently-LISTENing peers. A new CONNECT
+// for a client_id can flip `sessions.broker_id` on this pod's row while
+// this pod is briefly partitioned from Postgres-NOTIFY (or its listener
+// goroutine has gone, e.g. mid-recovery from the listener's connection
+// being torn down). Until the prior socket's TCP keepalive trips
+// (~25 s) we'd otherwise still accept PUBLISHes from the orphaned
+// socket, which would then fan out and surface as duplicate-from-the-
+// new-session traffic.
+//
+// The sweep is best-effort: snapshot the local conns map, ask PG who
+// owns each client_id, and `Shutdown()` any whose `broker_id` is no
+// longer us. Idempotent against in-flight CONNECTs (registerConn is
+// guarded by connsMu so we won't see partial state). Cheap — a single
+// `WHERE client_id = ANY($1)` query every 5s.
+func (e *Engine) runOwnershipSweep(ctx context.Context) {
+	defer e.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Error("ownership sweep panic",
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.shutdown:
+			return
+		case <-t.C:
+			if err := e.sweepOrphanedSockets(ctx); err != nil {
+				e.logger.Warn("ownership sweep", "err", err)
+			}
+		}
+	}
+}
+
+func (e *Engine) sweepOrphanedSockets(ctx context.Context) error {
+	self := e.BrokerID()
+	if self == uuid.Nil {
+		// Listener hasn't assigned us a broker UUID yet; can't compare
+		// ownership. Skip — once SetBrokerID lands the next tick handles it.
+		return nil
+	}
+	e.connsMu.RLock()
+	clientIDs := make([]string, 0, len(e.conns))
+	for id := range e.conns {
+		clientIDs = append(clientIDs, id)
+	}
+	e.connsMu.RUnlock()
+	if len(clientIDs) == 0 {
+		return nil
+	}
+	rows, err := e.pool.Query(ctx, `
+		SELECT client_id, broker_id
+		  FROM sessions
+		 WHERE client_id = ANY($1)
+		   AND broker_id IS NOT NULL
+		   AND broker_id != $2
+	`, clientIDs, self)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type orphan struct {
+		clientID string
+		owner    uuid.UUID
+	}
+	var orphans []orphan
+	for rows.Next() {
+		var cid string
+		var bid uuid.UUID
+		if err := rows.Scan(&cid, &bid); err != nil {
+			return err
+		}
+		orphans = append(orphans, orphan{clientID: cid, owner: bid})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, o := range orphans {
+		c, ok := e.ConnFor(o.clientID)
+		if !ok {
+			continue
+		}
+		e.logger.Info("orphaned socket: closing (sessions.broker_id != self)",
+			"client", o.clientID, "owner", o.owner, "self", self)
+		c.Shutdown()
+	}
 	return nil
 }
 
