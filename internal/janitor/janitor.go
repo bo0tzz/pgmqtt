@@ -529,7 +529,7 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 		 WHERE connected = false
 		   AND session_expires_at IS NOT NULL
 		   AND session_expires_at <= now()
-		 FOR UPDATE SKIP LOCKED
+		 FOR UPDATE
 	`)
 	if err != nil {
 		return err
