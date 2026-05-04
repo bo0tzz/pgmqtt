@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 )
@@ -170,6 +171,8 @@ func getenvInt(key string, def int) int {
 		if err == nil {
 			return n
 		}
+		slog.Warn("config: failed to parse env var as int — using default",
+			"key", key, "value", v, "default", def, "err", err)
 	}
 	return def
 }

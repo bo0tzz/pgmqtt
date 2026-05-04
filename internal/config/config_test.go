@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,4 +117,31 @@ func TestFromEnvLogFormat(t *testing.T) {
 			t.Fatal("expected error for PGMQTT_LOG_FORMAT=yaml")
 		}
 	})
+}
+
+// TestGetenvIntWarnsOnBadValue asserts a malformed integer env var falls
+// back to the default AND emits a Warn log line naming the key + value,
+// so the operator can spot the typo instead of silently getting defaults.
+func TestGetenvIntWarnsOnBadValue(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+	t.Setenv("PGMQTT_MAX_CONNECTIONS", "foobar")
+	c, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.MaxConnections != 5000 {
+		t.Errorf("MaxConnections: got %d want default 5000", c.MaxConnections)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "PGMQTT_MAX_CONNECTIONS") {
+		t.Errorf("expected key in log; got: %q", logged)
+	}
+	if !strings.Contains(logged, "foobar") {
+		t.Errorf("expected offending value in log; got: %q", logged)
+	}
 }
