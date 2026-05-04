@@ -2,12 +2,15 @@ package operator_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1193,6 +1196,268 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 	}
 	if !hasReadyCondition(got, metav1.ConditionFalse, "SecretError") {
 		t.Errorf("expected Ready=False with reason SecretError, got conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestUserReconcileLeaseHandoffPasswordRace exercises the lease-handoff
+// race where two managers both think they hold the operator Lease and
+// both reconcile the same User CR concurrently. The dangerous interleave:
+//
+//	t0 A.Get(secret) → NotFound; A generates password_A
+//	t0 B.Get(secret) → NotFound; B generates password_B
+//	t1 A bcrypt(A) → DB.UPSERT
+//	t2 B bcrypt(B) → DB.UPSERT          (DB now has bcrypt(B))
+//	t3 B Create(secret) with B          (Secret has B)
+//	t4 A's CreateOrUpdate retries: Get sees B → MutateFn overwrites with A
+//	    → final Secret has A
+//	   final state: Secret=A, DB=bcrypt(B). Auth fails forever.
+//
+// The fix re-orders Reconcile so each manager runs Secret CreateOrUpdate
+// FIRST (with a MutateFn that preserves any pre-existing data["password"]
+// rather than always overwriting), then re-Gets the merged Secret to read
+// the password that won the K8s API race, and finally bcrypts THAT before
+// writing PG. The post-condition is the system invariant:
+//
+//	bcrypt(secret.Data["password"]) verifies against the DB password_hash.
+//
+// We drive two reconciles in sequence: R_A goes first and creates the
+// Secret. We then simulate "peer manager B reached the K8s API faster
+// than R_A's view" by directly mutating the Secret's data["password"]
+// to a fresh value via the underlying client, then clear the User CR's
+// observed-secret-hash to force R_A through the non-short-circuit path.
+// R_A's next Reconcile must:
+//   - preserve the peer-set password (NOT overwrite with a fresh random),
+//   - re-Get to observe that password,
+//   - bcrypt THAT password into PG.
+//
+// The assertion checks the invariant holds after each reconcile, which
+// would have been violated by the OLD bcrypt-then-CreateOrUpdate ordering.
+func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "ha", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).
+		WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	// First pass adds the finalizer; second pass provisions the Secret + DB.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	assertSecretMatchesDB(t, cli, pool, "mqtt", "ha-mqtt-credentials", "ha")
+
+	// Simulate peer manager B writing a different password into the
+	// Secret during the lease-handoff window — modelling B's
+	// CreateOrUpdate landing AFTER R_A's previous CreateOrUpdate but
+	// BEFORE R_A's next reconcile sees the system. R_A must adopt the
+	// peer's value (NOT overwrite it with a fresh random) and bcrypt
+	// it into the DB so Secret and PG converge.
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	sec.Data["password"] = []byte("PEER-WROTE-LAST")
+	if err := cli.Update(context.Background(), &sec); err != nil {
+		t.Fatalf("simulate peer write: %v", err)
+	}
+	// Bypass the ObservedSecretHash short-circuit so reconcile re-runs
+	// the bcrypt+PG path.
+	var u pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha"}, &u); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	u.Status.ObservedSecretHash = ""
+	u.Status.CredentialsSecretRef = nil
+	if err := cli.Status().Update(context.Background(), &u); err != nil {
+		t.Fatalf("clear status: %v", err)
+	}
+
+	// R_A reconciles after the peer-write. With the fix's MutateFn
+	// preserving existing passwords, the peer's value must persist;
+	// without the re-Get-then-bcrypt ordering, the DB hash could lag
+	// behind. The post-condition is the invariant.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
+		t.Fatalf("reconcile post-peer-write: %v", err)
+	}
+	assertSecretMatchesDB(t, cli, pool, "mqtt", "ha-mqtt-credentials", "ha")
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret post-reconcile: %v", err)
+	}
+	if string(sec.Data["password"]) != "PEER-WROTE-LAST" {
+		t.Errorf("peer-set password was overwritten: got %q, want %q",
+			sec.Data["password"], "PEER-WROTE-LAST")
+	}
+}
+
+// assertSecretMatchesDB asserts the User's PG password_hash bcrypt-verifies
+// against the credentials Secret's data["password"]. This is the system
+// invariant the lease-handoff fix protects.
+func assertSecretMatchesDB(t *testing.T, cli client.Client, pool *pgxpool.Pool, namespace, secretName, username string) {
+	t.Helper()
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: secretName}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username=$1`, username).Scan(&hash); err != nil {
+		t.Fatalf("query users: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), sec.Data["password"]); err != nil {
+		t.Errorf("invariant violated: bcrypt(secret.password) does not verify DB hash: %v\n  secret.password=%q\n  hash=%q",
+			err, sec.Data["password"], hash)
+	}
+}
+
+// TestRehashOnCostBump verifies the operator re-bcrypts an existing
+// User row when the configured BcryptCost is higher than the cost
+// embedded in the stored hash. Without this, bumping
+// operator.bcryptCost (10 → 14) would leave existing rows on the old
+// cost forever, since the password-cleartext-unchanged short-circuit
+// would fire before any rehash. The metric
+// pgmqtt_user_rehash_total{reason="cost_bump"} fires once per
+// reconcile that rewrites a row for this reason.
+//
+// Setup: seed a User row with a cost-4 hash via direct PG insert
+// (bypassing the reconciler so we can pin the cost). Configure the
+// reconciler with BcryptCost=10 and a credentials Secret already
+// holding the cleartext that produced the cost-4 hash, with the User
+// CR's Status.ObservedSecretHash matching sha256(cleartext) so the
+// short-circuit *would* trigger. Run Reconcile.
+//
+// Expected post-condition: stored hash now has cost prefix "$2a$10$"
+// AND the metric counter for reason="cost_bump" incremented by 1.
+func TestRehashOnCostBump(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+
+	const username = "rehash-target"
+	const cleartext = "static-password"
+
+	// Seed a cost-4 row. bcrypt.MinCost=4 so this is the cheapest
+	// pre-existing hash we can plant; the configured cost of 10 must
+	// trigger a rehash.
+	weak, err := bcrypt.GenerateFromPassword([]byte(cleartext), 4)
+	if err != nil {
+		t.Fatalf("seed bcrypt: %v", err)
+	}
+	if !strings.HasPrefix(string(weak), "$2a$04$") {
+		t.Fatalf("seed cost prefix: %q", weak[:7])
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users(username, password_hash) VALUES($1, $2)`,
+		username, string(weak)); err != nil {
+		t.Fatalf("seed users row: %v", err)
+	}
+
+	// Build the corresponding K8s state: a User CR + auto-gen Secret with
+	// the same cleartext, plus a populated Status that would normally
+	// short-circuit (ObservedSecretHash matches sha256(cleartext)).
+	hashSum := sha256.Sum256([]byte(cleartext))
+	observedHash := hex.EncodeToString(hashSum[:])
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       username,
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Status: pgmqttv1alpha1.UserStatus{
+			ObservedSecretHash:   observedHash,
+			CredentialsSecretRef: &corev1.LocalObjectReference{Name: username + "-mqtt-credentials"},
+		},
+	}
+	credSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      username + "-mqtt-credentials",
+			Namespace: "mqtt",
+		},
+		Data: map[string][]byte{"password": []byte(cleartext)},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, credSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost:  10,
+	}
+
+	before := operator.UserRehashTotalForTest("cost_bump")
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: username}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// Post-condition 1: stored hash now at cost 10.
+	var stored string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !strings.HasPrefix(stored, "$2a$10$") {
+		t.Errorf("expected post-rehash cost 10, got prefix %q", stored[:7])
+	}
+	// The new hash must still verify the same cleartext — we rehashed,
+	// not rotated.
+	if err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(cleartext)); err != nil {
+		t.Errorf("post-rehash bcrypt verify failed: %v", err)
+	}
+
+	// Post-condition 2: cost_bump metric incremented exactly once.
+	after := operator.UserRehashTotalForTest("cost_bump")
+	if after-before != 1 {
+		t.Errorf("cost_bump metric delta: got %v, want 1", after-before)
+	}
+}
+
+// TestRehashCostBumpHonoredAtNoOpReconcile verifies that a no-op reconcile
+// (cleartext unchanged AND stored hash already at configured cost) does
+// NOT increment the cost_bump metric. The short-circuit must fire.
+func TestRehashCostBumpHonoredAtNoOpReconcile(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "noop-user", Namespace: "mqtt"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+		BcryptCost:  6,
+	}
+	// Run twice to settle finalizer + initial provision (rotation +1).
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "noop-user"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	beforeCost := operator.UserRehashTotalForTest("cost_bump")
+	beforeRot := operator.UserRehashTotalForTest("rotation")
+	// Third reconcile is a true no-op.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "noop-user"}}); err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
+	if got := operator.UserRehashTotalForTest("cost_bump") - beforeCost; got != 0 {
+		t.Errorf("cost_bump incremented on no-op reconcile: delta=%v", got)
+	}
+	if got := operator.UserRehashTotalForTest("rotation") - beforeRot; got != 0 {
+		t.Errorf("rotation incremented on no-op reconcile: delta=%v", got)
 	}
 }
 

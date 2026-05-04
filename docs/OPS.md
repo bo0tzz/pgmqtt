@@ -80,6 +80,47 @@ There is no singleton-leader anymore (since the leaderless refactor):
   ```
   Next reconciler in the cluster will recreate it.
 
+## User CRD operations — bcrypt cost rollouts
+
+`PGMQTT_BCRYPT_COST` (or Helm `operator.bcryptCost`) controls the cost
+parameter the operator uses when (re)hashing User passwords. It defaults
+to 10 (`bcrypt.DefaultCost`). Existing User rows store the cost in the
+`$2a$NN$` prefix of their `password_hash` column.
+
+**Bumping cost forces a rehash.** Each User reconcile reads the cost
+embedded in the stored hash; if it is below the configured cost, the
+reconciler re-`bcrypt`s the existing cleartext (no plaintext rotation,
+no Secret update) at the new cost and UPSERTs the row. The metric
+`pgmqtt_user_rehash_total{reason="cost_bump"}` increments once per row
+rewritten for this reason; `reason="rotation"` covers the
+cleartext-changed path (User CR creation, Secret rotation).
+
+**Rehash storm on large fleets.** When operators bump cost from e.g.
+10 → 14, every existing User CR triggers exactly one cost_bump reconcile
+the next time controller-runtime re-syncs. At default Pod CPU, bcrypt
+cost 14 takes ~1 s per row vs. ~70 ms at cost 10. A fleet of 1 000
+Users will saturate the operator's reconcile worker for ~16 minutes. To
+avoid stalling other reconciles or triggering Lease timeouts:
+
+1. **Bump in stages**: 10 → 12 first, watch
+   `pgmqtt_user_rehash_total{reason="cost_bump"}` reach the User CR
+   count, then 12 → 13, then 13 → 14. Each stage roughly halves the
+   bcrypt time per row vs. doing the full bump at once.
+2. **Watch for Lease timeouts** during the rehash — if reconciles take
+   long enough that the operator misses the Lease renewal interval (15 s
+   default), controller-runtime exits the manager and a peer takes
+   over, restarting any in-flight rehash. The metric counter is
+   per-process so the absolute count may double-increment across Pods.
+3. **For very large fleets** (10 000+ Users) consider scripting a
+   manual UPDATE that walks the `users` table out-of-band and rehashes
+   in batches with paced sleeps; the operator-driven rollout is fine
+   for hundreds of Users but not designed for tens of thousands.
+
+There is no rollback path other than dropping cost back and waiting
+for the next reconcile — bcrypt verifies any stored cost regardless of
+the current configured value, so a partially-completed bump still
+authenticates correctly.
+
 ## "Zombie session ownership" — broker_id points at a dead Pod
 
 A session row's `broker_id` is the Pod that currently owns the client.

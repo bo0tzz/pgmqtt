@@ -10,10 +10,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -64,6 +66,30 @@ func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // Reconcile implements controller-runtime.Reconciler.
 //
+// Ordering rationale: Secret reconcile happens BEFORE the bcrypt+PG write.
+// Two managers can both think they hold the operator Lease during the
+// ~15s lease-handoff window (controller-runtime's Lease default duration),
+// and a freshly-created User CR with no pre-existing Secret means both
+// managers will each generate their own random password via rand.Read.
+// If the bcrypt+PG write happens before the Secret CreateOrUpdate, the
+// last DB writer can disagree with the last K8s API writer:
+//
+//	t0  A.Get(secret) → NotFound; A generates password_A
+//	t0  B.Get(secret) → NotFound; B generates password_B
+//	t1  A bcrypt(A) → DB.UPSERT
+//	t2  B bcrypt(B) → DB.UPSERT       (DB now has bcrypt(B))
+//	t3  B Create(secret, B)            (Secret now has B)
+//	t4  A Create(secret, A) → conflict → reload+retry
+//	t5  A's MutateFn overwrites with A → Secret now has A
+//	     final: Secret=A, DB=bcrypt(B) — auth fails forever
+//
+// Reordering the Secret reconcile to come first, *and* having the MutateFn
+// preserve any existing data["password"] rather than always overwriting it,
+// makes the password-that-wins the K8s API race the single source of truth.
+// Both managers then re-Get the merged Secret and feed THAT password into
+// bcrypt before writing PG, so the DB hash always matches the cleartext
+// stored in the Secret regardless of which manager wrote last.
+//
 // +kubebuilder:rbac:groups=pgmqtt.io,resources=users,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgmqtt.io,resources=users/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgmqtt.io,resources=users/finalizers,verbs=update
@@ -103,18 +129,38 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	hash := sha256Hex(password)
-	if user.Status.ObservedSecretHash == hash &&
-		user.Status.CredentialsSecretRef != nil &&
-		user.Status.CredentialsSecretRef.Name == secret.Name {
-		setReady(&user, true, "Reconciled", "")
-		return ctrl.Result{}, r.Status().Update(ctx, &user)
-	}
-
 	cost := r.BcryptCost
 	if cost == 0 {
 		cost = bcrypt.DefaultCost
 	}
+
+	// Decide whether the short-circuit applies. The cleartext-unchanged
+	// branch fires when ObservedSecretHash matches AND the stored bcrypt
+	// row is at-or-above the configured cost. Bumping operator.bcryptCost
+	// must NOT leave existing rows on the old cost forever — see
+	// pgmqtt_user_rehash_total{reason="cost_bump"} for rollout tracking.
+	hash := sha256Hex(password)
+	rehashReason := ""
+	if user.Status.ObservedSecretHash == hash &&
+		user.Status.CredentialsSecretRef != nil &&
+		user.Status.CredentialsSecretRef.Name == secret.Name {
+		// Cleartext is unchanged — still need to verify the stored hash
+		// is at the configured cost. A miss here means an operator bumped
+		// bcryptCost since the last reconcile; we re-bcrypt the same
+		// password at the new cost.
+		storedCost, err := r.storedBcryptCost(ctx, username)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
+		}
+		if storedCost >= cost {
+			setReady(&user, true, "Reconciled", "")
+			return ctrl.Result{}, r.Status().Update(ctx, &user)
+		}
+		rehashReason = "cost_bump"
+	} else {
+		rehashReason = "rotation"
+	}
+
 	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("bcrypt: %w", err)
@@ -128,6 +174,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		_ = r.Status().Update(ctx, &user)
 		return ctrl.Result{}, err
 	}
+	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
 	user.Status.ObservedSecretHash = hash
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
@@ -135,8 +182,35 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Status().Update(ctx, &user); err != nil {
 		return ctrl.Result{}, err
 	}
-	logger.Info("user upserted", "username", username, "secret", secret.Name)
+	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
 	return ctrl.Result{}, nil
+}
+
+// storedBcryptCost returns the cost parameter encoded in the user row's
+// password_hash, or 0 if the row does not exist (caller should treat as
+// "needs initial hash"). Returns -1 only on a DB error so the caller can
+// distinguish "no row" (proceed with rehash branch via the reason path)
+// from "PG unavailable" (return error).
+//
+// The pgx ErrNoRows case is mapped to (0, nil) — the row will be inserted
+// by the upsert below, so a stored cost of 0 reliably falls under any
+// configured cost (which is at least bcrypt.MinCost = 4).
+func (r *UserReconciler) storedBcryptCost(ctx context.Context, username string) (int, error) {
+	var stored string
+	err := r.Pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return -1, err
+	}
+	c, err := bcrypt.Cost([]byte(stored))
+	if err != nil {
+		// Stored hash is unparseable (corrupted or non-bcrypt). Treat as
+		// cost=0 so the rehash branch fires and replaces it.
+		return 0, nil
+	}
+	return c, nil
 }
 
 func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alpha1.User) (ctrl.Result, error) {
@@ -155,8 +229,17 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 }
 
 // resolveCredentialSecret returns the Secret referenced by spec.PasswordSecretRef,
-// or generates a `<name>-mqtt-credentials` Secret in the User's namespace.
+// or reconciles a `<name>-mqtt-credentials` Secret in the User's namespace.
 // Returns the Secret and the raw password value.
+//
+// For the auto-generated case the password-that-wins is determined by the
+// K8s API write race inside CreateOrUpdate, NOT by which manager generated
+// the candidate first. Concretely: the MutateFn preserves any existing
+// data["password"] rather than overwriting it, so the FIRST manager to
+// successfully Create the Secret seeds the password value; subsequent
+// peers re-Get the merged Secret to read whatever password landed. This
+// closes the lease-handoff divergence between Secret-cleartext and
+// PG-bcrypt-hash described on the Reconcile docstring.
 func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmqttv1alpha1.User, username string) (*corev1.Secret, string, error) {
 	if user.Spec.PasswordSecretRef != nil {
 		ref := user.Spec.PasswordSecretRef
@@ -176,24 +259,12 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 	}
 
 	name := user.Name + credentialsSuffix
-	var existing corev1.Secret
-	err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: name}, &existing)
-	if err != nil && !apierrors.IsNotFound(err) {
+
+	// Generate a candidate password. We only use it if the Secret didn't
+	// exist or its data["password"] was empty — see MutateFn below.
+	candidate, err := generatePassword()
+	if err != nil {
 		return nil, "", err
-	}
-	password := ""
-	if err == nil {
-		// Secret already exists — preserve its password but refresh wire details.
-		if pw, ok := existing.Data["password"]; ok {
-			password = string(pw)
-		}
-	}
-	if password == "" {
-		raw := make([]byte, 24)
-		if _, err := rand.Read(raw); err != nil {
-			return nil, "", err
-		}
-		password = base64.RawURLEncoding.EncodeToString(raw)
 	}
 
 	host := r.ServiceHost
@@ -209,16 +280,6 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		wsPort = 8083
 	}
 
-	data := map[string][]byte{
-		"username": []byte(username),
-		"password": []byte(password),
-		"host":     []byte(host),
-		"port":     []byte(fmt.Sprintf("%d", port)),
-		"ws-port":  []byte(fmt.Sprintf("%d", wsPort)),
-		"uri":      []byte(fmt.Sprintf("mqtt://%s:%s@%s:%d", url.PathEscape(username), url.PathEscape(password), host, port)),
-		"ws-uri":   []byte(fmt.Sprintf("ws://%s:%s@%s:%d/mqtt", url.PathEscape(username), url.PathEscape(password), host, wsPort)),
-	}
-
 	desired := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -226,25 +287,59 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		},
 		Type: corev1.SecretTypeOpaque,
 	}
-	if err := controllerutil.SetControllerReference(user, desired, r.Scheme); err != nil {
-		return nil, "", err
-	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
 		desired.Type = corev1.SecretTypeOpaque
 		if desired.Data == nil {
 			desired.Data = map[string][]byte{}
 		}
-		for k, v := range data {
-			desired.Data[k] = v
+		// Preserve any existing password so two concurrent reconciles
+		// during a lease-handoff converge on the same value: whichever
+		// manager Created the Secret first wins, and the loser's
+		// CreateOrUpdate retry sees data["password"] populated and keeps
+		// it instead of forcing its own candidate.
+		password := desired.Data["password"]
+		if len(password) == 0 {
+			password = []byte(candidate)
 		}
+		desired.Data["username"] = []byte(username)
+		desired.Data["password"] = password
+		desired.Data["host"] = []byte(host)
+		desired.Data["port"] = []byte(fmt.Sprintf("%d", port))
+		desired.Data["ws-port"] = []byte(fmt.Sprintf("%d", wsPort))
+		desired.Data["uri"] = []byte(fmt.Sprintf("mqtt://%s:%s@%s:%d",
+			url.PathEscape(username), url.PathEscape(string(password)), host, port))
+		desired.Data["ws-uri"] = []byte(fmt.Sprintf("ws://%s:%s@%s:%d/mqtt",
+			url.PathEscape(username), url.PathEscape(string(password)), host, wsPort))
 		return controllerutil.SetControllerReference(user, desired, r.Scheme)
 	})
 	if err != nil {
 		return nil, "", err
 	}
 	r.Logger.Debug("credentials secret reconciled", "op", op, "name", name)
-	return desired, password, nil
+
+	// Re-Get after the merge so we observe the password that "won" the
+	// CreateOrUpdate race. Without this, a concurrent peer manager could
+	// have written a different password between our MutateFn run and our
+	// caller's bcrypt+PG write — leading to Secret/DB divergence.
+	var resolved corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: name}, &resolved); err != nil {
+		return nil, "", fmt.Errorf("re-get secret %s/%s: %w", user.Namespace, name, err)
+	}
+	pw, ok := resolved.Data["password"]
+	if !ok || len(pw) == 0 {
+		return nil, "", fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name)
+	}
+	return &resolved, string(pw), nil
+}
+
+// generatePassword returns a base64-url-encoded 24-byte random password.
+func generatePassword() (string, error) {
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func sha256Hex(s string) string {
