@@ -327,6 +327,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
+        "useHTTP": { "type": "boolean" },
         "liveness": {
           "type": "object",
           "additionalProperties": false,

@@ -329,6 +329,11 @@ automountServiceAccountToken: true
 ## stall doesn't restart the broker mid-stream.
 probes:
   enabled: true
+  ## When true, liveness/readiness use httpGet against /healthz/{live,ready}
+  ## on the metrics port. /healthz/ready pings the pgxpool with a tight
+  ## timeout, so a wedged Postgres flips this Pod out of the Service. Off
+  ## by default to keep tier3 conformance behaviour predictable.
+  useHTTP: false
   liveness:
     initialDelaySeconds: 5
     periodSeconds: 10
