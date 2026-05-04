@@ -968,21 +968,19 @@ func (c *Conn) handleUnsubscribe(ctx context.Context, pk *packets.Packet) error 
 	return nil
 }
 
-// jsonOrNil returns nil for an empty Properties to avoid storing empty JSONB.
+// propsToJSON returns nil for an empty Properties so we don't store
+// empty JSONB rows. The previous implementation marshalled twice on
+// every PUBLISH carrying any v5 property — once to compare against
+// "{}" (isEmptyProps) and once to actually capture the bytes. We keep
+// the marshal-once form here: store the result, look at it, return
+// nil-or-bytes accordingly.
 func propsToJSON(p packets.Properties) ([]byte, error) {
-	if isEmptyProps(p) {
-		return nil, nil
-	}
-	return json.Marshal(p)
-}
-
-func isEmptyProps(p packets.Properties) bool {
-	// Quick check: marshal+compare is wasteful but adequate for our purposes
-	// since this only fires on packets that *might* carry properties. The
-	// individual struct fields are too numerous to enumerate.
 	b, err := json.Marshal(p)
 	if err != nil {
-		return false
+		return nil, err
 	}
-	return string(b) == `{}` || string(b) == "null"
+	if len(b) == 0 || string(b) == `{}` || string(b) == "null" {
+		return nil, nil
+	}
+	return b, nil
 }

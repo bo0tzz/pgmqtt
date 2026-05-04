@@ -53,6 +53,11 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 		cfg.MaxConns = 8
 	}
 	cfg.MaxConnLifetime = 30 * time.Minute
+	// Without jitter, every conn opened in a startup burst would expire
+	// at the same instant 30 min later — across N pods that's a
+	// coordinated reconnect storm against Postgres. 5 min of jitter
+	// smears the churn over a 17% window of the lifetime.
+	cfg.MaxConnLifetimeJitter = 5 * time.Minute
 	cfg.MaxConnIdleTime = 5 * time.Minute
 
 	if opts.StatementTimeout > 0 {
