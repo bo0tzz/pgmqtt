@@ -643,7 +643,8 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 	}()
 
 	rows, err := conn.Query(ctx, `
-		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties
+		SELECT client_id, will_topic, will_payload, will_qos, will_retain,
+		       will_properties, will_delay
 		  FROM sessions
 		 WHERE broker_id = $1
 		   AND will_topic IS NOT NULL
@@ -658,11 +659,12 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 		qos     int
 		retain  bool
 		props   []byte
+		delay   *int // nil or 0 = fire immediately
 	}
 	var wills []will
 	for rows.Next() {
 		var w will
-		if err := rows.Scan(&w.client, &w.topic, &w.payload, &w.qos, &w.retain, &w.props); err != nil {
+		if err := rows.Scan(&w.client, &w.topic, &w.payload, &w.qos, &w.retain, &w.props, &w.delay); err != nil {
 			rows.Close()
 			return true, err
 		}
@@ -674,14 +676,47 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 	}
 	rows.Close()
 
+	// Per [MQTT-3.1.3.2.2] (Will Delay Interval): the server MUST NOT
+	// publish the will until the delay has elapsed. The previous code
+	// fired ALL wills for the dead broker immediately, which broke v5
+	// will-delay clients (Z2M restart → instant "device went offline"
+	// instead of the configured 30 s settling window). Split the rows:
+	//   - delay nil or 0  → fire now, clear will_*
+	//   - delay > 0       → schedule will_fire_at, leave will_* set
+	//                       so fireDueWills picks them up at the right
+	//                       time. Clamp by session_expires_at if set.
 	for _, w := range wills {
-		if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
-			j.logger.Warn("fire will from dead broker", "client", w.client, "err", err)
+		if w.delay == nil || *w.delay == 0 {
+			if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
+				j.logger.Warn("fire will from dead broker", "client", w.client, "err", err)
+			}
 		}
 	}
 
+	// Step 1 — schedule delayed wills: clear broker_id, set will_fire_at
+	// (clamped against session_expires_at) but keep will_* so fireDueWills
+	// will pick the row up when its delay elapses.
+	if _, err := conn.Exec(ctx, `
+		UPDATE sessions SET
+		    connected=false,
+		    broker_id=NULL,
+		    last_seen=now(),
+		    will_fire_at = LEAST(
+		        now() + (will_delay * interval '1 second'),
+		        COALESCE(session_expires_at, 'infinity'::timestamptz)
+		    )
+		 WHERE broker_id = $1
+		   AND will_topic IS NOT NULL
+		   AND COALESCE(will_delay, 0) > 0
+	`, brokerID); err != nil {
+		return true, err
+	}
+
+	// Step 2 — every remaining session under the dead broker (no will,
+	// or will already fired immediately above): clear broker_id AND all
+	// will_* columns so a future fireDueWills tick can't double-fire.
 	_, err = conn.Exec(ctx,
-		`UPDATE sessions SET connected=false, broker_id=NULL,
+		`UPDATE sessions SET connected=false, broker_id=NULL, last_seen=now(),
 		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
 		    will_retain=NULL, will_delay=NULL, will_properties=NULL
 		 WHERE broker_id=$1`, brokerID)

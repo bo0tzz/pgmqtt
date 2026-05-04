@@ -82,6 +82,72 @@ func TestJanitorFiresWillFromDeadBroker(t *testing.T) {
 	}
 }
 
+// TestJanitorWillDelayRespectedAcrossDeadBroker simulates an ungraceful
+// death of a v5 client whose CONNECT carried WillDelayInterval=30s. The
+// previous handleDeadBroker fired ALL wills for the dead broker
+// immediately, so a Z2M restart surfaced as instant "device went offline"
+// on HA dashboards. After the fix, handleDeadBroker schedules the will
+// via will_fire_at = now() + will_delay, leaving fireDueWills to publish
+// it once the delay elapses.
+func TestJanitorWillDelayRespectedAcrossDeadBroker(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, warnLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	observer := pod.Connect(t, "obs-delayed")
+	defer observer.Close()
+	observer.Subscribe(t, "lwt/+", 1)
+
+	deadBroker := uuid.New()
+	_, err = mh.Pool.Exec(context.Background(), `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start,
+		    will_topic, will_payload, will_qos, will_retain, will_delay)
+		VALUES ($1, $2, true, 5, false, 'lwt/delayed', $3, 1, false, 30)
+	`, "delayed-ghost", deadBroker, []byte("delayed-died"))
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	if err := jt.Tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	// Will MUST NOT have fired yet — read with a short deadline; expect
+	// timeout.
+	if pk := observer.TryRead(300 * time.Millisecond); pk != nil && pk.FixedHeader.Type == packets.Publish {
+		t.Fatalf("will fired prematurely: topic=%q payload=%q", pk.TopicName, pk.Payload)
+	}
+
+	// will_fire_at must be ~30s ahead and broker_id cleared.
+	var brokerID *uuid.UUID
+	var willFireAt *time.Time
+	if err := mh.Pool.QueryRow(context.Background(),
+		`SELECT broker_id, will_fire_at FROM sessions WHERE client_id='delayed-ghost'`).
+		Scan(&brokerID, &willFireAt); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if brokerID != nil {
+		t.Errorf("broker_id not cleared: %v", brokerID)
+	}
+	if willFireAt == nil {
+		t.Fatal("will_fire_at must be scheduled")
+	}
+	delta := time.Until(*willFireAt)
+	if delta < 25*time.Second || delta > 35*time.Second {
+		t.Errorf("will_fire_at delta = %v; want ~30s", delta)
+	}
+}
+
 func TestJanitorOrphanSweep(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 1, nil)

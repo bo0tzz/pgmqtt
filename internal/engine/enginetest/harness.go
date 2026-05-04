@@ -376,6 +376,33 @@ func (c *TestClient) Subscribe(t *testing.T, filter string, qos byte) []byte {
 	return resp.ReasonCodes
 }
 
+// TryRead returns the next non-PINGRESP packet or nil if the read times
+// out. It does NOT fatal — use it when "no packet within timeout" is the
+// asserted outcome.
+func (c *TestClient) TryRead(timeout time.Duration) *packets.Packet {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil
+	}
+	defer c.Conn.SetReadDeadline(time.Time{})
+	for {
+		pk, err := c.r.Read()
+		if err != nil {
+			return nil
+		}
+		if pk.FixedHeader.Type == packets.Pingresp {
+			continue
+		}
+		if pk.FixedHeader.Type == packets.Publish && pk.FixedHeader.Qos == 1 {
+			_ = mqttwire.Write(c.Conn, &packets.Packet{
+				FixedHeader:     packets.FixedHeader{Type: packets.Puback},
+				ProtocolVersion: c.r.ProtocolVersion,
+				PacketID:        pk.PacketID,
+			})
+		}
+		return &pk
+	}
+}
+
 // Read returns the next non-PINGRESP packet or fails on timeout.
 func (c *TestClient) Read(t *testing.T, timeout time.Duration) packets.Packet {
 	t.Helper()
