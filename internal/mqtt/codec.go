@@ -20,21 +20,41 @@ const (
 	// can be enforced by the engine.
 	MaxPacketSize = 268435455
 
+	// PreConnectMaxPacketSize is the cap applied BEFORE CONNECT has been
+	// processed. A pre-auth client cannot be trusted to declare a 256 MiB
+	// remaining length: with N concurrent sockets that would balloon broker
+	// RAM by N*256 MiB before any allocation gating kicks in. 1 MiB is
+	// generous for any reasonable CONNECT (username/password + properties +
+	// will payload all fit comfortably) but small enough that even at the
+	// MaxConnections cap the worst-case allocation is bounded.
+	PreConnectMaxPacketSize = 1 << 20
+
 	// ProtocolMQTT311 = 4 (per MQTT-3.1.2-2).
 	ProtocolMQTT311 byte = 4
 	// ProtocolMQTT5 = 5.
 	ProtocolMQTT5 byte = 5
 )
 
-// ErrPacketTooLarge indicates the framed length exceeds MaxPacketSize.
+// ErrPacketTooLarge indicates the framed length exceeds the active size cap.
 var ErrPacketTooLarge = errors.New("mqtt: packet too large")
 
 // Reader reads MQTT packets from a buffered byte stream. The first packet must
 // be CONNECT. After CONNECT is decoded, set ProtocolVersion so subsequent reads
 // can decode v3.1.1- vs v5-specific layouts.
+//
+// The Reader applies a size cap on the variable-byte-integer remaining length
+// before the body is allocated. The default cap is PreConnectMaxPacketSize
+// (1 MiB) — bounded so an unauthenticated peer cannot announce a huge
+// remaining length and force a multi-MiB allocation per socket. After CONNECT
+// processing the engine raises this via SetMaxPacketSize to
+// min(client_max_packet_size, server_max_packet_size).
 type Reader struct {
 	br              *bufio.Reader
 	ProtocolVersion byte
+	// maxPacketSize caps the value returned by DecodeLength before the body
+	// allocation. 0 means "use PreConnectMaxPacketSize". Set via
+	// SetMaxPacketSize after the engine has resolved the post-CONNECT cap.
+	maxPacketSize uint32
 }
 
 // NewReader wraps r. If r is already a *bufio.Reader it is reused.
@@ -43,6 +63,13 @@ func NewReader(r io.Reader) *Reader {
 		return &Reader{br: br}
 	}
 	return &Reader{br: bufio.NewReader(r)}
+}
+
+// SetMaxPacketSize sets the per-Reader inbound size cap, used after CONNECT
+// processing. Caller resolves min(client_advertised, server_policy) and
+// passes the result here. 0 reverts to PreConnectMaxPacketSize.
+func (r *Reader) SetMaxPacketSize(n uint32) {
+	r.maxPacketSize = n
 }
 
 // Read reads one packet. The Packet's ProtocolVersion field is populated from
@@ -61,6 +88,18 @@ func (r *Reader) Read() (packets.Packet, error) {
 		return pk, fmt.Errorf("decode length: %w", err)
 	}
 	if remaining > MaxPacketSize {
+		return pk, ErrPacketTooLarge
+	}
+	// Apply the active inbound cap BEFORE allocating the body. Pre-CONNECT
+	// (maxPacketSize == 0) we cap at PreConnectMaxPacketSize so a peer can't
+	// blow our heap by declaring a multi-MiB remaining length on connection
+	// open. Post-CONNECT the engine sets maxPacketSize to
+	// min(client_max, server_max).
+	cap := int(r.maxPacketSize)
+	if cap == 0 {
+		cap = PreConnectMaxPacketSize
+	}
+	if remaining > cap {
 		return pk, ErrPacketTooLarge
 	}
 	pk.FixedHeader.Remaining = remaining

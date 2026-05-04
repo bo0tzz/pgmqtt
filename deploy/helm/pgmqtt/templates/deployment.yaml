@@ -101,6 +101,8 @@ spec:
               value: {{ .Values.limits.maxConnections | quote }}
             - name: PGMQTT_MAX_INBOUND_MSGS_PER_SEC
               value: {{ .Values.limits.maxInboundMsgsPerSec | quote }}
+            - name: PGMQTT_MAX_PACKET_SIZE
+              value: {{ .Values.limits.maxPacketSize | quote }}
             - name: PGMQTT_PG_STATEMENT_TIMEOUT_MS
               value: {{ .Values.database.statementTimeoutMs | quote }}
             - name: PGMQTT_LOG_FORMAT

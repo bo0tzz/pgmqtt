@@ -114,6 +114,13 @@ func (e *Engine) maxInboundRate() int {
 	return int(e.maxInboundRateAtomic.Load())
 }
 
+// maxPacketSize returns the post-CONNECT inbound packet-size cap (bytes)
+// configured for this Pod. 0 means "no Pod-level cap" — the codec falls
+// back to the absolute upper bound (256 MiB).
+func (e *Engine) maxPacketSize() int {
+	return int(e.maxPacketSizeAtomic.Load())
+}
+
 func (c *Conn) run(ctx context.Context) {
 	defer c.shutdown()
 	defer func() {
@@ -130,7 +137,15 @@ func (c *Conn) run(ctx context.Context) {
 	}
 	pk, err := c.reader.Read()
 	if err != nil {
-		c.eng.logger.Debug("read connect", "err", err)
+		// Pre-CONNECT: any read error (including ErrPacketTooLarge from a
+		// peer announcing > 1 MiB remaining length) hard-closes the socket
+		// without writing a CONNACK. The protocol level is untrusted at
+		// this point — we don't know whether to send a v3 or v5 reply.
+		if errors.Is(err, mqttwire.ErrPacketTooLarge) {
+			c.eng.logger.Warn("pre-connect packet exceeded size cap", "remote", c.nc.RemoteAddr())
+		} else {
+			c.eng.logger.Debug("read connect", "err", err)
+		}
 		return
 	}
 	if pk.FixedHeader.Type != packets.Connect {
@@ -149,6 +164,16 @@ func (c *Conn) run(ctx context.Context) {
 		}
 		pk, err := c.reader.Read()
 		if err != nil {
+			// Post-CONNECT oversize: v5 gets DISCONNECT 0x95 (Packet Too
+			// Large) so the client can distinguish "I sent something too
+			// big" from a generic socket close. v3.1.1 has no DISCONNECT-
+			// from-server, so we hard-close.
+			if errors.Is(err, mqttwire.ErrPacketTooLarge) && c.protocol == mqttwire.ProtocolMQTT5 {
+				_ = c.write(&packets.Packet{
+					FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+					ReasonCode:  0x95,
+				})
+			}
 			c.handleDisconnect(ctx, err)
 			return
 		}
@@ -340,6 +365,12 @@ func (e *Engine) SetMaxConnectionsForTest(n int) {
 // Test-only.
 func (e *Engine) SetMaxInboundRateForTest(n int) {
 	e.maxInboundRateAtomic.Store(int64(n))
+}
+
+// SetMaxPacketSizeForTest overrides the post-CONNECT inbound packet-size
+// cap. Test-only.
+func (e *Engine) SetMaxPacketSizeForTest(n int) {
+	e.maxPacketSizeAtomic.Store(int64(n))
 }
 
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised

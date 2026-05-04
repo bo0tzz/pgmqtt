@@ -77,6 +77,7 @@ type Engine struct {
 	maxConnsAtomic       atomic.Int64
 	maxQueuedAtomic      atomic.Int64
 	maxInboundRateAtomic atomic.Int64
+	maxPacketSizeAtomic  atomic.Int64
 	receiveMaxV5Atomic   atomic.Int64
 	keepaliveMaxV5Atomic atomic.Int64 // nanoseconds
 
@@ -110,6 +111,7 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		e.maxConnsAtomic.Store(int64(cfg.MaxConnections))
 		e.maxQueuedAtomic.Store(int64(cfg.MaxQueuedDeliveriesPerClient))
 		e.maxInboundRateAtomic.Store(int64(cfg.MaxInboundMsgsPerSec))
+		e.maxPacketSizeAtomic.Store(int64(cfg.MaxPacketSize))
 		e.receiveMaxV5Atomic.Store(int64(cfg.V5ReceiveMaximum))
 		e.keepaliveMaxV5Atomic.Store(int64(cfg.V5KeepaliveMax))
 	}
