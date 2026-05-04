@@ -163,6 +163,8 @@ psql "$PGMQTT_DATABASE_URL" -c "INSERT INTO users(username,password_hash) VALUES
 | `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` | `10000` | Slow-subscriber cap; over → DISCONNECT 0x97 (0 disables) |
 | `PGMQTT_MAX_CONNECTIONS` | `5000` | Per-Pod connection cap; over → CONNACK 0x9F (0 disables) |
 | `PGMQTT_MAX_INBOUND_MSGS_PER_SEC` | `1000` | Per-conn token-bucket rate; over → DISCONNECT 0x96 (0 disables) |
+| `PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC` | `5` | Per-IP CONNECT rate (and burst); over → hard close, no CONNACK (0 disables). bcrypt-CPU DoS mitigation. |
+| `PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN` | `30` | Per-IP bcrypt-failure budget; over → IP enters 60s penalty box, subsequent CONNECTs dropped pre-bcrypt (0 disables) |
 | `PGMQTT_PG_STATEMENT_TIMEOUT_MS` | `30000` | Per-statement timeout for the broker's pgxpool (0 disables) |
 
 ## Development

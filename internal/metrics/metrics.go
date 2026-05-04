@@ -55,6 +55,15 @@ type Metrics struct {
 	// banned (0x88), bad_auth_method (0x8C — enhanced auth attempted).
 	AuthFailuresTotal *prometheus.CounterVec
 
+	// ConnectDroppedTotal counts CONNECTs dropped pre-CONNACK by the
+	// per-IP limiter (bcrypt-CPU DoS mitigation). Reasons:
+	//   * rate_limit  — over the configured CONNECTs/sec budget for the
+	//                   source IP. Socket closed without CONNACK.
+	//   * penalty_box — IP exhausted its auth-failure budget; further
+	//                   CONNECTs are dropped pre-bcrypt for the cool-off
+	//                   window (default 60s).
+	ConnectDroppedTotal *prometheus.CounterVec
+
 	// SubscribesTotal / UnsubscribesTotal — symmetric to PublishesTotal,
 	// used to bound topic-churn driven load.
 	SubscribesTotal   prometheus.Counter
@@ -177,6 +186,12 @@ func New() *Metrics {
 			Help: "Credential rejections at CONNECT, labelled by reason " +
 				"(bad_credentials, not_authorized, banned, bad_auth_method).",
 		}, []string{"reason"}),
+		ConnectDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_connect_dropped_total",
+			Help: "CONNECTs dropped pre-CONNACK by the per-IP limiter, " +
+				"labelled by reason (rate_limit, penalty_box). " +
+				"bcrypt-CPU DoS mitigation.",
+		}, []string{"reason"}),
 		SubscribesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgmqtt_subscribes_total",
 			Help: "Inbound MQTT SUBSCRIBE packets accepted by this Pod.",
@@ -260,6 +275,7 @@ func New() *Metrics {
 		m.RateLimitedTotal,
 		m.PublishStageSeconds,
 		m.AuthFailuresTotal,
+		m.ConnectDroppedTotal,
 		m.SubscribesTotal,
 		m.UnsubscribesTotal,
 		m.JanitorTickSeconds,

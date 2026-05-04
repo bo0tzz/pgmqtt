@@ -91,6 +91,13 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	password := string(pk.Connect.Password)
 	if username != "" || !c.eng.cfg.AllowAnonymous {
 		if err := Authenticate(ctx, c.eng.pool, username, password); err != nil {
+			// Tick the per-IP auth-failure bucket so a stream of
+			// bad-credential CONNECTs from a single source IP
+			// eventually trips the penalty box (subsequent CONNECTs
+			// are dropped pre-bcrypt). Done before the CONNACK
+			// reject write so a connection refused mid-write still
+			// counts towards the IP's failure budget.
+			c.eng.recordAuthFailureFor(c.nc.RemoteAddr())
 			_ = c.writeConnackReject(pv, cackBadCredentials)
 			return err
 		}
