@@ -169,6 +169,46 @@ func TestNoLocalSuppression(t *testing.T) {
 	}
 }
 
+// TestWillDelayCancelledByReconnectBeforeFire pins MQTT-3.1.3.2.2:
+// when a v5 client with WillDelayInterval > 0 reconnects within the
+// delay window, its will MUST NOT fire. takeOwnership clears
+// will_fire_at on the new CONNECT, so the janitor's fireDueWills
+// query (`WHERE will_fire_at IS NOT NULL`) skips the row.
+func TestWillDelayCancelledByReconnectBeforeFire(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	observer := h.Connect(t, "obs-will-cancel")
+	defer observer.Close()
+	observer.Subscribe(t, "lwt/cancel", 1)
+
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = "lwt/cancel"
+		p.Connect.WillPayload = []byte("would-fire-without-cancel")
+		p.Connect.WillQos = 1
+		p.Properties.WillDelayInterval = 30
+		// SessionExpiry must exceed WillDelay or the latter is clamped
+		// to zero per MQTT-3.1.3-9 (we min(delay, expiry)).
+		p.Properties.SessionExpiryInterval = 60
+		p.Properties.SessionExpiryIntervalFlag = true
+		p.Connect.Clean = false
+	}
+	willer := h.Connect(t, "will-cancel-1", withWill)
+	willer.Kill() // ungraceful — will scheduled with 30s delay
+
+	// Reconnect before the delay elapses (immediately is fine).
+	willer2 := h.Connect(t, "will-cancel-1", withWill)
+	defer willer2.Close()
+
+	// will MUST NOT fire — short read deadline since we're asserting
+	// nothing arrives, not that it arrives slowly.
+	if pk := observer.TryRead(500 * time.Millisecond); pk != nil && pk.FixedHeader.Type == packets.Publish {
+		t.Fatalf("will fired despite reconnect within delay window: topic=%q payload=%q",
+			pk.TopicName, pk.Payload)
+	}
+}
+
 func TestWillFiresOnUngraceful(t *testing.T) {
 	t.Parallel()
 	h := enginetest.NewHarness(t)
