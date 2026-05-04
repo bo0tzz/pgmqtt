@@ -44,6 +44,24 @@ its dedicated `*pgx.Conn`. Exactly one Pod runs the janitor and the
 User-CR reconciler; if it dies hard, the lock should auto-release when
 the connection's TCP keepalive trips (~25 s by default).
 
+### Crash-loop on unexpected leader-loss
+
+The pgmqttd process treats unexpected leader-loss (PG conn drop while
+holding the lock, network partition tripping PG keepalive, manual
+`pg_terminate_backend` against the leader conn) as a fatal event and
+exits non-zero. kubelet restarts the Pod and a fresh `leader.Start`
+re-races for the advisory lock against whichever Pod is now leader.
+
+This is the operating compromise for v1: rather than re-arm
+janitor/operator inside a Pod that's been demoted, we re-roll the
+Pod. Visible signal: a pod with `Restarts > 0` whose recent log lines
+include `"leader lost outside of shutdown — exiting for restart"` —
+this is normal-but-noteworthy, not an alert.
+
+If a single Pod is restart-looping continuously, that Pod's PG
+connectivity is unstable: check NetworkPolicy egress, PG `max_connections`
+saturation, or kube-proxy / kube-DNS health.
+
 **Symptoms**
 
 - `pgmqtt_dead_brokers_handled_total` flatlines.

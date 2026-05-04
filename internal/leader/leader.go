@@ -1,6 +1,35 @@
 // Package leader provides Postgres-advisory-lock leader election. Exactly
 // one Pod holds pg_advisory_lock(LeaderKey) at any time; that Pod runs the
 // janitor and the User reconciler.
+//
+// Lost-handling policy: leadership is one-shot — once Lost() fires, this
+// Leader is dead and never re-arms. The expectation is that the caller
+// (cmd/pgmqttd/main.go) treats unexpected loss as a process-restart event
+// (kubelet restarts the pod). A fresh leader.Start in the new process
+// re-acquires the lock against whichever pod is the new leader. This
+// keeps the package small and avoids the surprise of janitor/operator
+// goroutines suddenly re-firing inside a pod that's been demoted.
+//
+// Fence safety note (audit L1): there is a window — bounded by the 10s
+// Ping interval below — between PG releasing the lock (e.g. our session
+// dies) and run() noticing. During that window, the new leader is up
+// and writing while we still believe we're the leader. The exposure is
+// bounded:
+//   - findDeadBrokers / handleDeadBroker uses `pg_try_advisory_lock` per
+//     dead-broker UUID, which is itself a fence — only one leader can
+//     claim a given dead broker.
+//   - expireSessions and fireDueWills use `FOR UPDATE` (resp. `SKIP
+//     LOCKED`) on the rows they mutate; concurrent leaders serialise.
+//     The second leader will see post-first-leader state.
+//   - Operator Reconcile writes are idempotent (`INSERT ... ON CONFLICT
+//     DO UPDATE`); K8s resourceVersion catches Status() conflicts.
+// The remaining sharp edge is a clean rolling-deploy timing window:
+// double-firing of will-publishes (mitigated by the publish-then-clear
+// ordering in fireDueWills — duplicate-better-than-lost) and double
+// session-expiry deletes (idempotent). A strict tx-fenced leader (epoch
+// column CAS or routing all leader writes through l.conn) is the future
+// fix and is filed as a follow-up. For v1 the bounded exposure plus the
+// crash-loop-on-Lost policy is the operating compromise.
 package leader
 
 import (

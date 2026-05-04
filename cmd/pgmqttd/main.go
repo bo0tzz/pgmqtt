@@ -117,6 +117,30 @@ func main() {
 	}
 	defer ld.Stop()
 
+	// Crash-loop policy on unexpected leader-loss: leader.Lost() closes when
+	// our session-scoped advisory lock is gone (PG conn drop, network
+	// partition that trips PG's TCP keepalive, manual `pg_terminate_backend`
+	// against our leader conn). The janitor + operator only react to Lost()
+	// once and exit; without restarting the process they would never re-arm.
+	// Rather than build a re-acquire path that re-runs the operator's
+	// manager startup + the janitor's tick loop, we let kubelet restart the
+	// pod — at which point a fresh leader.Start gets a fresh shot at the
+	// advisory lock against whichever pod is the new leader. Lost-during-
+	// shutdown (ctx cancelled) is normal and does NOT trigger this.
+	go func() {
+		defer recoverPanic(logger, "leader watchdog")
+		select {
+		case <-ctx.Done():
+			return
+		case <-ld.Lost():
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Error("leader lost outside of shutdown — exiting for restart")
+			os.Exit(1)
+		}
+	}()
+
 	jt := janitor.New(pool, eng, logger)
 	jt.SetMetrics(mtx)
 	go jt.RunWith(ctx, ld)
