@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
 )
 
@@ -54,7 +55,7 @@ type Listener struct {
 func Start(parentCtx context.Context, url string, eng *engine.Engine, logger *slog.Logger) (*Listener, error) {
 	cfg, err := pgx.ParseConfig(url)
 	if err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, fmt.Errorf("parse config: %w", db.ScrubURLError(err, url))
 	}
 	cfg.RuntimeParams = mergeParams(cfg.RuntimeParams, map[string]string{
 		// Server-side TCP keepalives; takes effect on this backend's outbound socket.
@@ -68,7 +69,7 @@ func Start(parentCtx context.Context, url string, eng *engine.Engine, logger *sl
 
 	conn, err := pgx.ConnectConfig(parentCtx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, fmt.Errorf("connect: %w", db.ScrubURLError(err, url))
 	}
 
 	id := uuid.New()

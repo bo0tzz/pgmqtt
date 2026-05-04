@@ -55,6 +55,7 @@ helm install pgmqtt deploy/helm/pgmqtt \
     --set image.tag=multi-broker \
     --set image.pullPolicy=IfNotPresent \
     --set replicaCount="$REPLICAS" \
+    --set "auth.allowAnonymous=true" \
     --set "limits.maxQueuedDeliveriesPerClient=0" \
     --set "limits.maxConnections=0" \
     --set "limits.maxInboundMsgsPerSec=0" \
@@ -63,17 +64,14 @@ helm install pgmqtt deploy/helm/pgmqtt \
 
 kubectl -n "$NS" rollout status deployment/pgmqtt --timeout=180s
 
+# allowAnonymous is set via --set auth.allowAnonymous=true on install — no
+# post-install env-patch needed (the previous "set env + rollout" sequence
+# raced with port-forward; new pods came up while the forward still pointed
+# at the terminating ones and Paho saw ConnectionRefused).
 echo "==> port-forward Service to local 11883 (round-robins across $REPLICAS Pods)"
 kubectl -n "$NS" port-forward svc/pgmqtt 11883:1883 &
 PF_PID=$!
 sleep 2
-
-echo "==> seed anonymous (we set allowAnonymous via env on the broker for the suite)"
-# The Paho suite expects to be able to connect without auth. The chart's
-# default doesn't set PGMQTT_ALLOW_ANONYMOUS=true; quickly patch the
-# Deployment env for the run, then revert at end.
-kubectl -n "$NS" set env deployment/pgmqtt PGMQTT_ALLOW_ANONYMOUS=true
-kubectl -n "$NS" rollout status deployment/pgmqtt --timeout=120s
 
 echo "==> run paho conformance via the Service VIP"
 python3 scripts/paho-conformance.py \

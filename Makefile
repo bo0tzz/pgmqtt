@@ -1,4 +1,4 @@
-.PHONY: build test test-race coverage vet lint helm-lint docker docker-multi smoke clean
+.PHONY: build test test-race coverage vet lint helm-lint docker docker-multi smoke validate clean
 
 BINARY := pgmqttd
 PKG := github.com/bo0tzz/pgmqtt
@@ -40,6 +40,19 @@ docker-multi:
 
 smoke:
 	bash scripts/smoke.sh
+
+# Tiered validation (see scripts/validate.sh for the full description).
+# Usage: make validate TIER=tier1
+#        make validate TIER=tier2 PAHO=/tmp/paho-testing
+#        make validate TIER=tier3 PAHO=/tmp/paho-testing
+TIER ?= tier1
+PAHO ?=
+validate:
+	@if [ "$(TIER)" != "tier1" ] && [ -z "$(PAHO)" ]; then \
+		echo "make validate TIER=$(TIER) requires PAHO=/path/to/paho.mqtt.testing" >&2; \
+		exit 2; \
+	fi
+	@bash scripts/validate.sh $(TIER) $(if $(PAHO),--paho $(PAHO))
 
 clean:
 	rm -f $(BINARY)
