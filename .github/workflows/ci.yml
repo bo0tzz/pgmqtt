@@ -54,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
         with:
-          version: v3.16.1
+          version: latest
       - name: lint
         run: |
           helm lint deploy/helm/pgmqtt --set database.url='postgres://x/y'
@@ -107,7 +107,7 @@ jobs:
           cluster_name: pgmqtt-smoke
       - uses: azure/setup-helm@v4
         with:
-          version: v3.16.1
+          version: latest
       - name: install postgres in cluster
         run: |
           kubectl create namespace mqtt
