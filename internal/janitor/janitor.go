@@ -63,14 +63,14 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 		pool:   pool,
 		eng:    eng,
 		logger: logger,
-		// 5s default. Time-bound operations (will-delay, session-expire,
-		// retained-expire) tolerate up to 5s of trigger latency — the MQTT
-		// 5 spec measures these in seconds and a few seconds of overshoot
-		// is well within real-world SLOs. Lower values (down to 1s) trade
-		// idle DB churn for tighter precision: at 1s × 11 jobs × N pods
-		// the cluster does 11×N queries/sec at zero traffic. Override via
-		// PGMQTT_JANITOR_INTERVAL_MS or Janitor.SetInterval.
-		interval:         5 * time.Second,
+		// 1s default. Will-delay precision is measured in seconds in the
+		// MQTT 5 spec and the Paho v5 conformance suite (test_will_delay)
+		// asserts will-fire within 1s of the configured WillDelayInterval.
+		// A 5s default reduced idle DB churn but blew that test by 4s;
+		// keep 1s and stratify the cleanup jobs separately if churn
+		// becomes a real bottleneck (tracked as a follow-up).
+		// Override via PGMQTT_JANITOR_INTERVAL_MS or Janitor.SetInterval.
+		interval:         1 * time.Second,
 		orphanGrace:      10 * time.Minute,
 		inboundQoS2Grace: 1 * time.Hour,
 	}

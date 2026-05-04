@@ -150,7 +150,7 @@ func FromEnv() (*Config, error) {
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
 		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
 		WSAllowedOrigins:             splitTrimmed(os.Getenv("PGMQTT_WS_ALLOWED_ORIGINS"), ","),
-		JanitorInterval:              time.Duration(getenvInt("PGMQTT_JANITOR_INTERVAL_MS", 5000)) * time.Millisecond,
+		JanitorInterval:              time.Duration(getenvInt("PGMQTT_JANITOR_INTERVAL_MS", 1000)) * time.Millisecond,
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

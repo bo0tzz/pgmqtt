@@ -332,13 +332,14 @@ operator:
 
 ## Janitor tick frequency. Each Pod runs the per-tick suite (find-dead-
 ## brokers, fire-due-wills, expire-sessions, expire-retained, sweep-
-## orphans, refresh-gauges) at this cadence — 5s default trades a few
-## seconds of will-fire / session-expire latency for ~5× lower idle DB
-## load (at 1s × 11 jobs × N pods, the cluster does 11N q/sec at zero
-## traffic). Lower for tighter time-bound precision, raise for less
-## churn at scale. 0 leaves the broker's compiled-in default (5s).
+## orphans, refresh-gauges) at this cadence. 1s default — the Paho v5
+## conformance suite (test_will_delay) asserts will-fire within 1s of
+## the configured WillDelayInterval; coarser ticks blow that. A
+## stratified-job follow-up will let cleanup jobs run on a slower
+## cadence than fire_due_wills, dropping idle DB churn without losing
+## time-bound precision. 0 leaves the broker's compiled-in default (1s).
 janitor:
-  intervalMs: 5000
+  intervalMs: 1000
 
 ## v5 server policy. See protocol-spec links in docs/CONFORMANCE.md.
 ##   receiveMaximum: cap on un-ACKed inbound QoS>0 PUBLISHes per conn.

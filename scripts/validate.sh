@@ -34,10 +34,14 @@ cd "$ROOT"
 TIER="${1:-}"
 shift || true
 
+PAHO=""
+KEEP_CLUSTER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)
             sed -n '2,30p' "$0"; exit 0 ;;
+        --paho) PAHO="$2"; shift 2 ;;
+        --keep-cluster) KEEP_CLUSTER=1; shift ;;
         *) echo "validate.sh: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -45,9 +49,16 @@ done
 case "$TIER" in
     tier1) ;;
     tier2|tier3)
-        echo "validate.sh: $TIER not yet wired (tier1 only at this commit)" >&2
-        exit 2 ;;
-    "")  echo "usage: $0 tier1|tier2|tier3" >&2; exit 2 ;;
+        if [ -z "$PAHO" ]; then
+            echo "validate.sh: $TIER requires --paho /path/to/paho.mqtt.testing" >&2
+            exit 2
+        fi
+        if [ ! -d "$PAHO/interoperability" ]; then
+            echo "validate.sh: --paho path doesn't look like the paho.mqtt.testing repo: $PAHO" >&2
+            exit 2
+        fi
+        ;;
+    "")  echo "usage: $0 tier1|tier2|tier3 [--paho PATH] [--keep-cluster]" >&2; exit 2 ;;
     *)   echo "validate.sh: unknown tier: $TIER" >&2; exit 2 ;;
 esac
 
@@ -112,7 +123,120 @@ run_tier1() {
     phase "helm template"    t1_helm_template
 }
 
-run_tier1
+# ---------- tier2 phases ----------
+
+t2_coverage() {
+    go test ./... -count=1 -coverprofile=coverage.out -covermode=atomic -timeout 10m
+    go tool cover -func=coverage.out | tee coverage.txt | tail -5
+}
+
+# Boot a single-broker pgmqttd (TCP only) against an ephemeral postgres
+# container, run the Paho v3+v5 conformance wrapper, capture results.
+T2_PG_PORT=55435
+T2_BROKER_PORT=11885
+T2_PG_NAME="pgmqtt-validate-pg-$$"
+t2_paho_setup() {
+    docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
+    docker run --rm -d --name "$T2_PG_NAME" \
+        -p "$T2_PG_PORT:5432" \
+        -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt -e POSTGRES_DB=pgmqtt \
+        postgres:18-alpine \
+        -c shared_preload_libraries=pg_stat_statements >/dev/null
+    # Wait for postgres ready.
+    for _ in $(seq 1 30); do
+        if docker exec "$T2_PG_NAME" pg_isready -U pgmqtt >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    go build -o /tmp/pgmqttd-validate ./cmd/pgmqttd
+    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@localhost:$T2_PG_PORT/pgmqtt?sslmode=disable" \
+    PGMQTT_TCP_ADDR="127.0.0.1:$T2_BROKER_PORT" \
+    PGMQTT_WS_ADDR= \
+    PGMQTT_METRICS_ADDR= \
+    PGMQTT_ALLOW_ANONYMOUS=true \
+        /tmp/pgmqttd-validate >/tmp/pgmqttd-validate.log 2>&1 &
+    echo $! >/tmp/pgmqttd-validate.pid
+    # Wait for the broker to start listening.
+    for _ in $(seq 1 30); do
+        if (echo > /dev/tcp/127.0.0.1/$T2_BROKER_PORT) 2>/dev/null; then break; fi
+        sleep 1
+    done
+}
+
+t2_paho_teardown() {
+    if [ -f /tmp/pgmqttd-validate.pid ]; then
+        kill "$(cat /tmp/pgmqttd-validate.pid)" 2>/dev/null || true
+        rm -f /tmp/pgmqttd-validate.pid
+    fi
+    docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
+}
+
+t2_paho_run() {
+    python3 scripts/paho-conformance.py \
+        --paho "$PAHO" \
+        --host 127.0.0.1 \
+        --port "$T2_BROKER_PORT" \
+        --version both \
+        --per-test-timeout 60
+}
+
+run_tier2() {
+    run_tier1
+    phase "make coverage"    t2_coverage
+    phase "paho setup"       t2_paho_setup
+    trap t2_paho_teardown EXIT
+    phase "paho v3+v5"       t2_paho_run
+    phase "paho teardown"    t2_paho_teardown
+    trap - EXIT
+}
+
+# ---------- tier3 phases ----------
+
+t3_multi_broker() {
+    bash scripts/paho-multi-broker.sh \
+        --paho "$PAHO" \
+        --version both
+}
+
+t3_soak_smoke() {
+    # Reuse the multi-broker kind cluster left up by t3_multi_broker if
+    # --keep-cluster was passed; otherwise spin a fresh single-broker
+    # docker for soak. Soak smoke = 60s × 1000 msg/s × 3 pubs × 3 subs.
+    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@localhost:$T2_PG_PORT/pgmqtt?sslmode=disable" \
+    PGMQTT_TCP_ADDR="127.0.0.1:$T2_BROKER_PORT" \
+    PGMQTT_WS_ADDR= \
+    PGMQTT_ALLOW_ANONYMOUS=true \
+        /tmp/pgmqttd-validate >>/tmp/pgmqttd-validate.log 2>&1 &
+    echo $! >/tmp/pgmqttd-validate.pid
+    for _ in $(seq 1 30); do
+        if (echo > /dev/tcp/127.0.0.1/$T2_BROKER_PORT) 2>/dev/null; then break; fi
+        sleep 1
+    done
+    go run ./cmd/soak \
+        -broker 127.0.0.1:$T2_BROKER_PORT \
+        -user '' -pass '' \
+        -duration 60s \
+        -rate 1000 \
+        -pubs 3 -subs 3 -inflight 25 -qos 1 \
+        -topic validate/soak >/tmp/validate-soak.json
+}
+
+run_tier3() {
+    run_tier2
+    phase "multi-broker paho"  t3_multi_broker
+    # Soak smoke needs the same single-broker that paho used; t2_paho_setup
+    # already started it, t2_paho_teardown stopped it. Re-start for soak.
+    phase "soak setup"         t2_paho_setup
+    trap t2_paho_teardown EXIT
+    phase "soak smoke"         t3_soak_smoke
+    phase "soak teardown"      t2_paho_teardown
+    trap - EXIT
+}
+
+case "$TIER" in
+    tier1) run_tier1 ;;
+    tier2) run_tier2 ;;
+    tier3) run_tier3 ;;
+esac
 
 OVERALL_END=$(date +%s)
 
