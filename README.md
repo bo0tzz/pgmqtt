@@ -184,6 +184,26 @@ helm lint deploy/helm/pgmqtt --set database.url='dev'
 Integration tests require Docker (testcontainers spins up Postgres). Set
 `PGMQTT_TEST_DATABASE_URL` to use an existing DB instead.
 
+### Validation tiers
+
+`scripts/validate.sh` is the canonical pre-commit / pre-tag entrypoint, with
+three additive tiers (tier3 ⊃ tier2 ⊃ tier1):
+
+```bash
+make validate TIER=tier1                                # ~10s — vet + race-light tests + helm lint/template
+make validate TIER=tier2 PAHO=/tmp/paho.mqtt.testing    # ~6m — adds full coverage + paho v3+v5 single broker
+make validate TIER=tier3 PAHO=/tmp/paho.mqtt.testing    # ~12–18m — adds multi-broker paho + in-cluster soak smoke
+```
+
+Wall-clock per phase + the bug class each tier catches that the previous
+tier misses are recorded in [`scripts/validate-timings.md`](scripts/validate-timings.md).
+For agents working on this repo (workflow conventions, common pitfalls,
+how the parallel-worktree pattern works), see [`AGENTS.md`](AGENTS.md).
+
+In CI, [`ci.yml`](.github/workflows/ci.yml) covers tier1's surface on every
+PR; tier2 runs nightly ([`conformance-nightly.yml`](.github/workflows/conformance-nightly.yml))
+and tier3 / soak runs weekly ([`soak-weekly.yml`](.github/workflows/soak-weekly.yml)).
+
 ## License
 
 MIT.
