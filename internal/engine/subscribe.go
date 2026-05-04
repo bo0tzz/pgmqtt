@@ -18,6 +18,7 @@ const (
 	subackQoS2               byte = 0x02
 	subackUnspec             byte = 0x80
 	subackTopicFilterInvalid byte = 0x8F
+	subackSharedSubNotSupp   byte = 0x9E
 )
 
 func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
@@ -41,10 +42,15 @@ func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
 
 	for _, f := range pk.Filters {
 		filter := f.Filter
-		// $share/{group}/{filter} — accept the filter; share semantics not yet
-		// implemented (best-effort: subscribe to the underlying filter).
-		if _, real, ok := mqttwire.SharedSubscription(filter); ok {
-			filter = real
+		// $share/{group}/{filter} — we advertise SharedSubAvailable=0 in
+		// CONNACK, so per [MQTT-3.8.4-7] / [MQTT-3.9.3] we MUST reject the
+		// per-filter SUBSCRIBE with reason 0x9E (Shared Subscriptions not
+		// supported). Previously we silently stripped the prefix and
+		// subscribed to the underlying filter, which gave clients
+		// duplicate-delivery rather than the documented shared semantics.
+		if _, _, ok := mqttwire.SharedSubscription(filter); ok {
+			codes = append(codes, subackSharedSubNotSupp)
+			continue
 		}
 		if err := mqttwire.ValidateTopicFilter(filter); err != nil {
 			codes = append(codes, subackTopicFilterInvalid)

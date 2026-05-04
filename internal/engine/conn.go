@@ -851,6 +851,16 @@ func (c *Conn) handlePuback(ctx context.Context, pk *packets.Packet) error {
 }
 
 func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
+	// [MQTT-4.3.3 / 3.5.2.1] If the receiver returns PUBREC with a reason
+	// code ≥ 0x80, the QoS-2 message is treated as completed: discard the
+	// outbound delivery row, release the inflight slot, do NOT send PUBREL.
+	if pk.ReasonCode >= 0x80 {
+		_, err := c.eng.pool.Exec(ctx,
+			`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=2`,
+			c.clientID, pk.PacketID)
+		c.returnInflight()
+		return err
+	}
 	if _, err := c.eng.pool.Exec(ctx,
 		`UPDATE deliveries SET state=2 WHERE client_id=$1 AND packet_id=$2 AND qos=2 AND state=1`,
 		c.clientID, pk.PacketID); err != nil {
@@ -865,16 +875,31 @@ func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
 // handlePubrel completes the QoS-2 publisher-side handshake. The matching
 // row in inbound_qos2 is removed so the same packet_id may be reused, and
 // the v5 inbound-flow-control slot is released.
+//
+// [MQTT-3.6.2-1] PUBREL for an unknown packet id replies PUBCOMP with reason
+// 0x92 (Packet Identifier not found) on v5; v3.1.1 has no reason field so we
+// reply unconditionally.
 func (c *Conn) handlePubrel(ctx context.Context, pk *packets.Packet) error {
-	_, _ = c.eng.pool.Exec(ctx,
+	ct, err := c.eng.pool.Exec(ctx,
 		`DELETE FROM inbound_qos2 WHERE client_id=$1 AND packet_id=$2`,
 		c.clientID, pk.PacketID)
-	err := c.write(&packets.Packet{
+	if err != nil {
+		return err
+	}
+	resp := &packets.Packet{
 		FixedHeader: packets.FixedHeader{Type: packets.Pubcomp},
 		PacketID:    pk.PacketID,
-	})
-	c.inboundInflight.Add(-1)
-	return err
+	}
+	if ct.RowsAffected() == 0 && c.protocol == mqttwire.ProtocolMQTT5 {
+		resp.ReasonCode = 0x92 // Packet Identifier not found
+	}
+	werr := c.write(resp)
+	// Only release the inflight slot when we actually completed a known
+	// QoS-2 inbound; an unknown packet id consumed no slot.
+	if ct.RowsAffected() > 0 {
+		c.inboundInflight.Add(-1)
+	}
+	return werr
 }
 
 func (c *Conn) handlePubcomp(ctx context.Context, pk *packets.Packet) error {
