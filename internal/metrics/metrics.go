@@ -91,6 +91,14 @@ type Metrics struct {
 	RetainedCount     prometheus.Gauge
 	InboundQoS2Pending prometheus.Gauge
 
+	// NotifyQueueUsageRatio — pg_notification_queue_usage(), sampled by
+	// the janitor. PG's notify queue is shared-memory and capped; once
+	// it fills (one wedged listener can do that under sustained
+	// publish load), every committing transaction in the cluster
+	// errors at COMMIT with 54000. The single largest cause of "lights
+	// are slow tonight" in a multi-pod deploy. Alert above 0.5.
+	NotifyQueueUsageRatio prometheus.Gauge
+
 	// WillsNotifyFailedTotal counts cross-pod will-publish failures
 	// where the post-commit Notifier hook returned an error. In
 	// production this is a no-op so the counter is normally zero;
@@ -250,6 +258,12 @@ func New() *Metrics {
 			Name: "pgmqtt_inbound_qos2_pending",
 			Help: "Rows in the inbound_qos2 dedup table (refreshed each janitor tick).",
 		}),
+		NotifyQueueUsageRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_pg_notify_queue_usage_ratio",
+			Help: "pg_notification_queue_usage(), 0..1. Above ~0.5 means " +
+				"a slow listener is letting NOTIFYs back up; at 1.0 every " +
+				"committing tx in the cluster errors with SQLSTATE 54000.",
+		}),
 		WillsNotifyFailedTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgmqtt_wills_notify_failed_total",
 			Help: "Will-publish post-commit Notifier-hook failures (production no-op; surfaces in test rigs).",
@@ -325,6 +339,7 @@ func New() *Metrics {
 		m.Sessions,
 		m.RetainedCount,
 		m.InboundQoS2Pending,
+		m.NotifyQueueUsageRatio,
 		m.WillsNotifyFailedTotal,
 		m.RetainedDispatchFailedTotal,
 		m.DeliveryStageSeconds,

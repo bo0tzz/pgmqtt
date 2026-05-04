@@ -79,6 +79,7 @@ const (
 	JobRefreshDeliveriesGauge = "refresh_deliveries_gauge"
 	JobRefreshStateGauges    = "refresh_state_gauges"
 	JobSweepOrphanMessages   = "sweep_orphan_messages"
+	JobRefreshNotifyQueue    = "refresh_notify_queue"
 )
 
 // defaultJobIntervals defines the per-job cadence. The base ticker fires
@@ -94,6 +95,7 @@ var defaultJobIntervals = map[string]time.Duration{
 	JobRefreshDeliveriesGauge: 10 * time.Second,
 	JobRefreshStateGauges:     10 * time.Second,
 	JobSweepOrphanMessages:    30 * time.Second,
+	JobRefreshNotifyQueue:     10 * time.Second,
 }
 
 // Run loops until ctx is cancelled, running Tick every interval on this Pod.
@@ -293,6 +295,7 @@ func (j *Janitor) Tick(ctx context.Context) error {
 		{JobRefreshDeliveriesGauge, j.refreshDeliveriesGauge},
 		{JobRefreshStateGauges, j.refreshStateGauges},
 		{JobSweepOrphanMessages, j.sweepOrphanMessages},
+		{JobRefreshNotifyQueue, j.refreshNotifyQueue},
 	}
 	var firstErr error
 	for _, jb := range jobs {
@@ -323,6 +326,24 @@ func (j *Janitor) timed(job string, f func() error) error {
 		j.logger.Warn("janitor sub-job", "job", job, "err", err)
 	}
 	return err
+}
+
+// refreshNotifyQueue samples pg_notification_queue_usage() and writes
+// it to the gauge. PG's NOTIFY queue is shared-memory and capped; once
+// it fills (one wedged listener can do that under sustained publish
+// load), every committing transaction in the cluster errors at COMMIT
+// with SQLSTATE 54000. Most likely cause of "lights are slow tonight"
+// in a multi-pod deploy; previously invisible until the failure cliff.
+func (j *Janitor) refreshNotifyQueue(ctx context.Context) error {
+	if j.metrics == nil {
+		return nil
+	}
+	var v float64
+	if err := j.pool.QueryRow(ctx, `SELECT pg_notification_queue_usage()`).Scan(&v); err != nil {
+		return err
+	}
+	j.metrics.NotifyQueueUsageRatio.Set(v)
+	return nil
 }
 
 // refreshStateGauges populates the per-table cardinality gauges
