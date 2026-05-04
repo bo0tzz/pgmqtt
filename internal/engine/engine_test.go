@@ -237,10 +237,20 @@ func TestSessionExpiryDisconnectExtension(t *testing.T) {
 		p.Properties.SessionExpiryIntervalFlag = true
 	})
 
+	// handleDisconnect's deferred UPDATE runs on a background context
+	// after the broker's read loop unwinds; poll briefly so we don't
+	// race the test query against the async commit.
 	var expiresAt *time.Time
-	if err := h.Pool.QueryRow(ctx,
-		`SELECT session_expires_at FROM sessions WHERE client_id=$1`, clientID).Scan(&expiresAt); err != nil {
-		t.Fatalf("query: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := h.Pool.QueryRow(ctx,
+			`SELECT session_expires_at FROM sessions WHERE client_id=$1`, clientID).Scan(&expiresAt); err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if expiresAt != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if expiresAt == nil {
 		t.Fatalf("session_expires_at must be set after DISCONNECT with SE>0")
@@ -275,14 +285,21 @@ func TestSessionExpiryDisconnectCancellation(t *testing.T) {
 		p.Properties.SessionExpiryIntervalFlag = true
 	})
 
+	// Poll for the asynchronous DELETE to land — same race as
+	// TestSessionExpiryDisconnectExtension above.
+	deadline := time.Now().Add(2 * time.Second)
 	var n int
-	if err := h.Pool.QueryRow(ctx,
-		`SELECT count(*) FROM sessions WHERE client_id=$1`, clientID).Scan(&n); err != nil {
-		t.Fatalf("query: %v", err)
+	for time.Now().Before(deadline) {
+		if err := h.Pool.QueryRow(ctx,
+			`SELECT count(*) FROM sessions WHERE client_id=$1`, clientID).Scan(&n); err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if n != 0 {
-		t.Errorf("session row not deleted after DISCONNECT SE=0; count=%d", n)
-	}
+	t.Errorf("session row not deleted after DISCONNECT SE=0; count=%d", n)
 }
 
 func TestWillFiresOnUngraceful(t *testing.T) {
