@@ -137,6 +137,36 @@ func main() {
 	for i := range publishedByPub {
 		publishedByPub[i] = new(atomic.Int64)
 	}
+
+	// Per-minute heartbeat: long soaks otherwise look identical to a frozen
+	// rig in their log output (no reconnects = no log lines). One line per
+	// minute lets a future investigator confirm the rig is still pumping.
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		var lastPublished int64
+		var lastReceived int64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				curPub := int64(0)
+				for _, p := range publishedByPub {
+					curPub += p.Load()
+				}
+				curRecv := int64(0)
+				for _, s := range subStatsList {
+					curRecv += s.received.Load()
+				}
+				log.Printf("heartbeat: published=%d (+%d/min) received=%d (+%d/min) elapsed=%s",
+					curPub, curPub-lastPublished, curRecv, curRecv-lastReceived,
+					time.Until(endAt).Round(time.Second))
+				lastPublished = curPub
+				lastReceived = curRecv
+			}
+		}
+	}()
 	var pubWG sync.WaitGroup
 	perPubRate := *rate / *pubs
 	if perPubRate < 1 {
