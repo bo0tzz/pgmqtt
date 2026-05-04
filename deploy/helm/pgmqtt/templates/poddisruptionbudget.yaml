@@ -7,8 +7,16 @@ metadata:
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
 spec:
-  {{- with .Values.podDisruptionBudget.minAvailable }}
-  minAvailable: {{ . }}
+  {{- /* PDB minAvailable=N with replicaCount<=N wedges voluntary
+         disruption (kubectl drain, cluster autoscaler, kured all fail
+         with "would violate PDB"). When the user explicitly opts into
+         a single-replica deploy, render minAvailable=0 so drain works.
+         Anyone running multi-replica gets the configured value. */}}
+  {{- $min := .Values.podDisruptionBudget.minAvailable }}
+  {{- if and $min (le (int .Values.replicaCount) 1) }}
+  minAvailable: 0
+  {{- else if $min }}
+  minAvailable: {{ $min }}
   {{- end }}
   {{- with .Values.podDisruptionBudget.maxUnavailable }}
   maxUnavailable: {{ . }}

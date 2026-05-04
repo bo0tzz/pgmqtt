@@ -66,14 +66,39 @@ spec:
         - protocol: TCP
           port: {{ $.Values.networkPolicy.egress.postgresPort }}
     {{- end }}
-    {{- with .Values.networkPolicy.egress.kubernetesAPI }}
     # Kubernetes API — required for the User-CRD reconciler (every Pod
     # runs a controller-runtime manager; one wins the K8s Lease and
-    # reconciles, all need API access for the Lease + watch).
+    # reconciles, all need API access for the Lease + watch). When the
+    # operator left this empty, the operator goroutine silently broke;
+    # default to the kube-system DNS-style fallback so a misconfigured
+    # NetworkPolicy doesn't take the operator down without explanation.
+    {{- if .Values.networkPolicy.egress.kubernetesAPI }}
     - to:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.networkPolicy.egress.kubernetesAPI | nindent 8 }}
       ports:
         - protocol: TCP
           port: 443
+    {{- else }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+          podSelector:
+            matchLabels:
+              component: apiserver
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
     {{- end }}
 {{- end }}

@@ -7,6 +7,11 @@ replicaCount: 2
 image:
   repository: ghcr.io/bo0tzz/pgmqtt
   tag: ""           # defaults to .Chart.AppVersion
+  ## Optional digest pin. When set the rendered image becomes
+  ##   <repository>@sha256:...
+  ## and `tag` is ignored. Pin by digest for reproducible/locked
+  ## deploys; leave empty to track the floating tag.
+  digest: ""
   pullPolicy: IfNotPresent
 
 ## Postgres connection. Either set existingSecret to a Secret containing a

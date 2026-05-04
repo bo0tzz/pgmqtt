@@ -50,6 +50,14 @@ type UserReconciler struct {
 	ServiceHost string // e.g. "pgmqtt.mqtt.svc.cluster.local"
 	ServicePort int    // e.g. 1883
 	WSPort      int    // e.g. 8083
+	// Optional TLS endpoint for the User CR's Secret. When TLSHost is
+	// non-empty the operator emits an mqtts:// URI alongside the plain
+	// mqtt:// one. Operators wanting to push apps to TLS-only set the
+	// matching listener up out-of-band (ingress-nginx, HAProxy, etc.)
+	// — see docs/TLS.md.
+	TLSHost string
+	TLSPort int    // e.g. 8883
+	WSSPort int    // e.g. 8443
 
 	// BcryptCost overrides the cost used when hashing the User's password.
 	// 0 falls back to bcrypt.DefaultCost (10).
@@ -312,6 +320,27 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 			url.PathEscape(username), url.PathEscape(string(password)), host, port))
 		desired.Data["ws-uri"] = []byte(fmt.Sprintf("ws://%s:%s@%s:%d/mqtt",
 			url.PathEscape(username), url.PathEscape(string(password)), host, wsPort))
+		// TLS endpoints — populated only when an operator wires
+		// TLSHost/TLSPort into the broker's env (helm
+		// `operator.tlsHost` etc.). The plain mqtt:// URI stays in
+		// the Secret either way for in-cluster traffic; mqtts://
+		// gives consumer apps an opinionated path to the encrypted
+		// listener so they don't fall back to plaintext by default.
+		if r.TLSHost != "" {
+			tlsPort := r.TLSPort
+			if tlsPort == 0 {
+				tlsPort = 8883
+			}
+			desired.Data["tls-host"] = []byte(r.TLSHost)
+			desired.Data["tls-port"] = []byte(fmt.Sprintf("%d", tlsPort))
+			desired.Data["mqtts-uri"] = []byte(fmt.Sprintf("mqtts://%s:%s@%s:%d",
+				url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, tlsPort))
+			if wssPort := r.WSSPort; wssPort > 0 {
+				desired.Data["wss-port"] = []byte(fmt.Sprintf("%d", wssPort))
+				desired.Data["wss-uri"] = []byte(fmt.Sprintf("wss://%s:%s@%s:%d/mqtt",
+					url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, wssPort))
+			}
+		}
 		return controllerutil.SetControllerReference(user, desired, r.Scheme)
 	})
 	if err != nil {

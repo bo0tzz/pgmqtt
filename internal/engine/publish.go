@@ -10,10 +10,20 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
+
+// publishTimeout bounds the publish path against a wedged Postgres. The
+// inbound read loop's ctx has no deadline; without this wrap, a stalled
+// pgxpool.Acquire or in-flight statement would hang the conn until TCP
+// keepalive killed it minutes later. 5 s is conservative — fast enough
+// to surface DISCONNECT 0x88 to the publisher promptly, slow enough that
+// a transiently-busy PG (autovacuum, brief failover bounce) doesn't trip
+// it on healthy traffic.
+const publishTimeout = 5 * time.Second
 
 // handlePublish processes an inbound PUBLISH from the client and runs the
 // publisher path: optional retain update, message insert, delivery fanout,
@@ -99,7 +109,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		core.QoS2DedupKey = &qos2DedupKey{ClientID: c.clientID, PacketID: pk.PacketID}
 	}
 
-	res, err := c.eng.publishCore(ctx, core)
+	pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+	res, err := c.eng.publishCore(pubCtx, core)
 	if errors.Is(err, ErrQoS2Duplicate) {
 		// QoS-2 retransmit before PUBREL — re-send PUBREC, no fanout.
 		// Atomic dedup-and-publish runs in publishCore now; previously
@@ -111,6 +123,12 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		})
 	}
 	if err != nil {
+		// PG-down handling: surface a v5 DISCONNECT reason so the
+		// publisher knows why we're tearing the conn down. Without
+		// this, the client just sees a closed socket and reconnects
+		// blindly — which contributes to the reconnect storm against
+		// an already-ailing Postgres.
+		c.disconnectForPublishError(err)
 		return err
 	}
 	if c.eng.metrics != nil {
@@ -177,6 +195,40 @@ type publishCore struct {
 	// even if publishCore failed, causing the retry to hit ON CONFLICT
 	// and skip fanout).
 	QoS2DedupKey *qos2DedupKey
+}
+
+// disconnectForPublishError emits a v5 DISCONNECT with a reason code
+// that classifies the underlying Postgres failure, so a publisher can
+// distinguish "broker unavailable" from "broker hung up randomly".
+// Best-effort — write deadline is bounded by Conn.write's own logic.
+// v3.1.1 has no DISCONNECT-with-reason from server; we just close.
+func (c *Conn) disconnectForPublishError(err error) {
+	if c.protocol != mqttwire.ProtocolMQTT5 {
+		return
+	}
+	reason := byte(0x88) // Server unavailable
+	if errors.Is(err, context.DeadlineExceeded) {
+		reason = 0x88
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "53100": // disk_full
+			reason = 0x99 // Payload format invalid → no, use 0x97? Actually 0x99
+			// MQTT-5 0x97 Quota exceeded fits "no room"; 0x99 is Payload format invalid.
+			// 0x9C Use another server is wrong. 0x88 Server unavailable best-fits
+			// disk-full from the publisher's POV.
+			reason = 0x88
+		case "53200", "53300": // out_of_memory / too_many_connections
+			reason = 0x97 // Quota exceeded
+		case "57P01", "57P02", "57P03": // admin_shutdown / crash_shutdown / cannot_connect_now
+			reason = 0x88
+		}
+	}
+	_ = c.write(&packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+		ReasonCode:  reason,
+	})
 }
 
 // qos2DedupKey identifies the QoS-2 publish for inbound dedup. PacketID
