@@ -142,16 +142,20 @@ func TestListenerReconnectsOnTransientError(t *testing.T) {
 		t.Fatalf("pre-kill: got type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
 	}
 
-	// Kill the listener backends. pg_listening_channels() only reports the
-	// *current* connection's channels so we can't filter per-pid by listen
-	// channel from a separate pool conn. The broad approach — terminate
-	// every backend with application_name='pgmqttd-listener' — is fine in
-	// the test rig: the other pod's listener will also reconnect (no-op
-	// for the assertion below, just slightly more disruption than needed).
+	// Kill the listener backends for THIS test's database. Tests run in
+	// parallel against the same testcontainer Postgres instance (each test
+	// gets a fresh DB inside it); we must filter by datname so we don't
+	// nuke sibling tests' listener backends and blow past their reconnect
+	// retry budget. pg_listening_channels() reports only the current
+	// conn's channels so we can't filter per-pid by listen channel from
+	// the pool side; broad-terminate inside our own database is fine —
+	// the other pod's listener will also reconnect, no-op for the
+	// assertion below.
 	if _, err := mh.Pool.Exec(context.Background(), `
 		SELECT pg_terminate_backend(pid)
 		  FROM pg_stat_activity
 		 WHERE application_name = 'pgmqttd-listener'
+		   AND datname = current_database()
 		   AND pid <> pg_backend_pid()
 	`); err != nil {
 		t.Fatalf("pg_terminate_backend: %v", err)
@@ -190,6 +194,7 @@ func TestListenerReconnectsOnTransientError(t *testing.T) {
 		if err := mh.Pool.QueryRow(context.Background(), `
 			SELECT count(*) FROM pg_stat_activity
 			 WHERE application_name = 'pgmqttd-listener'
+			   AND datname = current_database()
 			   AND state = 'idle'`).Scan(&n); err == nil && n >= wantBackends {
 			break
 		}
