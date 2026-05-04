@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mochi-mqtt/server/v2/packets"
 	dto "github.com/prometheus/client_model/go"
 
@@ -226,6 +227,75 @@ func TestListenerReconnectsOnTransientError(t *testing.T) {
 	}
 	if !gotPost {
 		t.Fatalf("post-reconnect publish never reached subscriber after %d attempts", attempts)
+	}
+}
+
+// TestStaleTakeoverNotifyDoesNotKillFreshConn pins the token-aware
+// takeover semantics. A stale takeover NOTIFY (carrying the session_token
+// of a Conn that no longer exists) must NOT shut down a freshly-
+// reconnected Conn that owns a different token. Without the guard, a
+// reconnect storm could see PodA → PodB → PodA play out, with PodB's
+// earlier-queued notify arriving at PodA after the second reconnect and
+// killing the legitimate fresh Conn.
+func TestStaleTakeoverNotifyDoesNotKillFreshConn(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, newPodLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	// Connect a client; current token is whatever takeOwnership rotated
+	// to (call it T_fresh).
+	tc := pod.Connect(t, "stale-takeover-victim")
+	defer tc.Close()
+	conn, ok := pod.Engine.ConnFor("stale-takeover-victim")
+	if !ok {
+		t.Fatalf("conn not registered")
+	}
+	freshToken := conn.SessionToken()
+
+	// Emit a stale takeover notify with a random (unrelated) prevToken
+	// — this represents the PodA→PodB→PodA race where PodB's notify
+	// (carrying the now-superseded token) arrives late.
+	staleToken := uuid.New()
+	if staleToken == freshToken {
+		staleToken = uuid.New() // astronomically unlikely; just guard
+	}
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_takeover_"+l.BrokerID().String(),
+		staleToken.String()+"stale-takeover-victim"); err != nil {
+		t.Fatalf("emit stale notify: %v", err)
+	}
+
+	// Give the listener a moment to process it. The fresh Conn must
+	// still be alive.
+	time.Sleep(150 * time.Millisecond)
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := tc.NextRaw(); err == nil {
+		t.Fatalf("fresh conn was unexpectedly closed by a stale takeover notify")
+	}
+	// Now confirm a matching takeover (with the fresh token) DOES close
+	// it — otherwise the test wouldn't be testing the right thing.
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_takeover_"+l.BrokerID().String(),
+		freshToken.String()+"stale-takeover-victim"); err != nil {
+		t.Fatalf("emit matching notify: %v", err)
+	}
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := tc.NextRaw(); err == nil {
+		t.Fatalf("matching takeover failed to close conn")
 	}
 }
 

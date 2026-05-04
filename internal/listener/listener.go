@@ -283,13 +283,48 @@ func (l *Listener) dispatchNotification(ctx context.Context, notif *pgconn.Notif
 			l.logger.Warn("deliver", "msg", msgID, "err", err)
 		}
 	case takeoverCh:
-		if c, ok := l.eng.ConnFor(notif.Payload); ok {
-			l.logger.Info("takeover from peer", "client", notif.Payload)
-			c.Shutdown()
+		// Payload format (current): <36-char prevToken><clientID>.
+		// Forward-compat: a payload that doesn't parse as
+		// "uuid-then-anything" is treated as a bare clientID — older
+		// peers that haven't shipped the token-aware notify yet still
+		// trigger a shutdown of any matching local Conn.
+		prevToken, clientID, parsed := parseTakeoverPayload(notif.Payload)
+		c, ok := l.eng.ConnFor(clientID)
+		if !ok {
+			return
 		}
+		if parsed && c.SessionToken() != prevToken {
+			// Stale notification — the matching Conn over here was
+			// taken over again since this NOTIFY was emitted, so
+			// shutting it down would kill a healthy session.
+			l.logger.Debug("stale takeover ignored",
+				"client", clientID,
+				"payload_token", prevToken,
+				"current_token", c.SessionToken())
+			return
+		}
+		l.logger.Info("takeover from peer", "client", clientID)
+		c.Shutdown()
 	case quotaCh:
 		l.eng.QuotaExceededLocally(notif.Payload)
 	}
+}
+
+// parseTakeoverPayload splits a takeover NOTIFY payload into the token of
+// the Conn-being-superseded and the clientID. New format: <36-char UUID>
+// followed immediately by the clientID. The boolean return is false for
+// any payload that doesn't begin with a 36-char hyphenated UUID — those
+// are treated as bare clientIDs by the caller for forward-compat with
+// older peers that haven't shipped the token-aware notify yet.
+func parseTakeoverPayload(payload string) (prev uuid.UUID, clientID string, ok bool) {
+	if len(payload) < 36 {
+		return uuid.Nil, payload, false
+	}
+	t, err := uuid.Parse(payload[:36])
+	if err != nil {
+		return uuid.Nil, payload, false
+	}
+	return t, payload[36:], true
 }
 
 // pubChannel / takeoverChannel produce a quoted identifier suitable for the

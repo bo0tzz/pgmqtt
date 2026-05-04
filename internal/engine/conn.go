@@ -655,6 +655,11 @@ func (c *Conn) shutdown() {
 // goroutine — used by takeover and at server shutdown.
 func (c *Conn) Shutdown() { c.shutdown() }
 
+// SessionToken returns the per-conn session_token captured at takeover
+// time. Used by the listener's takeover dispatch to ignore a late
+// notification whose payload doesn't match this Conn's token.
+func (c *Conn) SessionToken() uuid.UUID { return c.sessionToken }
+
 // ClientID returns the resolved client identifier (empty before CONNECT).
 func (c *Conn) ClientID() string { return c.clientID }
 

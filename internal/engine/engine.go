@@ -41,7 +41,13 @@ type Notifier interface {
 // (single-Pod tests); production wires `listener.NewTakeoverNotifier`,
 // which fires `pg_notify` on `pgmqtt_takeover_<broker_id>`.
 type TakeoverNotifier interface {
-	NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string) error
+	// NotifyTakeover signals the prior owner Pod to close the now-stale
+	// socket for clientID. prevToken is the session_token captured at
+	// takeover time before rotation; the receiver MUST only close a Conn
+	// whose locally-stored sessionToken matches prevToken — otherwise a
+	// late notification could shut down a freshly-reconnected legitimate
+	// Conn during a reconnect storm.
+	NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string, prevToken uuid.UUID) error
 }
 
 // QuotaNotifier emits a "quota exceeded" signal for a client_id whose
@@ -652,7 +658,9 @@ func (n *inProcNotifier) Notify(ctx context.Context, brokerIDs []uuid.UUID, msgI
 
 type noopTakeover struct{}
 
-func (noopTakeover) NotifyTakeover(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+func (noopTakeover) NotifyTakeover(_ context.Context, _ uuid.UUID, _ string, _ uuid.UUID) error {
+	return nil
+}
 
 type noopQuota struct{}
 

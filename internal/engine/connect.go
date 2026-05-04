@@ -157,7 +157,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 
 	// Take ownership in a single transaction.
-	prevBroker, newSession, err := c.takeOwnership(ctx, pk)
+	prevBroker, prevToken, newSession, err := c.takeOwnership(ctx, pk)
 	if err != nil {
 		_ = c.writeConnackReject(pv, cackUnspecified)
 		return err
@@ -166,9 +166,13 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		"prev_broker", prevBroker, "new_broker", c.eng.BrokerID(),
 		"new_session", newSession)
 
-	// Notify the prior owner Pod (if any and different) so it can close the stale socket.
+	// Notify the prior owner Pod (if any and different) so it can close
+	// the stale socket. prevToken pins which Conn over there is stale —
+	// the receiver shuts down only the Conn whose sessionToken == prevToken
+	// so that a late-arriving notification can't kill a Conn that has
+	// since been re-taken-over back to that Pod.
 	if prevBroker != uuid.Nil && prevBroker != c.eng.BrokerID() {
-		if err := c.eng.takeover.NotifyTakeover(ctx, prevBroker, c.clientID); err != nil {
+		if err := c.eng.takeover.NotifyTakeover(ctx, prevBroker, c.clientID, prevToken); err != nil {
 			c.eng.logger.Warn("takeover notify", "prev", prevBroker, "err", err)
 		}
 	}
@@ -312,35 +316,43 @@ func authReasonLabel(reason byte) string {
 }
 
 // takeOwnership performs the CONNECT take-over upsert. Returns the previous
-// broker_id (uuid.Nil if first session) and whether this is a brand-new row.
+// broker_id (uuid.Nil if first session), the previous session_token (uuid.Nil
+// if no prior session), and whether this is a brand-new row.
 //
 // Every takeOwnership rotates the row's session_token so a peer's stale
 // handleDisconnect can guard its DELETE on the token captured at takeover
-// time and roll back instead of wiping the new conn's row. Token is stored
-// on Conn.sessionToken for handleDisconnect to read later.
-func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroker uuid.UUID, newSession bool, err error) {
+// time and roll back instead of wiping the new conn's row. The previous
+// token is also handed back so NotifyTakeover can target only the truly
+// stale Conn on the prior owner pod (and not a newer Conn that might have
+// since been re-taken-over back). Token is stored on Conn.sessionToken
+// for handleDisconnect to read later.
+func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroker uuid.UUID, prevToken uuid.UUID, newSession bool, err error) {
 	self := c.eng.BrokerID()
 	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return uuid.Nil, false, err
+		return uuid.Nil, uuid.Nil, false, err
 	}
 	defer tx.Rollback(ctx)
 
 	var existed bool
 	var existingBroker *uuid.UUID
+	var existingToken *uuid.UUID
 	err = tx.QueryRow(ctx,
-		`SELECT broker_id FROM sessions WHERE client_id=$1 FOR UPDATE`, c.clientID).
-		Scan(&existingBroker)
+		`SELECT broker_id, session_token FROM sessions WHERE client_id=$1 FOR UPDATE`, c.clientID).
+		Scan(&existingBroker, &existingToken)
 	switch err {
 	case nil:
 		existed = true
 		if existingBroker != nil {
 			prevBroker = *existingBroker
 		}
+		if existingToken != nil {
+			prevToken = *existingToken
+		}
 	case pgx.ErrNoRows:
 		existed = false
 	default:
-		return uuid.Nil, false, err
+		return uuid.Nil, uuid.Nil, false, err
 	}
 
 	expiry := defaultExpiryFor(pk)
@@ -391,13 +403,13 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 		).Scan(&newToken)
 	}
 	if err != nil {
-		return uuid.Nil, false, err
+		return uuid.Nil, uuid.Nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return uuid.Nil, false, err
+		return uuid.Nil, uuid.Nil, false, err
 	}
 	c.sessionToken = newToken
-	return prevBroker, !existed, nil
+	return prevBroker, prevToken, !existed, nil
 }
 
 func defaultExpiryFor(pk *packets.Packet) *int32 {

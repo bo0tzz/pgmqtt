@@ -20,9 +20,14 @@ func NewTakeoverNotifier(pool *pgxpool.Pool) engine.TakeoverNotifier {
 	return &PgTakeoverNotifier{pool: pool}
 }
 
-func (n *PgTakeoverNotifier) NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string) error {
+// Payload format: <36-char prevToken><clientID>. UUID hyphenated form is
+// always 36 chars so the receiver can split unambiguously without a
+// separator (clientIDs in MQTT 5 may contain any UTF-8 except NUL).
+func (n *PgTakeoverNotifier) NotifyTakeover(ctx context.Context, brokerID uuid.UUID, clientID string, prevToken uuid.UUID) error {
 	_, err := n.pool.Exec(ctx,
-		`SELECT pg_notify($1, $2)`, "pgmqtt_takeover_"+brokerID.String(), clientID)
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_takeover_"+brokerID.String(),
+		prevToken.String()+clientID)
 	return err
 }
 
