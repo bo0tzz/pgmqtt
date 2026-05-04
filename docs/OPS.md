@@ -37,75 +37,53 @@ Keys to look for in `/metrics`:
   PUBLISH path. See [`PERF.md`](PERF.md) for what each stage covers and
   how to read the breakdown when PUBACK latency creeps up.
 
-## "Leader stuck" — janitor + reconciler stop running
+## "Janitor / reconciler stopped running"
 
-The leader is whichever Pod currently holds `pg_advisory_lock(42)` on
-its dedicated `*pgx.Conn`. Exactly one Pod runs the janitor and the
-User-CR reconciler; if it dies hard, the lock should auto-release when
-the connection's TCP keepalive trips (~25 s by default).
+There is no singleton-leader anymore (since the leaderless refactor):
 
-### Crash-loop on unexpected leader-loss
-
-The pgmqttd process treats unexpected leader-loss (PG conn drop while
-holding the lock, network partition tripping PG keepalive, manual
-`pg_terminate_backend` against the leader conn) as a fatal event and
-exits non-zero. kubelet restarts the Pod and a fresh `leader.Start`
-re-races for the advisory lock against whichever Pod is now leader.
-
-This is the operating compromise for v1: rather than re-arm
-janitor/operator inside a Pod that's been demoted, we re-roll the
-Pod. Visible signal: a pod with `Restarts > 0` whose recent log lines
-include `"leader lost outside of shutdown — exiting for restart"` —
-this is normal-but-noteworthy, not an alert.
-
-If a single Pod is restart-looping continuously, that Pod's PG
-connectivity is unstable: check NetworkPolicy egress, PG `max_connections`
-saturation, or kube-proxy / kube-DNS health.
+- **Janitor** runs on every Pod independently. Sweep operations are
+  concurrency-safe by construction (per-row locks, SKIP LOCKED claims,
+  idempotent DELETEs, per-resource `try_advisory_lock`); see
+  `internal/janitor/janitor.go` package doc for the per-job analysis.
+- **User-CR reconciler** uses controller-runtime's K8s Lease leader
+  election. The Lease lives at
+  `coordination.k8s.io/leases/<broker-namespace>/pgmqtt-operator`.
+  Exactly one Pod's manager reconciles at a time; on loss
+  controller-runtime exits the manager and a peer Pod takes over —
+  no Pod restart involved.
 
 **Symptoms**
 
-- `pgmqtt_dead_brokers_handled_total` flatlines.
-- New `User` CRs don't get a Secret minted within ~5 s.
-- Will messages from a hard-dead Pod don't fire (the dead Pod's broker
-  ID is still seen as the owner of the will rows).
+- `pgmqtt_dead_brokers_handled_total` flatlines on EVERY Pod for
+  more than a tick or two: the cluster has lost connectivity to PG, or
+  no Pod is alive. (One Pod's counter being flat is fine — they only
+  increment on the Pod that *won* the per-broker advisory lock for
+  that scan tick.)
+- `pgmqtt_janitor_errors_total{job=...}` increasing on every Pod →
+  PG-side issue, not a leader issue. Check `pg_stat_activity` for
+  blocked sessions, `pg_locks` for contention, autovacuum status on
+  `sessions`/`deliveries`.
+- New `User` CRs don't get a Secret minted within ~5 s →
+  reconciler is wedged. Check the Lease:
+  ```bash
+  kubectl -n mqtt get lease pgmqtt-operator -o yaml
+  ```
+  `holderIdentity` shows which Pod currently has it. If it's a Pod
+  IP that no longer exists, the Lease will time out (default 15 s)
+  and a peer takes over. To force handoff: delete the Lease.
 
-**Diagnose**
-
-```sql
--- Who currently holds advisory lock 42 (the leader)?
-SELECT a.pid, a.application_name, a.client_addr, a.state, l.granted
-  FROM pg_locks l
-  JOIN pg_stat_activity a USING (pid)
- WHERE l.locktype = 'advisory'
-   AND l.objid = 42;
-
--- The application_name is "pgmqttd-leader" for the leader connection.
--- client_addr is the Pod's IP — cross-reference with `kubectl get pods -o wide`.
-```
-
-If you see no rows, no Pod has the lock — the next janitor scan should
-acquire it. If 30+ seconds elapse without acquisition, check:
-- Are any pgmqttd Pods running and Ready?
-- Are they connected to the right Postgres? (`PGMQTT_DATABASE_URL`)
-- Is Postgres wedged? (`pg_stat_activity` shows blocked sessions?)
-
-If a row exists but the Pod IP is no longer running, the dead Pod
-didn't shed the lock cleanly. Forcing release:
-
-```sql
--- Replace 12345 with the pid from the query above.
-SELECT pg_terminate_backend(12345);
-```
-
-The next pgmqttd scan picks up leadership within `interval` (default 1 s).
+  ```bash
+  kubectl -n mqtt delete lease pgmqtt-operator
+  ```
+  Next reconciler in the cluster will recreate it.
 
 ## "Zombie session ownership" — broker_id points at a dead Pod
 
 A session row's `broker_id` is the Pod that currently owns the client.
 On graceful shutdown the Pod clears it; on hard kill the janitor's
-`findDeadBrokers` scan re-claims it via `pg_try_advisory_lock`. If the
-janitor is also down (see "Leader stuck"), `broker_id` may stay stale
-and inbound NOTIFY fanout for that client goes nowhere.
+dead-broker scan re-claims it via `pg_try_advisory_lock`. If every
+Pod's janitor is wedged, `broker_id` may stay stale and inbound
+NOTIFY fanout for that client goes nowhere.
 
 **Diagnose**
 

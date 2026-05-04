@@ -258,11 +258,13 @@ change.
 
 Real but lower-impact than what landed:
 
-- [ ] **Strict leader-write fence.** Today's bounded-exposure
-      analysis is correct but leans on row-level locking and
-      idempotent writes for safety. A real fence (epoch column CAS
-      or routing all leader writes through `l.conn`) would eliminate
-      the 10s window. Worth doing before a strong-correctness claim.
+- [x] **Strict leader-write fence.** Resolved by going leaderless:
+      the janitor now runs on every Pod (every operation is already
+      concurrency-safe by construction — see janitor package doc),
+      and the operator switched to controller-runtime's K8s Lease
+      leader election. The L1 fence concern, L2 re-arm concern, and
+      L4 lost-cancellable-tick concern all dissolve because there's
+      no singleton leader to flap.
 - [ ] **Real-hardware perf re-measure.** All current numbers in
       PERF.md are from a contended kind cluster. A clean dedicated-
       host run on the same shape (5 pubs × inflight=50 × 5000/s ×
