@@ -191,44 +191,72 @@ run_tier2() {
 
 # ---------- tier3 phases ----------
 
+# t3_multi_broker spins a fresh kind cluster, helm-installs the broker,
+# then runs scripts/paho-multi-broker-incluster.sh — the in-cluster Pod
+# variant. The earlier port-forward path (scripts/paho-multi-broker.sh)
+# dropped after ~11 connections under paho's churn; the in-cluster
+# runner sidesteps that by talking directly to the Service VIP via
+# cluster DNS. Cluster name is namespaced to this script + tier3 so
+# parallel sessions don't collide.
+T3_CLUSTER="pgmqtt-validate-tier3-$$"
+T3_NS="mqtt"
+
+t3_multi_broker_setup() {
+    docker build --quiet -t pgmqtt:tier3 . >/dev/null
+    kind create cluster --name "$T3_CLUSTER" --wait 60s
+    kind load docker-image pgmqtt:tier3 --name "$T3_CLUSTER" >/dev/null
+    kubectl --context "kind-$T3_CLUSTER" create namespace "$T3_NS"
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" apply -f .github/ci/postgres.yaml
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" rollout status statefulset/postgres --timeout=180s
+    helm --kube-context "kind-$T3_CLUSTER" install pgmqtt deploy/helm/pgmqtt \
+        --namespace "$T3_NS" \
+        --set image.repository=pgmqtt --set image.tag=tier3 --set image.pullPolicy=IfNotPresent \
+        --set replicaCount=3 \
+        --set auth.allowAnonymous=true \
+        --set 'limits.maxQueuedDeliveriesPerClient=0' \
+        --set 'limits.maxConnections=0' \
+        --set 'limits.maxInboundMsgsPerSec=0' \
+        --set 'limits.maxConnectsPerIPPerSec=0' \
+        --set 'limits.maxAuthFailuresPerIPPerMin=0' \
+        --set operator.bcryptCost=4 \
+        --set "database.url=postgres://pgmqtt:pgmqtt@postgres.$T3_NS.svc:5432/pgmqtt?sslmode=disable" >/dev/null
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" rollout status deployment/pgmqtt --timeout=180s
+}
+
 t3_multi_broker() {
-    bash scripts/paho-multi-broker.sh \
-        --paho "$PAHO" \
+    bash scripts/paho-multi-broker-incluster.sh \
+        --cluster "$T3_CLUSTER" \
+        --namespace "$T3_NS" \
         --version both
 }
 
+t3_multi_broker_teardown() {
+    kind delete cluster --name "$T3_CLUSTER" >/dev/null 2>&1 || true
+}
+
 t3_soak_smoke() {
-    # Reuse the multi-broker kind cluster left up by t3_multi_broker if
-    # --keep-cluster was passed; otherwise spin a fresh single-broker
-    # docker for soak. Soak smoke = 60s × 1000 msg/s × 3 pubs × 3 subs.
-    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@localhost:$T2_PG_PORT/pgmqtt?sslmode=disable" \
-    PGMQTT_TCP_ADDR="127.0.0.1:$T2_BROKER_PORT" \
-    PGMQTT_WS_ADDR= \
-    PGMQTT_ALLOW_ANONYMOUS=true \
-        /tmp/pgmqttd-validate >>/tmp/pgmqttd-validate.log 2>&1 &
-    echo $! >/tmp/pgmqttd-validate.pid
-    for _ in $(seq 1 30); do
-        if (echo > /dev/tcp/127.0.0.1/$T2_BROKER_PORT) 2>/dev/null; then break; fi
-        sleep 1
-    done
-    go run ./cmd/soak \
-        -broker 127.0.0.1:$T2_BROKER_PORT \
-        -user '' -pass '' \
-        -duration 60s \
-        -rate 1000 \
-        -pubs 3 -subs 3 -inflight 25 -qos 1 \
-        -topic validate/soak >/tmp/validate-soak.json
+    # In-cluster soak against the same tier3 kind cluster t3_multi_broker
+    # set up. Direct Service VIP — no port-forward — so it's reliable under
+    # the rate the multi-broker run can take. 60s × 1000 msg/s × 3 pubs ×
+    # 3 subs at QoS 1.
+    bash scripts/soak-incluster.sh \
+        --cluster "$T3_CLUSTER" \
+        --namespace "$T3_NS" \
+        --duration 60s --rate 1000 \
+        --pubs 3 --subs 3 --inflight 25 --qos 1
 }
 
 run_tier3() {
     run_tier2
-    phase "multi-broker paho"  t3_multi_broker
-    # Soak smoke needs the same single-broker that paho used; t2_paho_setup
-    # already started it, t2_paho_teardown stopped it. Re-start for soak.
-    phase "soak setup"         t2_paho_setup
-    trap t2_paho_teardown EXIT
-    phase "soak smoke"         t3_soak_smoke
-    phase "soak teardown"      t2_paho_teardown
+    # tier3 reuses one kind cluster for both multi-broker paho and the
+    # soak smoke — same broker install, no per-phase teardown. The
+    # cluster is created in t3_multi_broker_setup and torn down in
+    # t3_multi_broker_teardown.
+    phase "tier3 cluster setup" t3_multi_broker_setup
+    trap t3_multi_broker_teardown EXIT
+    phase "multi-broker paho"   t3_multi_broker
+    phase "soak smoke"          t3_soak_smoke
+    phase "tier3 cluster teardown" t3_multi_broker_teardown
     trap - EXIT
 }
 
