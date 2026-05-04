@@ -7,8 +7,8 @@ metadata:
     # Templated CRDs apply on `helm upgrade`. Helm v3's crds/ directory
     # was install-only; templating them gives operators control via the
     # `crds.install` value but loses Helm's "create before render" guard.
-    # In practice the broker doesn't reference the CRD until the operator
-    # leader's first reconcile, so render-order isn't a problem here.
+    # In practice the broker doesn't reference the CRD until the elected
+    # reconciler's first reconcile, so render-order isn't a problem here.
     "helm.sh/resource-policy": keep
 spec:
   group: pgmqtt.io
@@ -38,7 +38,7 @@ spec:
         status: {}
       schema:
         openAPIV3Schema:
-          description: User configures an MQTT user account managed by pgmqttd. Exactly one Pod (the leader) reconciles each User into a row in the broker's Postgres `users` table.
+          description: User configures an MQTT user account managed by pgmqttd. controller-runtime's K8s Lease elects exactly one reconciler at a time across Pods; the elected Pod materialises each User into a row in the broker's Postgres `users` table.
           type: object
           properties:
             apiVersion:
