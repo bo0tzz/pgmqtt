@@ -1,9 +1,11 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,6 +21,25 @@ import (
 
 	pgmqttv1alpha1 "github.com/bo0tzz/pgmqtt/api/v1alpha1"
 )
+
+// inClusterNamespacePath is the canonical service-account namespace file
+// that Kubernetes injects into every Pod. Overridable for tests.
+var inClusterNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// resolveLeaderElectionNamespace returns the namespace the operator
+// should hold its Lease in. Order: explicit opts value, then the
+// in-cluster service-account file. Empty return means "neither was
+// resolvable; caller should disable the operator".
+func resolveLeaderElectionNamespace(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	b, err := os.ReadFile(inClusterNamespacePath)
+	if err != nil {
+		return ""
+	}
+	return string(bytes.TrimSpace(b))
+}
 
 // Options configures the operator manager.
 type Options struct {
@@ -64,6 +85,18 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 	if err != nil || resources == nil || len(resources.APIResources) == 0 {
 		logger.Info("operator: pgmqtt.io/v1alpha1 not registered in cluster; user reconciler disabled",
 			"hint", "install the User CRD to enable")
+		return nil
+	}
+
+	// Resolve the lease namespace early. If neither POD_NAMESPACE nor the
+	// in-cluster service-account file is available (dev workstation pointing
+	// at a real cluster via kubeconfig), disable the operator cleanly
+	// rather than letting controller-runtime emit "unable to find leader
+	// election namespace" mid-startup.
+	opts.LeaderElectionNamespace = resolveLeaderElectionNamespace(opts.LeaderElectionNamespace)
+	if opts.LeaderElectionNamespace == "" {
+		logger.Info("operator disabled: POD_NAMESPACE unset and not in-cluster",
+			"hint", "wire POD_NAMESPACE via the Downward API (helm chart's deployment template already does)")
 		return nil
 	}
 
