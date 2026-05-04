@@ -8,10 +8,15 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	TCPAddr     string
-	WSAddr      string
-	PodName     string
+	DatabaseURL  string
+	TCPAddr      string
+	WSAddr       string
+	PodName      string
+	PodNamespace string // K8s namespace this Pod runs in (Downward API).
+	// Used as the LeaderElectionNamespace for the operator's
+	// controller-runtime Lease. Empty falls back to the in-cluster
+	// auto-detect path; explicit-via-env is needed when running
+	// outside a cluster against a dev kubeconfig.
 
 	// AllowAnonymous accepts CONNECT without username/password. Off by default.
 	AllowAnonymous bool
@@ -84,7 +89,8 @@ func FromEnv() (*Config, error) {
 		DatabaseURL: os.Getenv("PGMQTT_DATABASE_URL"),
 		TCPAddr:     getenv("PGMQTT_TCP_ADDR", ":1883"),
 		WSAddr:      getenv("PGMQTT_WS_ADDR", ":8083"),
-		PodName:     os.Getenv("POD_NAME"),
+		PodName:      os.Getenv("POD_NAME"),
+		PodNamespace: os.Getenv("POD_NAMESPACE"),
 		ServiceHost:    os.Getenv("PGMQTT_SERVICE_HOST"),
 		ServicePort:    getenvInt("PGMQTT_SERVICE_PORT", 1883),
 		WSPort:         getenvInt("PGMQTT_SERVICE_WS_PORT", 8083),

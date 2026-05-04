@@ -1,5 +1,7 @@
 // Package operator implements the in-broker controller-runtime reconciler for
-// the User CRD. It runs only on the leader Pod (gated by leader.Leader.Acquired).
+// the User CRD. Multiple Pods can run the manager concurrently; controller-
+// runtime's K8s Lease leader election (`LeaderElection: true` in Run)
+// ensures exactly one reconciles at a time.
 package operator
 
 import (

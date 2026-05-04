@@ -1,5 +1,25 @@
 // Package janitor runs the dead-Pod scan, will fan-out, and orphan-message
-// sweep. Exactly one Pod runs the janitor at a time, gated by leader.Leader.
+// sweep. Every Pod runs an independent Tick loop. The work is concurrency-
+// safe by construction:
+//
+//   - findDeadBrokerCandidates + handleDeadBroker uses pg_try_advisory_lock
+//     per broker_id, so only one Pod claims any given dead broker at a time.
+//   - fireDueWills uses SELECT … FOR UPDATE SKIP LOCKED so concurrent Pods
+//     don't double-fire the same will.
+//   - expireSessions uses SELECT … FOR UPDATE; the row locks serialise
+//     concurrent leaders and the DELETE is idempotent.
+//   - expireRetained / sweepInboundQoS2 / sweepOrphanDeliveries /
+//     sweepOrphanMessages are pure idempotent DELETEs — each row is
+//     deleted at most once across Pods.
+//   - refreshDeliveriesGauge / refreshStateGauges are read-only. Each Pod
+//     observes the same state, sets its own Prometheus gauge; aggregation
+//     across Pods (Prom max()) gives the right cluster-wide value.
+//
+// Cost of running on every Pod: N × 9 sub-jobs/sec instead of 9. For the
+// 3-pod default deployment that's ~27 cheap PG queries/sec; trivial
+// compared to publish/deliver load. If a deployment scales past hundreds
+// of Pods, an opt-in pg_try_advisory_lock(TICK_KEY) prefix on Tick would
+// rate-limit cluster-wide.
 package janitor
 
 import (
@@ -18,8 +38,7 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
 
-// Run loops until ctx is cancelled. While leader.IsLeader is true (gated by
-// the Acquired/Lost channels) it runs Tick every interval.
+// Run loops until ctx is cancelled, running Tick every interval on this Pod.
 type Janitor struct {
 	pool     *pgxpool.Pool
 	eng      *engine.Engine
@@ -66,15 +85,10 @@ func (j *Janitor) SetInboundQoS2Grace(d time.Duration) { j.inboundQoS2Grace = d 
 // SetMetrics installs a Metrics instance for janitor counters. Optional.
 func (j *Janitor) SetMetrics(m *metrics.Metrics) { j.metrics = m }
 
-// Leader is the subset of leader.Leader the janitor depends on.
-type Leader interface {
-	Acquired() <-chan struct{}
-	Lost() <-chan struct{}
-	IsLeader() bool
-}
-
-// RunWith starts the loop, gated on leader.
-func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
+// Run starts the tick loop on this Pod. Returns when ctx is cancelled.
+// Every Pod runs its own Run; coordination is per-row in PG, not per-Pod
+// (see the package doc).
+func (j *Janitor) Run(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
 			j.logger.Error("janitor goroutine panic",
@@ -82,31 +96,7 @@ func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
 		}
 	}()
 
-	j.logger.Info("janitor waiting for leadership")
-	select {
-	case <-ctx.Done():
-		j.logger.Info("janitor exiting before leadership (ctx done)")
-		return
-	case <-leader.Acquired():
-		j.logger.Info("janitor leadership acquired; starting tick loop", "interval", j.interval)
-	case <-leader.Lost():
-		j.logger.Info("janitor exiting before leadership (lost)")
-		return
-	}
-
-	// runCtx cancels when leadership is lost so an in-flight tick's PG
-	// queries don't keep running on an ex-leader pod. Combined with the
-	// leader-write fence (task #84), this closes the double-fire window
-	// for wills/expiries when leadership transitions mid-tick.
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	go func() {
-		select {
-		case <-leader.Lost():
-			cancelRun()
-		case <-runCtx.Done():
-		}
-	}()
+	j.logger.Info("janitor starting", "interval", j.interval)
 
 	t := time.NewTicker(j.interval)
 	defer t.Stop()
@@ -114,10 +104,8 @@ func (j *Janitor) RunWith(ctx context.Context, leader Leader) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-leader.Lost():
-			return
 		case <-t.C:
-			if err := j.tickWithRecover(runCtx); err != nil &&
+			if err := j.tickWithRecover(ctx); err != nil &&
 				!errors.Is(err, context.Canceled) {
 				j.logger.Warn("janitor tick", "err", err)
 			}

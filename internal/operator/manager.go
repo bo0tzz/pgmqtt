@@ -26,21 +26,23 @@ type Options struct {
 	ServicePort int
 	WSPort      int
 	BcryptCost  int
+
+	// LeaderElectionNamespace is the namespace where the controller-runtime
+	// Lease resource lives. Empty means "auto-detect from the in-cluster
+	// config" (the namespace this Pod runs in), which is what production
+	// wants. Override only for tests or split-namespace setups.
+	LeaderElectionNamespace string
 }
 
-// LeaderSignal is the subset of leader.Leader the operator depends on.
-type LeaderSignal interface {
-	Acquired() <-chan struct{}
-	Lost() <-chan struct{}
-}
-
-// Run blocks until ctx is cancelled or leader is lost. It waits for leader,
-// then starts the controller-runtime manager and the User reconciler.
+// Run starts the controller-runtime manager and the User reconciler. The
+// manager uses K8s Lease leader election, so multiple Pods can call Run
+// concurrently and exactly one wins reconciliation responsibility at a
+// time. Returns when ctx is cancelled or the manager exits.
 //
 // If a Kubernetes client config can't be loaded (e.g., dev workstation with
 // no kubeconfig and no in-cluster config) Run logs and returns nil — the
 // broker continues to function without CRD-driven user management.
-func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.Logger, opts Options) error {
+func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Options) error {
 	logger = logger.With("component", "operator")
 	cfg, err := config.GetConfig()
 	if err != nil {
@@ -65,15 +67,6 @@ func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.L
 		return nil
 	}
 
-	// Block until we win leadership or shutdown.
-	select {
-	case <-ctx.Done():
-		return nil
-	case <-l.Lost():
-		return nil
-	case <-l.Acquired():
-	}
-
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(pgmqttv1alpha1.AddToScheme(scheme))
@@ -82,10 +75,16 @@ func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.L
 	log.SetLogger(zap.New(zap.UseDevMode(false)))
 
 	mgr, err := ctrl.NewManager(cfg, manager.Options{
-		Scheme:                 scheme,
-		LeaderElection:         false, // we elect leadership via Postgres advisory lock
-		HealthProbeBindAddress: ":0",
-		Metrics:                metricsserver.Options{BindAddress: "0"},
+		Scheme: scheme,
+		// K8s Lease leader election. Exactly one pod's manager runs the
+		// reconciler at a time; on leader loss controller-runtime exits
+		// the manager (Run returns) and a peer pod's Run takes over.
+		LeaderElection:                true,
+		LeaderElectionID:              "pgmqtt-operator",
+		LeaderElectionNamespace:       opts.LeaderElectionNamespace,
+		LeaderElectionReleaseOnCancel: true,
+		HealthProbeBindAddress:        ":0",
+		Metrics:                       metricsserver.Options{BindAddress: "0"},
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
@@ -105,19 +104,8 @@ func Run(ctx context.Context, l LeaderSignal, pool *pgxpool.Pool, logger *slog.L
 		return fmt.Errorf("setup: %w", err)
 	}
 
-	// Cancel mgr context on leader loss or parent shutdown.
-	mgrCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		select {
-		case <-l.Lost():
-			cancel()
-		case <-mgrCtx.Done():
-		}
-	}()
-
-	logger.Info("starting operator manager")
-	if err := mgr.Start(mgrCtx); err != nil {
+	logger.Info("starting operator manager", "leader_election_namespace", opts.LeaderElectionNamespace)
+	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
 	return nil

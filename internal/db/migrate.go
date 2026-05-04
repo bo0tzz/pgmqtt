@@ -15,9 +15,9 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// migrateLockKey is a stable bigint distinct from leader.LeaderKey. It is held
-// for the duration of a Migrate call so that concurrent Pods don't double-apply
-// (and double-fail with unique-constraint races on `CREATE TABLE`).
+// migrateLockKey is a stable bigint held for the duration of a Migrate call
+// so that concurrent Pods don't double-apply (and double-fail with
+// unique-constraint races on `CREATE TABLE`).
 const migrateLockKey int64 = 0x70676d717474_0001
 
 // Migrate applies any unapplied migrations from the embedded `migrations` directory

@@ -16,7 +16,6 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/db"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
 	"github.com/bo0tzz/pgmqtt/internal/janitor"
-	"github.com/bo0tzz/pgmqtt/internal/leader"
 	"github.com/bo0tzz/pgmqtt/internal/listener"
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 	"github.com/bo0tzz/pgmqtt/internal/operator"
@@ -110,50 +109,29 @@ func main() {
 	eng.SetTakeoverNotifier(listener.NewTakeoverNotifier(pool))
 	eng.SetQuotaNotifier(listener.NewQuotaNotifier(pool))
 
-	ld, err := leader.Start(ctx, cfg.DatabaseURL, logger)
-	if err != nil {
-		logger.Error("leader", "err", err)
-		os.Exit(1)
-	}
-	defer ld.Stop()
-
-	// Crash-loop policy on unexpected leader-loss: leader.Lost() closes when
-	// our session-scoped advisory lock is gone (PG conn drop, network
-	// partition that trips PG's TCP keepalive, manual `pg_terminate_backend`
-	// against our leader conn). The janitor + operator only react to Lost()
-	// once and exit; without restarting the process they would never re-arm.
-	// Rather than build a re-acquire path that re-runs the operator's
-	// manager startup + the janitor's tick loop, we let kubelet restart the
-	// pod — at which point a fresh leader.Start gets a fresh shot at the
-	// advisory lock against whichever pod is the new leader. Lost-during-
-	// shutdown (ctx cancelled) is normal and does NOT trigger this.
-	go func() {
-		defer recoverPanic(logger, "leader watchdog")
-		select {
-		case <-ctx.Done():
-			return
-		case <-ld.Lost():
-			if ctx.Err() != nil {
-				return
-			}
-			logger.Error("leader lost outside of shutdown — exiting for restart")
-			os.Exit(1)
-		}
-	}()
-
+	// Janitor runs on every Pod independently. Sweep operations are
+	// concurrency-safe by construction (per-row locks, SKIP LOCKED claims,
+	// idempotent DELETEs, per-resource try_advisory_lock) — no leader gate
+	// needed. See janitor package doc for the full safety analysis.
 	jt := janitor.New(pool, eng, logger)
 	jt.SetMetrics(mtx)
-	go jt.RunWith(ctx, ld)
+	go jt.Run(ctx)
 
+	// Operator uses controller-runtime's K8s Lease leader election.
+	// Multiple Pods call operator.Run concurrently; exactly one wins
+	// reconciliation responsibility at a time. Loss/handoff is handled
+	// inside controller-runtime; on loss the manager exits and a peer
+	// Pod's manager takes over (no Pod restart needed).
 	go func() {
 		defer recoverPanic(logger, "operator run")
 		opts := operator.Options{
-			ServiceHost: cfg.ServiceHost,
-			ServicePort: cfg.ServicePort,
-			WSPort:      cfg.WSPort,
-			BcryptCost:  cfg.BcryptCost,
+			ServiceHost:             cfg.ServiceHost,
+			ServicePort:             cfg.ServicePort,
+			WSPort:                  cfg.WSPort,
+			BcryptCost:              cfg.BcryptCost,
+			LeaderElectionNamespace: cfg.PodNamespace,
 		}
-		if err := operator.Run(ctx, ld, pool, logger, opts); err != nil {
+		if err := operator.Run(ctx, pool, logger, opts); err != nil {
 			logger.Error("operator", "err", err)
 		}
 	}()
