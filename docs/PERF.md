@@ -185,7 +185,7 @@ longer walks the broader index. Remaining follow-up for that path:
 ## Common patterns
 
 **`tx_commit` dominates.** This is fsync. Either your disk is slow,
-or Postgres' WAL volume is contended. Check `pg_stat_io` (PG16+):
+or Postgres' WAL volume is contended. Check `pg_stat_io` (PG18+):
 
 ```sql
 SELECT backend_type, object, fsyncs, fsync_time
@@ -228,7 +228,7 @@ and `pgmqtt_quota_<uuid>`.
 
 ## Enabling `pg_stat_statements`
 
-Not enabled by default in `postgres:16-alpine`. To turn on:
+Not enabled by default in `postgres:18-alpine`. To turn on:
 
 ```ini
 # postgresql.conf

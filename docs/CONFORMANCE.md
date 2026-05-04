@@ -11,7 +11,7 @@ users:
 ```bash
 docker run --rm -d --name pgmqtt-pg -p 55432:5432 \
   -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt -e POSTGRES_DB=pgmqtt \
-  postgres:16-alpine
+  postgres:18-alpine
 
 go build -o pgmqttd ./cmd/pgmqttd
 PGMQTT_DATABASE_URL='postgres://pgmqtt:pgmqtt@localhost:55432/pgmqtt?sslmode=disable' \

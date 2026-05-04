@@ -43,7 +43,7 @@ func SharedContainer(ctx context.Context) (*Shared, error) {
 			return
 		}
 		ctr, err := tcpostgres.Run(ctx,
-			"postgres:16-alpine",
+			"postgres:18-alpine",
 			tcpostgres.WithDatabase("pgmqtt_template"),
 			tcpostgres.WithUsername("pgmqtt"),
 			tcpostgres.WithPassword("pgmqtt"),

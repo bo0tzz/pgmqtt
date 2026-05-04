@@ -26,7 +26,7 @@ echo "==> launching postgres"
 docker run --rm -d --name "$PG_NAME" \
   -p "${PG_PORT}:5432" \
   -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt -e POSTGRES_DB=pgmqtt \
-  postgres:16-alpine >/dev/null
+  postgres:18-alpine >/dev/null
 
 echo "==> waiting for postgres"
 for _ in $(seq 1 60); do

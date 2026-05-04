@@ -123,7 +123,7 @@ kubectl -n mqtt get secret homeassistant-mqtt-credentials -o jsonpath='{.data.ur
 # Postgres via your favourite means; for testing:
 docker run --rm -d --name pgmqtt-pg -p 5432:5432 \
     -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt \
-    -e POSTGRES_DB=pgmqtt postgres:16-alpine
+    -e POSTGRES_DB=pgmqtt postgres:18-alpine
 
 export PGMQTT_DATABASE_URL='postgres://pgmqtt:pgmqtt@localhost:5432/pgmqtt?sslmode=disable'
 go run ./cmd/pgmqttd
