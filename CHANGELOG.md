@@ -45,25 +45,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   match 0007's narrower `state=0 AND qos>0` index. The new index's
   predicate matches the WHERE clause exactly, so the planner picks
   it deterministically.
+- Migration **0009** drops `sessions.next_packet_id` and the
+  `mqtt_next_packet_id()` SQL function. Outbound packet ID
+  allocation moved into a per-`*Conn` atomic counter seeded from
+  `MAX(packet_id)` on session takeover, eliminating the per-delivery
+  HOT-update churn that bloated the `sessions` row over hours of
+  operation. Spec only requires uniqueness per inflight; the seed
+  provides crash-recovery without persisted state.
+- `cleanStart=true` reconnect now also DELETEs `inbound_qos2`
+  rows for the client. Without this, stale QoS-2 dedup tombstones
+  from the prior incarnation persisted (the FK CASCADE didn't
+  trigger because takeOwnership reuses the existing sessions row).
+  A fresh QoS-2 PUBLISH that reused a packet_id from the prior
+  session would otherwise hit ON CONFLICT and be silently swallowed.
+- AUTH packet handling: CONNECT with `AuthenticationMethod` set is
+  now rejected with CONNACK 0x8C (Bad authentication method), and a
+  stray AUTH packet mid-connection draws DISCONNECT 0x82 (Protocol
+  error). Previously fell through to a generic "unsupported packet
+  type" socket close — non-conformant per MQTT-4.12.0-2.
+- `c.sessionExpiry` and `c.willDelay` switched from `*int32` to
+  `*uint32`. Spec values in the `[0x80000000, 0xFFFFFFFE]` range
+  no longer wrap to negative; the "never expire" sentinel is now
+  `MaxUint32` (matching `0xFFFFFFFF` from the spec) instead of the
+  ambiguous `MaxInt32`/`-1` pair. Persisted DB column stays INT
+  (int32) and clamps for record-keeping; in-memory authoritative
+  value preserves the full spec range.
+- `c.sessionExpiry` is now only assigned when the CONNECT actually
+  carried a `SessionExpiryInterval` property
+  (`SessionExpiryIntervalFlag == true`). The struct comment claimed
+  "nil = no value sent" but the assignment ignored that — the
+  graceful-DISCONNECT increase-from-0 invalidIncrease check keys
+  off this sentinel.
 
-### Added — operability
+### Added — observability
 
 - `pgmqtt_publish_seconds` Prometheus histogram with stages `total`,
   `qos2_dedup`, `retain`, `tx_begin`, `mqtt_publish_query`, `tx_commit`,
   `notify`, `response_write`. Per-stage attribution of inbound PUBLISH
   latency without correlating against `pg_stat_statements`.
+- `pgmqtt_delivery_seconds{stage}` histogram — outbound counterpart
+  with stages `total`, `scan`, `alloc`, `write`. Bounds the whole
+  publish→subscriber latency story together with `publish_seconds`.
+- `pgmqtt_janitor_tick_seconds{job}` histogram +
+  `pgmqtt_janitor_errors_total{job}` counter — per-sub-job timing
+  and error attribution for janitor.Tick. A single sub-job blowing
+  past the 1 s tick interval (or failing repeatedly) was previously
+  invisible in metrics.
+- `pgmqtt_auth_failures_total{reason}` counter, labels
+  `bad_credentials`, `not_authorized`, `bad_auth_method`,
+  `client_id_invalid`, `unsupported_protocol`, `other`. Brute-force
+  / misconfigured-client detection.
+- `pgmqtt_subscribes_total` / `pgmqtt_unsubscribes_total` counters,
+  symmetric with `publishes_total`. Bound topic-churn driven load.
+- `pgmqtt_subscriptions` / `pgmqtt_sessions` / `pgmqtt_retained_count`
+  / `pgmqtt_inbound_qos2_pending` gauges — table cardinalities,
+  refreshed each janitor tick.
+- `pgmqtt_will_fire_lateness_seconds` histogram — `(now - will_fire_at)`
+  at janitor fire time. SLO: delayed wills fire within ~1 s of
+  scheduled at default tick interval.
+- `pgmqtt_outbound_inflight_saturation` histogram —
+  `len(inflight)/cap(inflight)` sampled per delivery. Slow-consumer
+  shape detection.
+- `pgmqtt_connections_capacity_ratio` gauge — current accepted
+  connections / `maxConnections`. HPA scale-out signal.
+- `pgmqtt_wills_notify_failed_total` and
+  `pgmqtt_retained_dispatch_failed_total` counters — production-no-op
+  counters that surface InProcessNotifier failures (test) and
+  silent retained-dispatch failures (post-SUBACK).
+- Controller-runtime metrics (`controller_runtime_reconcile_*`,
+  `workqueue_*`) are now surfaced on our existing `/metrics`
+  endpoint via a dedupe-aware merge gatherer. Operator reconcile
+  latency / error rate / queue depth are observable without
+  scraping a second port.
 - `PGMQTT_PG_STATEMENT_TIMEOUT_MS` (default `30000`) plumbed into the
   pgxpool ConnConfig.RuntimeParams. Bounds wedged Postgres so publisher
   dispatch can't hang past keepalive.
+- `PGMQTT_LOG_FORMAT` (default `text`, accepts `json`) switches the
+  slog handler at startup. Production deployments behind log
+  aggregation (Loki, Datadog, Cloud Logging) get structured JSON
+  without a sidecar / regex extractor.
 - Helm `auth.allowAnonymous` and `extraEnv` values — the chart
   previously documented `--set auth.allowAnonymous=true` but no
   template rendered it; setting it was a silent no-op.
 - Helm `crds.install` is now actually wired. The User CRD moved from
   `crds/users.yaml` (Helm v3 install-only) into a templated CRD in
   `templates/crd-users.yaml` gated on `.Values.crds.install`.
+- Helm production knobs: `podAntiAffinity` (soft preset, off by
+  default), `imagePullSecrets`, `podLabels`, `extraVolumes` /
+  `extraVolumeMounts`, `priorityClassName`,
+  `topologySpreadConstraints`, `terminationGracePeriodSeconds`,
+  full probe tunability (initialDelay/period/timeout/failure/success
+  thresholds for both liveness and readiness), `extraEnvFrom`,
+  `service.externalTrafficPolicy` / `loadBalancerIP` /
+  `loadBalancerSourceRanges`, `hostNetwork`, `dnsPolicy`,
+  `dnsConfig`, `runtimeClassName`,
+  `automountServiceAccountToken: false` by default (broker doesn't
+  call the K8s API).
 - `cfg.PodName` (was read from POD_NAME env via Downward API but never
   consumed) is now pinned onto every log line via `slog.With`, so
   aggregated-log operators can correlate pod ↔ broker UUID.
+
+### Added — broker resilience
+
+- Goroutine panic recovery at every long-lived background boundary:
+  janitor.RunWith + per-tick (one panic in any sub-job no longer
+  takes the broker down), listener.run + per-NOTIFY dispatch,
+  per-Conn `run()`, `runDrainLoop`, the metrics serve goroutine,
+  and the operator.Run goroutine. All log a stack at ERROR before
+  returning. Per-iteration recovery means a malformed payload or
+  panic on one event doesn't kill the loop for subsequent ones.
+- Janitor tick context is now derived from the leader's lifecycle:
+  a watcher goroutine cancels the tick context when leader.Lost()
+  fires, so an in-flight tick's PG queries don't keep running on
+  an ex-leader pod.
+- Crash-loop policy on unexpected leader-loss: cmd/pgmqttd watches
+  `leader.Lost()`. If it fires while ctx is still live, the process
+  exits non-zero ("leader lost outside of shutdown — exiting for
+  restart") and kubelet restarts the pod. A fresh leader.Start in
+  the new process re-races for the advisory lock.
+- New per-engine ownership-sweep goroutine reconciles the local
+  conns map against `sessions.broker_id` every 5 s. Sockets we
+  still hold for client_ids the DB now attributes to a different
+  broker get `Shutdown()`ed. Closes the takeover-NOTIFY-fire-and-
+  forget gap where an orphaned socket could keep PUBLISHing
+  duplicates after a silent ownership transfer.
 
 ### Added — docs
 
@@ -73,7 +178,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a "how does this compare to other brokers?" table grounded in
   published benchmarks.
 - `docs/VERSIONING.md` defines the SemVer policy across broker /
-  operator API / PG schema and the CHANGELOG flow.
+  operator API / PG schema and the CHANGELOG flow. New
+  "Migration policy: rolling-deploy safety" section codifies the
+  2-phase rule (release N stops the code from depending on a schema
+  item; release N+1 removes it) after migration 0009 demonstrated
+  the rolling-deploy error window.
+- `docs/CONFORMANCE.md` documents the v5 spec areas not exercised by
+  the Paho suite where pgmqtt is conformant by *omission* —
+  enhanced auth, ResponseInformation, large-uint32 SessionExpiry,
+  will-publish MessageExpiryInterval-after-delay choice.
+- `docs/SIZING.md` cross-references the PERF.md histograms and
+  flags the existing rules-of-thumb numbers as preliminary pending
+  a clean dedicated-host re-measurement.
+- `docs/BACKUP.md` schema audit: clarified that pg_dump captures the
+  full schema (functions, partial indexes, sequences) by default, not
+  just the operator-facing survival set listed; added migration 0006
+  rollforward guidance and a `schema_migrations` cross-check to the
+  recovery-drill validation step.
+- `docs/OPS.md` "Crash-loop on unexpected leader-loss" subsection
+  documents the operator-visible signal (Restarts > 0 with
+  "leader lost outside of shutdown" log line) and what to investigate
+  when a single pod restart-loops continuously.
 
 ### Added — tests
 
