@@ -89,13 +89,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one more row before DISCONNECT 0x97. `OFFSET (p_max_queued - 1)
   LIMIT 1` restores the intended `>= cap` boundary.
   `engine_test.go::TestSlowSubscriberQuotaExceeded` catches this.
-- **Janitor tick frequency** lowered from 1s to 5s default
-  (`PGMQTT_JANITOR_INTERVAL_MS`, Helm `janitor.intervalMs`). The
-  prior 1s × 11 jobs × N pods generated ~33 PG queries/sec at idle
-  on a 3-replica cluster. The trade-off: will-fire / session-expire
-  / retained-expire latency rises by up to 4s — well within MQTT 5
-  spec tolerances. Lower for tighter precision, raise for less
-  churn at scale.
+- **Janitor sub-jobs are stratified by per-job interval.** Earlier
+  this round the base tick was bumped from 1s→5s to drop idle DB
+  churn, but Paho v5 `test_will_delay` asserts will-fire within 1s
+  of `WillDelayInterval`, so 5s blew the conformance suite and the
+  bump was reverted. The real fix is per-job stratification: each
+  sub-job carries its own minimum interval and a `lastRun`
+  timestamp; the base ticker fires every 1s (the GCD) and a job
+  fires iff `now - lastRun >= interval`. Shipping cadences:
+  `fire_due_wills` 1s (Paho precision), `expire_sessions` /
+  `expire_retained` / `find_dead_brokers` 5s,
+  `refresh_deliveries_gauge` / `refresh_state_gauges` 10s,
+  `sweep_inbound_qos2` / `sweep_orphan_deliveries` /
+  `sweep_orphan_messages` 30s. On a 3-pod cluster idle PG load
+  drops from ~33 queries/sec (11 jobs × 3 pods × 1Hz) to ~10/sec
+  averaged. Tests collapse the stratification with `SetJobIntervals`
+  (interval=0 ⇒ "fire every tick"). New
+  `TestJanitorStratifiedIntervals` pins the contract via a fake
+  clock that advances 1s per Tick over 12 ticks and asserts each
+  job's histogram sample-count.
 - **`PGMQTT_LOG_LEVEL` honors warn/error.** README advertised
   `debug|info|warn|error` but only `debug` was special-cased;
   the rest mapped to info. Now parses via `slog.Level.UnmarshalText`
