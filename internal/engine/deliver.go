@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -84,7 +85,9 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		return err
 	}
 
-	e.logger.Debug("deliver scan", "msg", messageID, "broker", self, "rows", len(items))
+	if e.logger.Enabled(ctx, slog.LevelDebug) {
+		e.logger.Debug("deliver scan", "msg", messageID, "broker", self, "rows", len(items))
+	}
 	for _, it := range items {
 		retain := false
 		if it.retainAsPublished {

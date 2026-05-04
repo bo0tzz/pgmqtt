@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -128,10 +129,12 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	if c.eng.metrics != nil {
 		c.eng.metrics.PublishesTotal.WithLabelValues(strconv.Itoa(int(pk.FixedHeader.Qos))).Inc()
 	}
-	c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
-		"qos", pk.FixedHeader.Qos, "msg", res.MessageID,
-		"brokers", len(res.BrokerIDs), "broker_ids", res.BrokerIDs,
-		"overflow", len(res.OverflowClients))
+	if c.eng.logger.Enabled(ctx, slog.LevelDebug) {
+		c.eng.logger.Debug("publish", "client", c.clientID, "topic", pk.TopicName,
+			"qos", pk.FixedHeader.Qos, "msg", res.MessageID,
+			"brokers", len(res.BrokerIDs), "broker_ids", res.BrokerIDs,
+			"overflow", len(res.OverflowClients))
+	}
 
 	if err := c.eng.notify.Notify(ctx, res.BrokerIDs, res.MessageID); err != nil {
 		c.eng.logger.Warn("post-commit notify hook", "msg", res.MessageID, "err", err)
