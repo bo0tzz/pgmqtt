@@ -24,4 +24,4 @@
 -- but the SHARE locks are short-lived (a delivery references one
 -- immutable message row once at INSERT, no chain accumulation).
 
-ALTER TABLE deliveries DROP CONSTRAINT deliveries_client_id_fkey;
+ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_client_id_fkey;

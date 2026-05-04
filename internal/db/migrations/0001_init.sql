@@ -1,9 +1,9 @@
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   username      TEXT PRIMARY KEY,
   password_hash TEXT NOT NULL
 );
 
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
   client_id        TEXT PRIMARY KEY,
   broker_id        UUID,
   connected        BOOLEAN NOT NULL DEFAULT false,
@@ -19,9 +19,9 @@ CREATE TABLE sessions (
   will_properties  JSONB,
   last_seen        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX sessions_broker_idx ON sessions(broker_id) WHERE broker_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS sessions_broker_idx ON sessions(broker_id) WHERE broker_id IS NOT NULL;
 
-CREATE TABLE subscriptions (
+CREATE TABLE IF NOT EXISTS subscriptions (
   client_id           TEXT REFERENCES sessions(client_id) ON DELETE CASCADE,
   topic_filter        TEXT NOT NULL,
   qos                 SMALLINT NOT NULL,
@@ -31,9 +31,9 @@ CREATE TABLE subscriptions (
   subscription_id     INT,
   PRIMARY KEY (client_id, topic_filter)
 );
-CREATE INDEX subscriptions_filter_idx ON subscriptions(topic_filter);
+CREATE INDEX IF NOT EXISTS subscriptions_filter_idx ON subscriptions(topic_filter);
 
-CREATE TABLE retained (
+CREATE TABLE IF NOT EXISTS retained (
   topic       TEXT PRIMARY KEY,
   payload     BYTEA NOT NULL,
   qos         SMALLINT NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE retained (
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id          BIGSERIAL PRIMARY KEY,
   topic       TEXT NOT NULL,
   payload     BYTEA NOT NULL,
@@ -51,9 +51,9 @@ CREATE TABLE messages (
   publisher_client_id TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX messages_created_idx ON messages(created_at);
+CREATE INDEX IF NOT EXISTS messages_created_idx ON messages(created_at);
 
-CREATE TABLE deliveries (
+CREATE TABLE IF NOT EXISTS deliveries (
   id          BIGSERIAL PRIMARY KEY,
   client_id   TEXT NOT NULL REFERENCES sessions(client_id) ON DELETE CASCADE,
   message_id  BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -62,8 +62,8 @@ CREATE TABLE deliveries (
   state       SMALLINT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX deliveries_client_state_idx ON deliveries(client_id, state, id);
-CREATE UNIQUE INDEX deliveries_client_packet_idx ON deliveries(client_id, packet_id) WHERE packet_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS deliveries_client_state_idx ON deliveries(client_id, state, id);
+CREATE UNIQUE INDEX IF NOT EXISTS deliveries_client_packet_idx ON deliveries(client_id, packet_id) WHERE packet_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION mqtt_topic_match(filter TEXT, topic TEXT)
 RETURNS BOOLEAN LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$

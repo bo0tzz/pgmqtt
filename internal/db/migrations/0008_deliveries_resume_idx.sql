@@ -31,6 +31,6 @@
 -- to keep online. A blocking CREATE INDEX is the simpler correct
 -- choice here.
 
-CREATE INDEX deliveries_client_id_resume_idx
+CREATE INDEX IF NOT EXISTS deliveries_client_id_resume_idx
     ON deliveries(client_id, id)
  WHERE state IN (0, 1, 2);

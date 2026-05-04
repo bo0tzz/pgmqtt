@@ -23,6 +23,6 @@
 -- in state=0,qos>0 — they're either acked-and-gone or in higher states
 -- mid-handshake), so cache footprint is negligible.
 
-CREATE INDEX deliveries_client_id_inflight_idx
+CREATE INDEX IF NOT EXISTS deliveries_client_id_inflight_idx
     ON deliveries(client_id, id)
  WHERE state = 0 AND qos > 0;
