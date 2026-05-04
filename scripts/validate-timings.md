@@ -87,21 +87,22 @@ Run after: any non-trivial change, before commit / before opening a PR.
 
 ## tier3 — `scripts/validate.sh tier3 --paho PATH`
 
-Wall clock: **measurement TBD** pending #142's in-cluster soak rig
-landing fully (a previous run via kubectl port-forward died mid-stream
-under sustained load — exactly the bug-class the rig fixes). Expect
-~12–18m end-to-end:
+Wall clock: ~15-20m end-to-end (one tier3 run on a `pgmqtt-perf` kind
+cluster: 6m tier2 prefix + ~7m multi-broker paho + ~70s soak smoke +
+~3m kind cluster setup/teardown). Numbers vary with docker image
+build cache state; cold runs add ~2m for image build + load.
 
-| Phase                    | Estimated  | Notes                                          |
+| Phase                    | Wall       | Notes                                          |
 |--------------------------|------------|------------------------------------------------|
 | (tier2 prefix)           | ~6m        | full tier2                                     |
-| `multi-broker paho`      | ~5–7m      | `scripts/paho-multi-broker.sh`: kind create + helm install + paho via Service VIP |
-| `soak setup`             | ~10s       | re-runs single-broker for the soak smoke phase |
-| `soak smoke`             | ~70s       | 60s × 1000 msg/s × QoS 1 across 3 pubs / 3 subs |
+| `tier3 cluster setup`    | ~3m        | docker build pgmqtt:tier3 + kind create + helm install + postgres rollout |
+| `multi-broker paho`      | ~7m        | `scripts/paho-multi-broker-incluster.sh`: builds the python+paho image, kind-loads it, runs `kubectl run` Pod against `pgmqtt.<ns>.svc.cluster.local:1883` (cluster DNS, no port-forward) |
+| `soak smoke`             | ~80s       | `scripts/soak-incluster.sh`: 60s × 1000 msg/s × QoS 1 across 3 pubs / 3 subs, also via the in-cluster Pod path |
+| `tier3 cluster teardown` | ~10s       | kind delete cluster                            |
 
-Once `scripts/soak-incluster.sh` (#142) is wired into validate.sh's tier3
-the soak smoke phase will move into the same kind cluster as the multi-
-broker paho run, and the dual setup/teardown will collapse.
+Both multi-broker paho and soak smoke now run as Pods inside the same
+kind cluster. The earlier port-forward path (`scripts/paho-multi-broker.sh`)
+is deprecated — it died after ~10 paho connections under load.
 
 **Bug classes caught here that tier2 doesn't:**
 - Cross-pod fanout: subscriptions on Pod A, publishes on Pod C, the

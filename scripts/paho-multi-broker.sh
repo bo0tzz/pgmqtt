@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# DEPRECATED — use scripts/paho-multi-broker-incluster.sh instead.
+#
+# This script's kubectl port-forward to the Service VIP drops mid-stream
+# under paho's connection churn (reproducible: dies after ~10 connections
+# in a 3-replica kind cluster). The in-cluster runner sidesteps this by
+# running the paho test driver as a Pod that talks to the Service VIP
+# directly via cluster DNS.
+#
+# Kept around for one-off port-forward debugging where you specifically
+# want to drive paho from outside the cluster. Don't use it for tier3
+# conformance numbers.
+#
+# ----- (original docstring) -----
 # Run the Paho MQTT conformance suite against a 3-Pod pgmqttd kind cluster,
 # exercising cross-Pod fanout via the Service VIP.
 #
