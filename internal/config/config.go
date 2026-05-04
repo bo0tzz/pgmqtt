@@ -65,6 +65,20 @@ type Config struct {
 	// 0x96 (Message Rate Too High). 0 disables the limit.
 	MaxInboundMsgsPerSec int
 
+	// MaxConnectsPerIPPerSec caps the per-source-IP CONNECT rate (and
+	// burst). Over-rate connections are dropped pre-CONNACK with the
+	// socket hard-closed (no CONNACK — sending one fans attackers' retries).
+	// 0 disables the limit.
+	//
+	// MaxAuthFailuresPerIPPerMin caps the per-IP rate of bcrypt failures
+	// before the IP enters a 60s "penalty box" — every CONNECT from
+	// that IP is dropped pre-bcrypt for the cool-off window. Together
+	// these mitigate the bcrypt-CPU DoS surface where an unauthenticated
+	// attacker can pin cores by streaming bad-credential CONNECTs.
+	// 0 disables the limit.
+	MaxConnectsPerIPPerSec     int
+	MaxAuthFailuresPerIPPerMin int
+
 	// MaxPacketSize is the post-CONNECT cap on the inbound packet size
 	// (bytes). The codec applies a hardcoded 1 MiB cap before CONNECT to
 	// bound DoS allocations from unauthenticated peers; once CONNECT lands
@@ -121,6 +135,8 @@ func FromEnv() (*Config, error) {
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
 		MaxConnections:               getenvInt("PGMQTT_MAX_CONNECTIONS", 5000),
 		MaxInboundMsgsPerSec:         getenvInt("PGMQTT_MAX_INBOUND_MSGS_PER_SEC", 1000),
+		MaxConnectsPerIPPerSec:     getenvInt("PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC", 5),
+		MaxAuthFailuresPerIPPerMin: getenvInt("PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN", 30),
 		MaxPacketSize:                getenvInt("PGMQTT_MAX_PACKET_SIZE", 16*1024*1024),
 		MetricsAddr:                  getenv("PGMQTT_METRICS_ADDR", ":9090"),
 		PGStatementTimeout:           time.Duration(getenvInt("PGMQTT_PG_STATEMENT_TIMEOUT_MS", 30000)) * time.Millisecond,
@@ -144,6 +160,12 @@ func FromEnv() (*Config, error) {
 	}
 	if c.MaxPacketSize < 0 || c.MaxPacketSize > 268435455 {
 		return nil, fmt.Errorf("PGMQTT_MAX_PACKET_SIZE must be in [0, 268435455]")
+	}
+	if c.MaxConnectsPerIPPerSec < 0 {
+		return nil, fmt.Errorf("PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC must be >= 0")
+	}
+	if c.MaxAuthFailuresPerIPPerMin < 0 {
+		return nil, fmt.Errorf("PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN must be >= 0")
 	}
 	switch c.LogFormat {
 	case "text", "json":

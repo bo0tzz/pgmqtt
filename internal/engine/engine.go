@@ -68,6 +68,13 @@ type Engine struct {
 
 	metrics *metrics.Metrics
 
+	// iplimit meters CONNECT rate + auth-failures per source IP to
+	// mitigate bcrypt-CPU DoS. Always non-nil; the limiter internally
+	// short-circuits when both knobs are 0. Lifecycle is bound to the
+	// engine's shutdown via iplimitCancel.
+	iplimit       *ipLimiter
+	iplimitCancel context.CancelFunc
+
 	connsMu     sync.RWMutex
 	conns       map[string]*Conn // client_id -> *Conn
 	openConns   atomic.Int64     // accepted-but-not-yet-closed sockets, regardless of CONNECT state
@@ -95,7 +102,7 @@ type Engine struct {
 
 // New constructs an Engine. SetBrokerID must be called before Serve so
 // publishes know who they are.
-func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*Engine, error) {
+func New(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog.Logger) (*Engine, error) {
 	e := &Engine{
 		cfg:            cfg,
 		pool:           pool,
@@ -107,6 +114,8 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		takeover:       noopTakeover{},
 		quota:          noopQuota{},
 	}
+	connectsPerSec := 0
+	authFailuresPerMin := 0
 	if cfg != nil {
 		e.maxConnsAtomic.Store(int64(cfg.MaxConnections))
 		e.maxQueuedAtomic.Store(int64(cfg.MaxQueuedDeliveriesPerClient))
@@ -114,7 +123,16 @@ func New(_ context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *slog
 		e.maxPacketSizeAtomic.Store(int64(cfg.MaxPacketSize))
 		e.receiveMaxV5Atomic.Store(int64(cfg.V5ReceiveMaximum))
 		e.keepaliveMaxV5Atomic.Store(int64(cfg.V5KeepaliveMax))
+		connectsPerSec = cfg.MaxConnectsPerIPPerSec
+		authFailuresPerMin = cfg.MaxAuthFailuresPerIPPerMin
 	}
+	// Bind the limiter's GC goroutine to a child of ctx that we cancel
+	// at shutdown (or when the parent ctx ends). Using a separate cancel
+	// rather than ctx itself means callers that pass context.Background()
+	// (single-use tests) still get GC stopped when the engine drains.
+	limCtx, limCancel := context.WithCancel(ctx)
+	e.iplimitCancel = limCancel
+	e.iplimit = newIPLimiter(limCtx, connectsPerSec, authFailuresPerMin)
 	return e, nil
 }
 
@@ -341,6 +359,15 @@ func (e *Engine) acceptTCP(ctx context.Context, ln net.Listener) {
 			e.logger.Warn("accept", "err", err)
 			continue
 		}
+		if reason, ok := e.checkIPLimits(nc.RemoteAddr()); !ok {
+			e.logger.Debug("connect dropped by ip-limiter",
+				"addr", nc.RemoteAddr(), "reason", reason)
+			if e.metrics != nil {
+				e.metrics.ConnectDroppedTotal.WithLabelValues(reason).Inc()
+			}
+			_ = nc.Close()
+			continue
+		}
 		if !e.tryReserveConn() {
 			e.logger.Warn("max connections reached; rejecting", "addr", nc.RemoteAddr())
 			e.rejectConnAtCap(nc)
@@ -380,6 +407,19 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 	}
 	mux := http.NewServeMux()
 	handler := func(w http.ResponseWriter, r *http.Request) {
+		// Pre-upgrade IP gate: same penalty-box / connect-rate checks
+		// as the TCP listener. Returning 429 (vs upgrading-then-closing)
+		// avoids the WebSocket handshake cost entirely for over-rate
+		// peers and matches the "hard close, no CONNACK" pattern.
+		if reason, ok := e.checkIPLimitsString(r.RemoteAddr); !ok {
+			e.logger.Debug("ws connect dropped by ip-limiter",
+				"remote", r.RemoteAddr, "reason", reason)
+			if e.metrics != nil {
+				e.metrics.ConnectDroppedTotal.WithLabelValues(reason).Inc()
+			}
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			e.logger.Warn("ws upgrade", "err", err)
@@ -413,6 +453,9 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 func (e *Engine) shutdownGracefully() {
 	e.shutdownOnce.Do(func() {
 		close(e.shutdown)
+		if e.iplimitCancel != nil {
+			e.iplimitCancel()
+		}
 		e.listenersMu.RLock()
 		tcpLn := e.tcpListener
 		wsLn := e.wsListener
@@ -496,6 +539,46 @@ func isClosedNetErr(err error) bool {
 		return false
 	}
 	return errors.Is(err, net.ErrClosed)
+}
+
+// checkIPLimits gates a brand-new socket against the per-IP limiter.
+// Returns ("", true) when the connection should proceed; otherwise
+// returns a Prometheus-friendly reason label and false. The caller is
+// expected to close the socket (and bump the metric) on a false return.
+//
+// Order matters: penalty-box (auth-failure cool-off) is checked before
+// the connect-rate bucket, since the box explicitly aims to short-
+// circuit the bcrypt path even if the IP is well within its CONNECT
+// rate budget.
+func (e *Engine) checkIPLimits(addr net.Addr) (reason string, ok bool) {
+	if addr == nil {
+		return "", true
+	}
+	return e.checkIPLimitsString(addr.String())
+}
+
+func (e *Engine) checkIPLimitsString(remote string) (reason string, ok bool) {
+	if e.iplimit == nil {
+		return "", true
+	}
+	if e.iplimit.inPenaltyBox(remote) {
+		return "penalty_box", false
+	}
+	if !e.iplimit.allowConnect(remote) {
+		return "rate_limit", false
+	}
+	return "", true
+}
+
+// recordAuthFailureFor ticks the limiter's auth-failure bucket for the
+// peer behind addr. Called from the CONNECT auth-reject path so a
+// stream of bad-credential CONNECTs from a single IP eventually trips
+// the penalty box and stops costing us bcrypt CPU.
+func (e *Engine) recordAuthFailureFor(addr net.Addr) {
+	if e.iplimit == nil || addr == nil {
+		return
+	}
+	e.iplimit.recordAuthFailure(addr.String())
 }
 
 // tryReserveConn atomically reserves a slot if under cap. Returns false when
