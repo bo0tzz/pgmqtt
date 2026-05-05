@@ -65,24 +65,32 @@ heap per in-CONNECT handshake), retained-flood-on-subscribe.
 
 ### Throughput: measured (same shape, single broker pod)
 
+Re-measured 2026-05-06 against the post-merge binary
+(commits `11837ad`, `ee27c59`).
+
 | QoS | Pubs | Inflight | Subs | Achieved msg/s | pub_total mean |
 | --- | ---  | ---      | ---  | ---            | ---            |
-| 0   | 1    | 1        | 1    | 1,081          | 1.3 ms         |
-| 1   | 1    | 1        | 1    | 97             | 2.9 ms         |
-| 1   | 1    | 50       | 1    | 504            | 1.9 ms         |
+| 0   | 1    | 1        | 1    | 1,078          | 1.7 ms         |
+| 1   | 1    | 1        | 1    | 98             | 3.7 ms         |
+| 1   | 1    | 50       | 1    | 425            | 2.3 ms         |
 | 1   | 5    | 50       | 3    | 1,070          | 4.6 ms         |
-| 1   | 10   | 50       | 5    | 813            | 12.6 ms        |
-| 1   | 10   | 100      | 5    | 807            | 12.7 ms        |
-| 2   | 1    | 1        | 1    | 97             | 3.2 ms         |
-| 2   | 1    | 1        | 1    | 355            | 2.1 ms (target 500) |
+| 1   | 10   | 50       | 5    | 784            | 12.6 ms        |
+| 1   | 10   | 100      | 5    | 777            | 13.1 ms        |
+| 2   | 1    | 1        | 1    | 97             | 4.2 ms         |
+| 2   | 1    | 1        | 1    | 336            | 2.3 ms (target 500) |
 
-Per-pod ceiling on this 8-core dev box: **~1,100 msg/s QoS-0**,
-**~1,000 msg/s QoS-1**, **~350 msg/s QoS-2**. The QoS-1 ceiling moves
+Per-pod ceiling on this 8-core dev box: **~1,080 msg/s QoS-0**,
+**~1,000 msg/s QoS-1**, **~340 msg/s QoS-2**. The QoS-1 ceiling moves
 left as concurrent publishers fan out to overlapping subscribers —
 same pattern documented in `PERF.md`. The bottleneck under
-multi-publisher saturation is the `mqtt_publish_query` stage (89% of
+multi-publisher saturation is the `mqtt_publish_query` stage (88% of
 publish time at 10 concurrent publishers): Postgres lock contention
-on the fanout INSERT, exactly as the v0.1.x perf round called out.
+on the fanout INSERT.
+
+For high-subscriber-count shapes (HA + integrations + dashboards class)
+the deliver-side LATERAL merge gives a **2.5× throughput multiplier**
+at 30 subs (133 → 332 msg/s) — see [`PERF.md`](PERF.md) "Deliver-side
+fanout" for the A/B numbers.
 
 ### Re-measure on your hardware
 

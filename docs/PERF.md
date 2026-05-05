@@ -96,31 +96,38 @@ instrumented. Cross-check against `process_cpu_seconds_total` and
 > `mqtt_publish_query` saturates first under multi-publisher
 > concurrency.
 
-## PG18 calibration (2026-05-05)
+## PG18 calibration (2026-05-06, post-LATERAL-merge)
 
 Single broker pod, `pgmqttd` built from this commit, postgres:18-alpine
 container, GOMAXPROCS=8, no CPU limit, allow-anonymous on. 30s/shape.
+Re-measured after the deliver-side LATERAL merge (commit `11837ad`)
+and the Tier-1 metric additions (`ee27c59`).
 
 ### Throughput by shape
 
 | QoS | Pubs | Inflight | Subs | Target msg/s | Achieved | pub_total mean | mqtt_publish_query mean |
 | --- | ---  | ---      | ---  | ---          | ---      | ---            | ---                     |
-| 0   | 1    | 1        | 1    | 100          | 98.2     | 3.8 ms         | 2.0 ms                  |
-| 0   | 1    | 1        | 1    | 1,000        | 935.2    | 1.5 ms         | 1.1 ms                  |
-| 0   | 1    | 1        | 1    | 5,000        | 1,081    | 1.3 ms         | 1.0 ms                  |
-| 1   | 1    | 1        | 1    | 100          | 97.1     | 2.9 ms         | 1.9 ms                  |
-| 1   | 1    | 50       | 1    | 1,000        | 503.8    | 1.9 ms         | 1.4 ms                  |
-| 1   | 5    | 50       | 3    | 5,000        | 1,069.8  | 4.6 ms         | 3.7 ms                  |
-| 1   | 10   | 50       | 5    | 10,000       | 812.7    | 12.6 ms        | 11.2 ms                 |
-| 1   | 10   | 100      | 5    | 20,000       | 806.9    | 12.7 ms        | 11.2 ms                 |
-| 2   | 1    | 1        | 1    | 100          | 96.9     | 3.2 ms         | 2.0 ms                  |
-| 2   | 1    | 1        | 1    | 500          | 355.0    | 2.1 ms         | 1.4 ms                  |
+| 0   | 1    | 1        | 1    | 100          | 98.2     | 4.1 ms         | 2.4 ms                  |
+| 0   | 1    | 1        | 1    | 1,000        | 935.0    | 1.3 ms         | 1.0 ms                  |
+| 0   | 1    | 1        | 1    | 5,000        | 1,077.7  | 1.7 ms         | 1.3 ms                  |
+| 1   | 1    | 1        | 1    | 100          | 97.8     | 3.7 ms         | 2.3 ms                  |
+| 1   | 1    | 50       | 1    | 1,000        | 425.3    | 2.3 ms         | 1.6 ms                  |
+| 1   | 5    | 50       | 3    | 5,000        | 1,069.7  | 4.6 ms         | 3.5 ms                  |
+| 1   | 10   | 50       | 5    | 10,000       | 784.1    | 12.6 ms        | 11.1 ms                 |
+| 1   | 10   | 100      | 5    | 20,000       | 776.5    | 13.1 ms        | 11.5 ms                 |
+| 2   | 1    | 1        | 1    | 100          | 97.0     | 4.2 ms         | 2.6 ms                  |
+| 2   | 1    | 1        | 1    | 500          | 336.2    | 2.3 ms         | 1.5 ms                  |
 
 Per-pod ceilings on this hardware:
 
 - **QoS-0** ~1,100 msg/s (pure publish-no-ack)
 - **QoS-1** ~1,000 msg/s under heavy fanout (multi-pub × multi-sub)
 - **QoS-2** ~350 msg/s (full PUBREC/PUBREL/PUBCOMP handshake)
+
+Ceilings are unchanged from the 2026-05-05 pre-merge sweep (within
+sweep noise, ±5%) — the merge only touches the deliver-side scan, which
+is sub-millisecond at these shapes. Where the merge does matter is at
+high subscriber fanout: see "Deliver-side fanout" below.
 
 ### Where the time goes (QoS-1, 5 pubs × 50 inflight × 3 subs, near-saturation)
 
