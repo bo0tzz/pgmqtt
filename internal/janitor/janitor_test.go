@@ -148,6 +148,54 @@ func TestJanitorWillDelayRespectedAcrossDeadBroker(t *testing.T) {
 	}
 }
 
+// TestJanitorExpireSessionsDeletesPastExpiry pins the contract Paho's
+// test_session_expiry depends on: a session with session_expires_at in
+// the past and connected=false MUST be DELETEd on the next janitor
+// tick. The test seeds the row directly (no live conn) so we exercise
+// the SQL path without timing flakes.
+func TestJanitorExpireSessionsDeletesPastExpiry(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+
+	ctx := context.Background()
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start,
+		                     session_expires_at)
+		VALUES ('expired-1', NULL, false, 5, false, now() - interval '1 second')
+	`); err != nil {
+		t.Fatalf("seed expired: %v", err)
+	}
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, broker_id, connected, protocol_version, clean_start,
+		                     session_expires_at)
+		VALUES ('alive-1', NULL, false, 5, false, now() + interval '60 seconds')
+	`); err != nil {
+		t.Fatalf("seed alive: %v", err)
+	}
+
+	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	if err := jt.Tick(ctx); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var n int
+	if err := mh.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE client_id='expired-1'`).Scan(&n); err != nil {
+		t.Fatalf("query expired: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expired session not deleted: count=%d", n)
+	}
+	if err := mh.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE client_id='alive-1'`).Scan(&n); err != nil {
+		t.Fatalf("query alive: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("alive session deleted prematurely: count=%d", n)
+	}
+}
+
 func TestJanitorOrphanSweep(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 1, nil)
