@@ -88,7 +88,13 @@ const (
 var defaultJobIntervals = map[string]time.Duration{
 	JobFindDeadBrokers:        5 * time.Second,
 	JobFireDueWills:           1 * time.Second,
-	JobExpireSessions:         5 * time.Second,
+	// Paho test_session_expiry sleeps 6 s after a disconnect with
+	// SessionExpiryInterval=5 and asserts the session is gone on
+	// reconnect. With expire_sessions at 5 s, the next tick after
+	// expiry can arrive >5 s late depending on phase, blowing the
+	// 1 s slack the test gives. Tighten to 1 s so expiry is honored
+	// within the spec's <2× tolerance and the test's window.
+	JobExpireSessions:         1 * time.Second,
 	JobExpireRetained:         5 * time.Second,
 	JobSweepInboundQoS2:       30 * time.Second,
 	JobSweepOrphanDeliveries:  30 * time.Second,
