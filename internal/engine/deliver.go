@@ -31,22 +31,19 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	rows, err := e.pool.Query(ctx, `
 		SELECT d.id, d.client_id, d.qos, d.state, d.packet_id,
 		       m.topic, m.payload, m.properties, m.retain, m.expires_at, m.created_at,
-		       COALESCE(
-		         (SELECT array_agg(sub.subscription_id ORDER BY sub.subscription_id)
-		            FROM subscriptions sub
-		           WHERE sub.client_id = d.client_id
-		             AND sub.subscription_id IS NOT NULL
-		             AND mqtt_topic_match(sub.topic_filter, m.topic)),
-		         '{}'::int[]) AS sub_ids,
-		       COALESCE(
-		         (SELECT bool_or(sub.retain_as_published)
-		            FROM subscriptions sub
-		           WHERE sub.client_id = d.client_id
-		             AND mqtt_topic_match(sub.topic_filter, m.topic)),
-		         false) AS retain_as_published
+		       COALESCE(sm.sub_ids, '{}'::int[]) AS sub_ids,
+		       COALESCE(sm.retain_as_published, false) AS retain_as_published
 		  FROM deliveries d
 		  JOIN sessions s ON s.client_id = d.client_id
 		  JOIN messages m ON m.id = d.message_id
+		  LEFT JOIN LATERAL (
+		    SELECT array_agg(sub.subscription_id ORDER BY sub.subscription_id)
+		             FILTER (WHERE sub.subscription_id IS NOT NULL) AS sub_ids,
+		           bool_or(sub.retain_as_published) AS retain_as_published
+		      FROM subscriptions sub
+		     WHERE sub.client_id = d.client_id
+		       AND mqtt_topic_match(sub.topic_filter, m.topic)
+		  ) sm ON true
 		 WHERE d.message_id = $1
 		   AND s.broker_id = $2
 		   AND d.state = 0
@@ -264,21 +261,18 @@ func (c *Conn) drainSessionQueue(ctx context.Context) error {
 	rows, err := c.eng.pool.Query(ctx, `
 		SELECT d.id, d.qos, d.state, d.packet_id,
 		       m.topic, m.payload, m.properties, m.retain, m.expires_at,
-		       COALESCE(
-		         (SELECT array_agg(sub.subscription_id ORDER BY sub.subscription_id)
-		            FROM subscriptions sub
-		           WHERE sub.client_id = d.client_id
-		             AND sub.subscription_id IS NOT NULL
-		             AND mqtt_topic_match(sub.topic_filter, m.topic)),
-		         '{}'::int[]) AS sub_ids,
-		       COALESCE(
-		         (SELECT bool_or(sub.retain_as_published)
-		            FROM subscriptions sub
-		           WHERE sub.client_id = d.client_id
-		             AND mqtt_topic_match(sub.topic_filter, m.topic)),
-		         false) AS retain_as_published
+		       COALESCE(sm.sub_ids, '{}'::int[]) AS sub_ids,
+		       COALESCE(sm.retain_as_published, false) AS retain_as_published
 		  FROM deliveries d
 		  JOIN messages m ON m.id = d.message_id
+		  LEFT JOIN LATERAL (
+		    SELECT array_agg(sub.subscription_id ORDER BY sub.subscription_id)
+		             FILTER (WHERE sub.subscription_id IS NOT NULL) AS sub_ids,
+		           bool_or(sub.retain_as_published) AS retain_as_published
+		      FROM subscriptions sub
+		     WHERE sub.client_id = d.client_id
+		       AND mqtt_topic_match(sub.topic_filter, m.topic)
+		  ) sm ON true
 		 WHERE d.client_id = $1
 		   AND d.state IN (0, 1, 2)
 		   AND (m.expires_at IS NULL OR m.expires_at > now())
