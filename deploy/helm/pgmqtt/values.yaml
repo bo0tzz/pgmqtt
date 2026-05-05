@@ -206,7 +206,10 @@ ui:
       drop:
         - ALL
 
-## Sized for limits.maxConnections=5000 with HA + Z2M-class workloads.
+## Sized for typical homelab / small-cluster shapes (≤ ~1k conns +
+## few hundred msg/s). If you're driving meaningfully higher load,
+## bump these with the table below — but at that scale you should be
+## thinking about resource settings anyway.
 ##
 ## Measured at idle (Linux x86_64 dev box, GOMAXPROCS=8, postgres:18-alpine,
 ## 2026-05-05): RSS scales linearly with conn count above ~500 conns at
@@ -218,24 +221,23 @@ ui:
 ## goroutine + one drain goroutine per connection).
 ##
 ##   conns   measured idle RSS    suggested limit (×2 burst)   request
-##       0           ~42 MiB                 256 MiB              64 MiB
-##     500           ~70 MiB                 256 MiB             128 MiB
-##    1000           ~88 MiB                 384 MiB             128 MiB
-##    2500          ~152 MiB                 512 MiB             192 MiB
-##    5000          ~250 MiB           1 GiB (chart default)    256 MiB
-##   10000          ~460 MiB                 1.5 GiB             512 MiB
+##       0           ~42 MiB              256 MiB (default)       64 MiB
+##     500           ~70 MiB              256 MiB (default)       64 MiB
+##    1000           ~88 MiB                  384 MiB            128 MiB
+##    2500          ~152 MiB                  512 MiB            192 MiB
+##    5000          ~250 MiB                  1 GiB              256 MiB
+##   10000          ~460 MiB                  1.5 GiB            512 MiB
 ##
-## The 1 GiB default at maxConnections=5000 gives ~4× burst headroom over
-## the measured idle number — covers reconnect storms (each in-CONNECT
-## handshake holds ~4 KB extra heap) and retained-message floods.
-## Inflight throughput at QoS-1 saturated ≈ 1000 msg/sec/pod with a
-## measured working-set heap of ~60 MiB above idle.
+## At chart default `limits.maxConnections=5000` the *cap* is 5k but
+## the *expected* working set is much smaller. The 256 MiB limit
+## comfortably covers up to ~3.5k conns idle plus burst headroom. Going
+## bigger means owning the sizing — there's no good default.
 resources:
   requests:
     cpu: 100m
-    memory: 256Mi
+    memory: 64Mi
   limits:
-    memory: 1Gi
+    memory: 256Mi
 
 ## Annotations applied to every broker Pod template. Useful for things like
 ## Prometheus scrape hints, Vault sidecar injection, or operator-required keys.

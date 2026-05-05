@@ -17,20 +17,25 @@ The broker is mostly I/O-bound (TCP read/write + Postgres queries) and
 spends very little CPU per packet, with bcrypt the one CPU spike on
 CONNECT auth.
 
-The supplied default resource block in `values.yaml` is sized for the
-chart's default `limits.maxConnections=5000`:
+The supplied default resource block in `values.yaml` is sized for
+typical homelab / small-cluster shapes (≤ ~1k conns + a few hundred
+msg/s):
 
 ```yaml
 resources:
   requests:
     cpu: 100m
-    memory: 256Mi
+    memory: 64Mi
   limits:
-    memory: 1Gi
+    memory: 256Mi
 ```
 
-…and handles **5,000 idle connections + ~1,000 msg/s QoS-1 sustained**
-per Pod on a modern x86_64 core.
+The chart's `limits.maxConnections` default of 5,000 is the per-Pod
+**ceiling**, not the expected working set. On the measured fit
+(`RSS_MB ≈ 48 + 0.042 × N`) the 256 MiB limit covers ~3.5k idle
+conns + burst headroom; if you legitimately expect to drive 5k+ conns
+or sustained QoS-1 above ~1k msg/s/pod, bump per the table below —
+which is sized territory anyway.
 
 ### Memory: measured (PG18, GOMAXPROCS=8, 2026-05-05)
 
