@@ -139,6 +139,26 @@ documented in the PG16 baseline. The 19× scaling factor that
 appeared on the noisy kind cluster is a 3× factor on a clean dev box;
 the *direction* matches.
 
+### Deliver-side fanout (high-subscriber A/B)
+
+The `Deliver()` SELECT used to run two correlated subqueries against
+`subscriptions` per matched delivery row — once for the
+`subscription_id` array, once for `bool_or(retain_as_published)`.
+Commit `11837ad` collapsed both into one `LEFT JOIN LATERAL`.
+
+| Shape (60s)              | Mean `delivery_seconds{stage=scan}` | Achieved msg/s |
+| ---                      | ---                                 | ---            |
+| 30 subs, OLD (2 sub-q's) | 8.22 ms                             | 133            |
+| 30 subs, NEW (LATERAL)   | **2.85 ms**  (−65%)                 | **332**  (2.5×) |
+| 3 subs, OLD              | 1.19 ms                             | 984            |
+| 3 subs, NEW              | 1.16 ms  (−2.6%)                    | 1,037           |
+
+The merge has shape-dependent ROI: at 3 subs (homelab norm) the win
+is in the noise; at 30 subs (HA + integrations + zigbee2mqtt +
+several dashboards) it's a 2.5× throughput multiplier. Bigger fanout
+amplifies it further because the per-row LATERAL pays once instead
+of twice.
+
 ### Idle memory
 
 A 5-point sweep at 0 / 100 / 500 / 1,000 / 2,500 / 5,001 idle
