@@ -163,32 +163,6 @@ suggested below. Cross items off in this file as they ship.
       what it deliberately doesn't (TLS, ACLs, mTLS), production
       recommendations, secrets handling.
 
-## 7. Release engineering
-
-- [ ] **Tag v0.1.0 locally** once 1–4 are done. The chart is published
-      automatically to `oci://ghcr.io/bo0tzz/charts/pgmqtt` by the
-      `chart-release.yml` workflow on tag push (no HTTP repo, no
-      gh-pages step). The AI assistant doesn't perform the tag push
-      itself — that remains a human action — but everything downstream
-      of the tag is wired.
-
-- [x] **Goreleaser** + matching workflow. `.goreleaser.yaml` produces
-      `pgmqttd_<version>_<os>_<arch>.tar.gz` for `linux/{amd64,arm64}`
-      and `darwin/{amd64,arm64}` plus a sha256 checksum file. The
-      `release` workflow runs on tag push with auto-publish disabled
-      so the maintainer reviews `dist/` before flipping `release.disable`
-      to false. Manual `workflow_dispatch` runs `--snapshot` for
-      dry-runs.
-
-- [x] **Semver policy** + CHANGELOG discipline. `docs/VERSIONING.md`
-      defines what bumps MAJOR / MINOR / PATCH (across broker, operator
-      API, and Postgres schema) and the `[Unreleased]` → `[X.Y.Z] -
-      YYYY-MM-DD` flow. `CHANGELOG.md` follows Keep a Changelog and is
-      updated per-PR.
-
-- [ ] **Deprecation policy** for the `User` CRD (`v1alpha1` → `v1beta1` →
-      `v1`). For now `v1alpha1` is fine.
-
 ## Out of scope (per original v1 plan)
 
 These were explicitly listed in the plan as out-of-scope and stay that way:
@@ -217,8 +191,6 @@ Driven by repeated audits of the post-tag tree (a transactional-
 consistency audit, a dead-wiring audit, a perf round, an MQTT 5 spec
 walk-through, a metrics-completeness audit, and a Helm-knobs audit).
 Each found real material; the items below are the ones that landed.
-See `CHANGELOG.md [Unreleased]` for the list and reasoning per
-change.
 
 - [x] **Atomicity / correctness round 1.** publishCore single-tx
       (covers retain + qos2 dedup + insert + fanout + pg_notify),
@@ -253,9 +225,9 @@ change.
       window (10s Ping interval mitigated by row-level locking in
       expireSessions, advisory_lock in handleDeadBroker, idempotent
       writes in operator).
-- [x] **Docs.** PERF.md, VERSIONING.md migration policy, BACKUP.md
-      schema audit, CONFORMANCE.md v5 spec omissions, OPS.md
-      crash-loop-on-leader-loss, SIZING.md recalibration pointer.
+- [x] **Docs.** PERF.md, BACKUP.md schema audit, CONFORMANCE.md v5
+      spec omissions, OPS.md crash-loop-on-leader-loss, SIZING.md
+      recalibration pointer.
 
 ### 8a. Round 2 — deferred
 

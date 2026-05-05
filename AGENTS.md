@@ -63,9 +63,9 @@ Why this pattern works for this codebase:
   the tail (helm schema additions, doc fixes, lint passes) parallelises
   cleanly. Dense files are typically owned by one agent at a time.
 - The merge cost is low: most worktrees touch ≤3 files outside their core
-  task. Conflicts when they do happen are usually in `CHANGELOG.md` (easy
-  to resolve manually) or in `internal/engine/conn.go` (which we treat as
-  a critical-section file: only one in-flight worktree may modify it).
+  task. Conflicts when they do happen are usually in `internal/engine/conn.go`,
+  which we treat as a critical-section file: only one in-flight worktree
+  may modify it.
 - Each worktree's commits stay coherent — the merge commit on main names
   what each agent landed and why.
 
