@@ -30,7 +30,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	scanStart := time.Now()
 	rows, err := e.pool.Query(ctx, `
 		SELECT d.id, d.client_id, d.qos, d.state, d.packet_id,
-		       m.topic, m.payload, m.properties, m.retain, m.expires_at,
+		       m.topic, m.payload, m.properties, m.retain, m.expires_at, m.created_at,
 		       COALESCE(
 		         (SELECT array_agg(sub.subscription_id ORDER BY sub.subscription_id)
 		            FROM subscriptions sub
@@ -69,6 +69,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		props              []byte
 		retain             bool
 		expiresAt          *time.Time
+		createdAt          time.Time
 		subIDs             []int
 		retainAsPublished  bool
 	}
@@ -76,7 +77,7 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	for rows.Next() {
 		var it item
 		if err := rows.Scan(&it.deliveryID, &it.clientID, &it.qos, &it.state, &it.packetID,
-			&it.topic, &it.payload, &it.props, &it.retain, &it.expiresAt, &it.subIDs, &it.retainAsPublished); err != nil {
+			&it.topic, &it.payload, &it.props, &it.retain, &it.expiresAt, &it.createdAt, &it.subIDs, &it.retainAsPublished); err != nil {
 			return err
 		}
 		items = append(items, it)
@@ -93,8 +94,17 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		if it.retainAsPublished {
 			retain = it.retain
 		}
-		if err := e.deliverOnePub(ctx, it.deliveryID, it.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, it.expiresAt, it.subIDs, retain, false); err != nil {
+		// Use the tracked variant so we can observe e2e latency only
+		// when the PUBLISH actually went on the wire — sent=false means
+		// the client wasn't local or had no flow-control slot, both of
+		// which would skew the histogram with the server's wait time.
+		sent, err := e.deliverOneTracked(ctx, it.deliveryID, it.clientID, it.qos, it.state, it.packetID, it.topic, it.payload, it.props, it.expiresAt, it.subIDs, retain, false)
+		if err != nil {
 			e.logger.Warn("deliver", "id", it.deliveryID, "client", it.clientID, "err", err)
+			continue
+		}
+		if sent {
+			e.metrics.ObserveE2EPublishToDeliver(time.Since(it.createdAt))
 		}
 	}
 	return nil

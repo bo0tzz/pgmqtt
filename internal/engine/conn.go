@@ -767,7 +767,7 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 		// wiped here. If the DELETE matches 0 rows, the row was
 		// already replaced by a takeover; rollback the deliveries
 		// delete too so the new conn's deliveries survive.
-		tx, err := c.eng.pool.BeginTx(bgCtx, pgx.TxOptions{})
+		tx, err := c.eng.beginTxTimed(bgCtx, pgx.TxOptions{})
 		if err != nil {
 			c.eng.logger.Warn("begin clean session", "client", c.clientID, "err", err)
 			return
@@ -923,7 +923,7 @@ func (c *Conn) handlePubcomp(ctx context.Context, pk *packets.Packet) error {
 }
 
 func (c *Conn) handleUnsubscribe(ctx context.Context, pk *packets.Packet) error {
-	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}

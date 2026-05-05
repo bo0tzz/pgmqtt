@@ -22,7 +22,7 @@ const (
 )
 
 func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
-	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -243,7 +243,7 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 // client so we can properly track QoS>0 retained delivery. We do not insert
 // for other clients (this is a single-client retained replay, not a fanout).
 func (c *Conn) persistRetainedDispatch(ctx context.Context, topic string, payload []byte, qos byte, props []byte) (int64, error) {
-	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return 0, err
 	}

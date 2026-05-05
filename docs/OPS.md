@@ -39,6 +39,11 @@ Keys to look for in `/metrics`:
 - `pgmqtt_publish_seconds{stage}` — per-stage latency for the inbound
   PUBLISH path. See [`PERF.md`](PERF.md) for what each stage covers and
   how to read the breakdown when PUBACK latency creeps up.
+- `pgmqtt_e2e_publish_to_deliver_seconds` — single-number
+  ingest-to-delivery SLO. p99 > 100 ms on a healthy homelab → check
+  `publish_seconds` and `delivery_seconds` to localise.
+- `pgmqtt_pgx_acquire_seconds` — pool-saturation signal across all
+  callers. p99 > 10 ms sustained → bump `pool_max_conns` or scale out.
 
 ## "Janitor / reconciler stopped running"
 

@@ -160,6 +160,30 @@ type Metrics struct {
 	// drain triggers (NOTIFY-driven re-scan, SUBSCRIBE-driven retained
 	// fanout) can be distinguished without a metric rename.
 	DrainSessionQueueTotal *prometheus.CounterVec
+
+	// PublishFanoutSubscribers — distribution of subscriber counts per
+	// inbound publish, sampled at the mqtt_publish CTE return. Tracks the
+	// per-message fanout shape an operator most cares about: "is one topic
+	// driving thousands of inserts per publish?" Skewed long-tail = a hot
+	// hub topic that's about to push the publish path into PG-CPU
+	// saturation; the cpu-pg sweep showed mqtt_publish at 64% of total
+	// PG exec time at QoS-1 saturation. 0 = no matching subscriber.
+	PublishFanoutSubscribers prometheus.Histogram
+
+	// EndToEndPublishToDeliverSeconds — histogram of (now() - messages.created_at)
+	// observed on each successful per-row deliver. Bridges publish_seconds
+	// (broker→PG) and delivery_seconds (PG→subscriber) into a single
+	// number an operator can SLO. Captures the full latency: publisher
+	// ACK + commit-to-NOTIFY + NOTIFY-to-Deliver + scan + write.
+	EndToEndPublishToDeliverSeconds prometheus.Histogram
+
+	// PgxAcquireSeconds — distribution of pool.Acquire / pool.BeginTx
+	// wait time across the broker. Cross-cutting view of pool saturation
+	// that the existing pgmqtt_pgx_acquire_duration_seconds_total counter
+	// (sum, no buckets) cannot give p99 visibility for. Observed by the
+	// engine + janitor BeginTx / Acquire helpers; queries via Query/Exec
+	// hold the conn briefly enough that they are not separately timed.
+	PgxAcquireSeconds prometheus.Histogram
 }
 
 // New creates and registers a fresh Metrics. Call once per process.
@@ -312,6 +336,35 @@ func New() *Metrics {
 				"deliveries for the returning session). " +
 				"Bounded by the reconnect rate; sustained spikes here indicate flapping clients.",
 		}, []string{"reason"}),
+		PublishFanoutSubscribers: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "pgmqtt_publish_fanout_subscribers",
+			Help: "Subscribers fanned out per inbound publish (deliveries-table inserts). " +
+				"0 = no matching subscriber. Long tail = hot hub topic.",
+			// Hub topics dominate the long tail; the buckets bracket
+			// 0 (no matching sub), 1-10 (homelab norm), 100+ (gateway-
+			// shaped fan-in), 1k+ (k8s-operator-class).
+			Buckets: []float64{0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000},
+		}),
+		EndToEndPublishToDeliverSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "pgmqtt_e2e_publish_to_deliver_seconds",
+			Help: "End-to-end latency from message INSERT (publisher's commit) to " +
+				"successful PUBLISH write to subscriber. now() - messages.created_at " +
+				"sampled per delivered row. Bridges publish_seconds and delivery_seconds.",
+			Buckets: []float64{
+				.0005, .001, .002, .005, .01, .02, .05, .1, .25, .5, 1, 2.5, 5,
+			},
+		}),
+		PgxAcquireSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "pgmqtt_pgx_acquire_seconds",
+			Help: "pgxpool BeginTx / Acquire wait time, observed by the engine + janitor " +
+				"helpers. Cross-cutting saturation signal — sustained p99 above ~10 ms " +
+				"on a healthy PG means the pool is starving callers. Complements the " +
+				"existing pgmqtt_pgx_acquire_duration_seconds_total counter (sum, no buckets).",
+			Buckets: []float64{
+				.0001, .0002, .0005, .001, .002, .005,
+				.01, .02, .05, .1, .25, .5, 1, 2.5, 5,
+			},
+		}),
 	}
 
 	// Pre-create label series at zero so /metrics surfaces them before any
@@ -348,6 +401,9 @@ func New() *Metrics {
 		m.ConnectionsCapacityRatio,
 		m.ListenerRestartsTotal,
 		m.DrainSessionQueueTotal,
+		m.PublishFanoutSubscribers,
+		m.EndToEndPublishToDeliverSeconds,
+		m.PgxAcquireSeconds,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -371,6 +427,33 @@ func (m *Metrics) ObservePublishStage(stage string, d time.Duration) {
 		return
 	}
 	m.PublishStageSeconds.WithLabelValues(stage).Observe(d.Seconds())
+}
+
+// ObservePublishFanout records the subscriber count for one publish.
+// Safe to call when m is nil.
+func (m *Metrics) ObservePublishFanout(subscribers int64) {
+	if m == nil {
+		return
+	}
+	m.PublishFanoutSubscribers.Observe(float64(subscribers))
+}
+
+// ObserveE2EPublishToDeliver records the end-to-end ingest→deliver latency
+// for one delivered row. Safe to call when m is nil.
+func (m *Metrics) ObserveE2EPublishToDeliver(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.EndToEndPublishToDeliverSeconds.Observe(d.Seconds())
+}
+
+// ObservePgxAcquire records one pool BeginTx / Acquire wait sample.
+// Safe to call when m is nil.
+func (m *Metrics) ObservePgxAcquire(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.PgxAcquireSeconds.Observe(d.Seconds())
 }
 
 // RegisterPgxPool registers a collector that reports pgxpool stats every

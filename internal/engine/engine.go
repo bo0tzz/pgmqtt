@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bo0tzz/pgmqtt/internal/config"
@@ -181,6 +182,18 @@ func (e *Engine) SetQuotaNotifier(q QuotaNotifier) {
 // counters/gauges on it as events occur. Calls are no-op when nil.
 func (e *Engine) SetMetrics(m *metrics.Metrics) {
 	e.metrics = m
+}
+
+// beginTxTimed wraps pool.BeginTx and observes pgmqtt_pgx_acquire_seconds.
+// The pgxpool BeginTx call internally does Acquire + "BEGIN" SQL — at
+// homelab latency the BEGIN is sub-ms, so the histogram closely tracks
+// pool starvation. Use this in place of e.pool.BeginTx everywhere on the
+// hot path so saturation shows up cross-cuttingly rather than per-stage.
+func (e *Engine) beginTxTimed(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	start := time.Now()
+	tx, err := e.pool.BeginTx(ctx, opts)
+	e.metrics.ObservePgxAcquire(time.Since(start))
+	return tx, err
 }
 
 // Serve runs the accept loops until ctx is cancelled or a fatal accept error.

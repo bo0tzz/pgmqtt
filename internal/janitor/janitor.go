@@ -162,6 +162,25 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 // SetInterval overrides the default base tick interval. Useful for tests.
 func (j *Janitor) SetInterval(d time.Duration) { j.interval = d }
 
+// beginTxTimed wraps pool.BeginTx and observes pgmqtt_pgx_acquire_seconds.
+// Counterpart to engine.beginTxTimed — same purpose, different pool owner.
+func (j *Janitor) beginTxTimed(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	start := time.Now()
+	tx, err := j.pool.BeginTx(ctx, opts)
+	j.metrics.ObservePgxAcquire(time.Since(start))
+	return tx, err
+}
+
+// acquireTimed wraps pool.Acquire and observes pgmqtt_pgx_acquire_seconds.
+// handleDeadBroker holds a dedicated conn for the lock+unlock pair so it
+// can't go through BeginTx; this is the one Acquire site in the broker.
+func (j *Janitor) acquireTimed(ctx context.Context) (*pgxpool.Conn, error) {
+	start := time.Now()
+	conn, err := j.pool.Acquire(ctx)
+	j.metrics.ObservePgxAcquire(time.Since(start))
+	return conn, err
+}
+
 // SetJobIntervals overrides per-job intervals. Unspecified jobs keep their
 // current value. A job with interval 0 fires on every base tick — handy
 // for tests that want one Tick to exercise every sub-job. Useful for
@@ -431,7 +450,7 @@ func stateLabel(state int) string {
 // Postgres returns the post-UPDATE row) and SELECT FOR UPDATE SKIP LOCKED so
 // concurrent janitors don't double-fire.
 func (j *Janitor) fireDueWills(ctx context.Context) error {
-	tx, err := j.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := j.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -524,7 +543,7 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 // dropped in migration 0006 (MultiXact SLRU thrash), so we delete those
 // explicitly in the same tx.
 func (j *Janitor) expireSessions(ctx context.Context) error {
-	tx, err := j.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := j.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -649,7 +668,7 @@ func (j *Janitor) findDeadBrokerCandidates(ctx context.Context) ([]uuid.UUID, er
 // Returns true if we claimed the broker (caller increments the metric);
 // false if another pod beat us to it.
 func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (claimed bool, err error) {
-	conn, err := j.pool.Acquire(ctx)
+	conn, err := j.acquireTimed(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -754,7 +773,7 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 // older than the grace period. (Deliveries cascade-delete on session cleanup,
 // so abandoned messages accumulate without a sweep.)
 func (j *Janitor) sweepOrphanMessages(ctx context.Context) error {
-	tx, err := j.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := j.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}

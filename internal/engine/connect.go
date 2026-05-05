@@ -221,7 +221,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	// tx so a partial failure can't leave (e.g.) orphan subscriptions
 	// after a "session is gone" CONNACK or, conversely, the prior
 	// will_fire_at active after a successful clean reconnect.
-	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
@@ -385,7 +385,7 @@ func authReasonLabel(reason byte) string {
 // for handleDisconnect to read later.
 func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroker uuid.UUID, prevToken uuid.UUID, newSession bool, err error) {
 	self := c.eng.BrokerID()
-	tx, err := c.eng.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return uuid.Nil, uuid.Nil, false, err
 	}

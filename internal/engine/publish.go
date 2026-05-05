@@ -260,7 +260,7 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 	var res publishResult
 
 	startBegin := time.Now()
-	tx, err := e.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := e.beginTxTimed(ctx, pgx.TxOptions{})
 	e.metrics.ObservePublishStage("tx_begin", time.Since(startBegin))
 	if err != nil {
 		return res, err
@@ -312,16 +312,18 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 
 	startQuery := time.Now()
 	row := tx.QueryRow(ctx, `
-		SELECT msg_id, broker_ids, overflow_clients
+		SELECT msg_id, broker_ids, overflow_clients, delivered_count
 		  FROM mqtt_publish($1, $2, $3::smallint, $4, $5::jsonb, $6, $7::int)
 	`, p.Topic, p.Payload, p.QoS, p.Retain, jsonOrNil(p.Properties), publisher, e.maxQueuedDeliveries())
 
 	var brokers []uuid.UUID
 	var overflow []string
-	if err := row.Scan(&res.MessageID, &brokers, &overflow); err != nil {
+	var delivered int64
+	if err := row.Scan(&res.MessageID, &brokers, &overflow, &delivered); err != nil {
 		return res, err
 	}
 	e.metrics.ObservePublishStage("mqtt_publish_query", time.Since(startQuery))
+	e.metrics.ObservePublishFanout(delivered)
 
 	// pg_notify INSIDE the publish tx, not after commit. Postgres queues
 	// notifications during the tx and delivers them on COMMIT, so peer

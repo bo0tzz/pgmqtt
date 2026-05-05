@@ -32,8 +32,41 @@ by stage of the inbound PUBLISH path:
 | `notify`             | NOTIFY to peer Pods via the delivery channel            |
 | `response_write`     | PUBACK (QoS-1) or PUBREC (QoS-2) packet write           |
 
-`pgxpool` connection pool depth and acquire latency surface as
-`pgmqtt_pgxpool_*` (registered via the pool collector).
+The outbound counterpart `pgmqtt_delivery_seconds` covers the
+broker→subscriber fanout path:
+
+| Stage                | Covers                                                  |
+| ---                  | ---                                                     |
+| `total`              | `Deliver()` entry → return (one NOTIFY round-trip)      |
+| `scan`               | The `SELECT` that pulls deliveries + topic + payload    |
+| `alloc`              | Per-row packet ID allocation + state=0→1 `UPDATE`       |
+| `write`              | Per-row socket write (PUBLISH on the wire)              |
+
+Three cross-cutting histograms tie the two paths together:
+
+| Metric                                       | Reads as                                          |
+| ---                                          | ---                                               |
+| `pgmqtt_e2e_publish_to_deliver_seconds`      | `now() − messages.created_at`, per delivered row. |
+| `pgmqtt_publish_fanout_subscribers`          | Subscribers fanned out per inbound publish.       |
+| `pgmqtt_pgx_acquire_seconds`                 | Pool `BeginTx` / `Acquire` wait, all callers.     |
+
+`e2e_publish_to_deliver_seconds` is the single best SLO target for
+"is the bus on time?" — it bridges `publish_seconds` and
+`delivery_seconds` so a regression in either side surfaces here.
+
+`publish_fanout_subscribers` shows the fanout shape per publish.
+`mqtt_publish` is the dominant PG cost at QoS-1 saturation (64% of
+total exec time on the 2026-05-05 sweep); a long tail here = a hub
+topic about to push the publish path into PG-CPU saturation.
+
+`pgx_acquire_seconds` is the cross-cutting pool-saturation signal.
+The existing `pgmqtt_pgx_acquire_duration_seconds_total` counter
+gives total wait time but not p99; this histogram fixes that.
+Sustained p99 above ~10 ms on a healthy PG = pool starving callers,
+bump `pool_max_conns`.
+
+`pgxpool` connection pool depth and the cumulative acquire counter
+also surface as `pgmqtt_pgx_*` (registered via the pool collector).
 
 ## Reading the histograms
 
