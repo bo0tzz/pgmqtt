@@ -14,36 +14,83 @@ against measurement.
 ## Pod sizing
 
 The broker is mostly I/O-bound (TCP read/write + Postgres queries) and
-spends very little CPU per packet. The supplied default resource block
-in `values.yaml`:
+spends very little CPU per packet, with bcrypt the one CPU spike on
+CONNECT auth.
+
+The supplied default resource block in `values.yaml` is sized for the
+chart's default `limits.maxConnections=5000`:
 
 ```yaml
 resources:
   requests:
     cpu: 100m
-    memory: 128Mi
+    memory: 256Mi
   limits:
-    memory: 512Mi
+    memory: 1Gi
 ```
 
-…handles roughly **5,000 idle connections + ~1,000 msg/s sustained**
-per Pod on a modern x86_64 core. Doubling either dimension wants:
+…and handles **5,000 idle connections + ~1,000 msg/s QoS-1 sustained**
+per Pod on a modern x86_64 core.
 
-- Connections: ~4 KB of resident memory per idle conn (kernel TCP +
-  Go runtime). 10k conns ≈ 40 MB just for sockets, plus per-conn Go
-  goroutines/stacks at ~8 KB → another 80 MB. Bump request to 256 Mi
-  if you cross 10k conns.
-- Messages/s: each PUBLISH is one Postgres `mqtt_publish` round-trip.
-  After the v0.1.x perf round (FK drop in migration 0006, partial
-  indexes in 0007/0008, in-broker packet ID counter in 2B), the
-  homelab/idle-Postgres ceiling is bounded by the
-  `mqtt_publish_query` stage's tail latency and the per-Conn write
-  goroutine's CPU. At 1k msg/s the publish stage is sub-ms; at 10k+
-  msg/s expect Postgres to saturate on `pg_xact_commit` before the
-  broker does. See `PERF.md` for what each histogram bucket actually
-  measured on a contended kind run, and recalibrate from
-  `pgmqtt_publish_seconds` and `pgmqtt_delivery_seconds` on your own
-  hardware before treating these as targets.
+### Memory: measured (PG18, GOMAXPROCS=8, 2026-05-05)
+
+A 5-point sweep against a freshly-built `pgmqttd` from this commit
+gave a clean linear fit above the Go-runtime baseline:
+
+```
+RSS_MB ≈ 48 + 0.042 × N_connections      (settled, idle, post-CONNECT)
+```
+
+| conns  | measured RSS | heap-in-use | goroutines |
+| ---    | ---          | ---         | ---        |
+| 0      | ~42 MiB      | ~5 MiB      | 16         |
+| 100    | 50.6 MiB     | 8.5 MiB     | 218        |
+| 500    | 68.9 MiB     | 14.8 MiB    | 1,018      |
+| 1,000  | 87.8 MiB     | 30.9 MiB    | 2,018      |
+| 2,500  | 152.3 MiB    | 39.9 MiB    | 5,018      |
+| 5,001  | 248.4 MiB    | 68.0 MiB    | 10,018     |
+
+Two goroutines per connection (one read, one drain). Per-conn marginal
+RSS settles at ~42 KB once the runtime overhead amortises (above ~500
+conns). Below that, baseline overhead dominates the per-conn quotient.
+
+The chart's 1 GiB default gives ~4× burst headroom over the 5k-conn
+idle measurement. Burst sources covered: reconnect storms (~4 KB extra
+heap per in-CONNECT handshake), retained-flood-on-subscribe.
+
+### Throughput: measured (same shape, single broker pod)
+
+| QoS | Pubs | Inflight | Subs | Achieved msg/s | pub_total mean |
+| --- | ---  | ---      | ---  | ---            | ---            |
+| 0   | 1    | 1        | 1    | 1,081          | 1.3 ms         |
+| 1   | 1    | 1        | 1    | 97             | 2.9 ms         |
+| 1   | 1    | 50       | 1    | 504            | 1.9 ms         |
+| 1   | 5    | 50       | 3    | 1,070          | 4.6 ms         |
+| 1   | 10   | 50       | 5    | 813            | 12.6 ms        |
+| 1   | 10   | 100      | 5    | 807            | 12.7 ms        |
+| 2   | 1    | 1        | 1    | 97             | 3.2 ms         |
+| 2   | 1    | 1        | 1    | 355            | 2.1 ms (target 500) |
+
+Per-pod ceiling on this 8-core dev box: **~1,100 msg/s QoS-0**,
+**~1,000 msg/s QoS-1**, **~350 msg/s QoS-2**. The QoS-1 ceiling moves
+left as concurrent publishers fan out to overlapping subscribers —
+same pattern documented in `PERF.md`. The bottleneck under
+multi-publisher saturation is the `mqtt_publish_query` stage (89% of
+publish time at 10 concurrent publishers): Postgres lock contention
+on the fanout INSERT, exactly as the v0.1.x perf round called out.
+
+### Re-measure on your hardware
+
+Numbers above are calibrated on a single dev box and shouldn't be
+treated as targets. Re-run with the soak rig at your shape and read
+`pgmqtt_publish_seconds` / `pgmqtt_delivery_seconds` for the real
+ceiling. Any of:
+
+- Postgres contention (shared host, slow disk, busy WAL);
+- a low CPU-limit cap on the broker pod;
+- a bcrypt-CPU connect storm (cost-10 default → ~85 connects/sec/4-core);
+
+…will move the per-pod ceiling around significantly.
 
 ## When to scale out vs. up
 

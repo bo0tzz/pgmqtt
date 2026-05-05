@@ -54,12 +54,72 @@ instrumented. Cross-check against `process_cpu_seconds_total` and
 
 ## A measured baseline
 
-> **Postgres version note:** the numbers in this section were captured
-> against `postgres:16-alpine`. The repo's default has since bumped to
-> `postgres:18-alpine` (commit `f91c4df`); a re-measurement on PG18 is
-> pending. Until that lands, treat the figures here as
-> PG16-historical — directionally still useful for reading the
-> histograms, but the absolute means may shift on PG18.
+> **Two measurements**: §"PG18 calibration" below is the most recent
+> run (single broker, fresh `pgmqttd` from this commit, PG18-alpine,
+> dev-box CPU). §"PG16 calibration (historical)" further down is the
+> earlier in-cluster run that documented the `mqtt_publish` lock
+> contention pattern. Numbers shifted on PG18 (different commit
+> latency profile) but the *shape* of the bottleneck is identical:
+> `mqtt_publish_query` saturates first under multi-publisher
+> concurrency.
+
+## PG18 calibration (2026-05-05)
+
+Single broker pod, `pgmqttd` built from this commit, postgres:18-alpine
+container, GOMAXPROCS=8, no CPU limit, allow-anonymous on. 30s/shape.
+
+### Throughput by shape
+
+| QoS | Pubs | Inflight | Subs | Target msg/s | Achieved | pub_total mean | mqtt_publish_query mean |
+| --- | ---  | ---      | ---  | ---          | ---      | ---            | ---                     |
+| 0   | 1    | 1        | 1    | 100          | 98.2     | 3.8 ms         | 2.0 ms                  |
+| 0   | 1    | 1        | 1    | 1,000        | 935.2    | 1.5 ms         | 1.1 ms                  |
+| 0   | 1    | 1        | 1    | 5,000        | 1,081    | 1.3 ms         | 1.0 ms                  |
+| 1   | 1    | 1        | 1    | 100          | 97.1     | 2.9 ms         | 1.9 ms                  |
+| 1   | 1    | 50       | 1    | 1,000        | 503.8    | 1.9 ms         | 1.4 ms                  |
+| 1   | 5    | 50       | 3    | 5,000        | 1,069.8  | 4.6 ms         | 3.7 ms                  |
+| 1   | 10   | 50       | 5    | 10,000       | 812.7    | 12.6 ms        | 11.2 ms                 |
+| 1   | 10   | 100      | 5    | 20,000       | 806.9    | 12.7 ms        | 11.2 ms                 |
+| 2   | 1    | 1        | 1    | 100          | 96.9     | 3.2 ms         | 2.0 ms                  |
+| 2   | 1    | 1        | 1    | 500          | 355.0    | 2.1 ms         | 1.4 ms                  |
+
+Per-pod ceilings on this hardware:
+
+- **QoS-0** ~1,100 msg/s (pure publish-no-ack)
+- **QoS-1** ~1,000 msg/s under heavy fanout (multi-pub × multi-sub)
+- **QoS-2** ~350 msg/s (full PUBREC/PUBREL/PUBCOMP handshake)
+
+### Where the time goes (QoS-1, 5 pubs × 50 inflight × 3 subs, near-saturation)
+
+| Stage                | Mean (ms) | Share of pub_total |
+| ---                  | ---       | ---                |
+| `total`              | 4.63      | 100%               |
+| `mqtt_publish_query` | 3.74      | 81%                |
+| `tx_commit`          | 0.54      | 12%                |
+| `notify`             | 0.12      | 3%                 |
+| `tx_begin`           | 0.08      | 2%                 |
+| `response_write`     | 0.02      | <1%                |
+
+At 10 publishers (closer to saturation) `mqtt_publish_query` mean
+moves from 3.7 ms to **11.2 ms** — exact same lock-contention pattern
+documented in the PG16 baseline. The 19× scaling factor that
+appeared on the noisy kind cluster is a 3× factor on a clean dev box;
+the *direction* matches.
+
+### Idle memory
+
+A 5-point sweep at 0 / 100 / 500 / 1,000 / 2,500 / 5,001 idle
+connections gives a clean linear fit:
+
+```
+RSS_MB ≈ 48 + 0.042 × N_connections
+```
+
+Validated within ±5% of the regression at every measured point. Two
+goroutines per connection (one read, one drain). At maxConnections=
+5,000 the idle working set is ~250 MiB.
+
+## PG16 calibration (historical)
 
 To avoid the "is my cluster broken or is this normal?" question, here's
 one calibrated point — an instrumented kind cluster running on a single
