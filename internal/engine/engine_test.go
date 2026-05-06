@@ -93,6 +93,80 @@ func TestRetainedDelivery(t *testing.T) {
 	}
 }
 
+// TestHADiscoveryFlood simulates Home Assistant's startup pattern: a single
+// client publishes hundreds of retained PUBLISHes in rapid succession
+// (auto-discovery topics + their initial state). We then connect a fresh
+// subscriber and verify all retained messages are replayed without loss.
+//
+// HA's MQTT integration on first connect publishes one retained
+// `homeassistant/<component>/<node>/<obj>/config` per discovered entity,
+// frequently followed by an initial state retain on a separate topic.
+// 250 entities → ~500 retained publishes in a burst is realistic for a
+// moderately busy install.
+//
+// What this test exercises:
+//   - The retained-table write path under burst load.
+//   - That none of the publishes are dropped silently.
+//   - That the subscribe-replay path can flush the full retained set.
+//
+// What it does NOT test (covered separately):
+//   - Per-IP CONNECT rate limiter — burst is one connection, many publishes.
+//   - bcrypt cost on auth — covered by iplimit_test.go and connect path.
+func TestHADiscoveryFlood(t *testing.T) {
+	t.Parallel()
+	const N = 500
+	h := enginetest.NewHarness(t)
+
+	pub := h.Connect(t, "ha-flood-pub")
+	for i := 0; i < N; i++ {
+		topic := "homeassistant/sensor/dev_" + itoa(i) + "/config"
+		payload := []byte(`{"name":"sensor","state_topic":"sensor/state"}`)
+		// QoS 1 here (HA's real discovery uses 0, but we need PUBACK
+		// confirmation that the retained UPSERT committed before we
+		// disconnect — otherwise the subsequent SUBSCRIBE can race
+		// with the publish path and pick up messages via deliver-scan
+		// instead of retained-replay, which doesn't set the RETAIN
+		// flag. The test under load is the same shape either way.
+		pub.Publish(t, topic, payload, 1, true)
+	}
+	pub.Close()
+
+	sub := h.Connect(t, "ha-flood-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "homeassistant/#", 0)
+
+	got := 0
+	deadline := time.Now().Add(10 * time.Second)
+	for got < N && time.Now().Before(deadline) {
+		pk := sub.Read(t, 2*time.Second)
+		if pk.FixedHeader.Type != packets.Publish {
+			t.Fatalf("expected publish, got type=%d after %d msgs", pk.FixedHeader.Type, got)
+		}
+		if !pk.FixedHeader.Retain {
+			t.Errorf("retained replay should set RETAIN flag (msg %d)", got)
+		}
+		got++
+	}
+	if got != N {
+		t.Fatalf("retained replay got %d, want %d (lost %d)", got, N, N-got)
+	}
+}
+
+// itoa avoids importing strconv just for this loop.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(buf[pos:])
+}
+
 func TestRetainedClearWithEmpty(t *testing.T) {
 	t.Parallel()
 	h := enginetest.NewHarness(t)
