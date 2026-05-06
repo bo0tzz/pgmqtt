@@ -28,8 +28,8 @@ Create an MQTT user (the broker reads from Postgres via the operator):
    expose every Secret in the cluster.
 
    For homelab/production: enable networkPolicy with `egress.postgres`
-   pinned to your CNPG/postgres-operator selector and review
-   docs/SECURITY.md before exposing the broker outside its VLAN.
+   pinned to your CNPG/postgres-operator selector before exposing the
+   broker outside its VLAN.
 {{- end }}
 
 {{- if and (not .Values.database.url) (not .Values.database.existingSecret) }}
@@ -65,5 +65,6 @@ Create an MQTT user (the broker reads from Postgres via the operator):
    configure the HPA's minReplicas to match.
 {{- end }}
 
-For ops runbooks see docs/OPS.md, sizing matrix in values.yaml comment
-above `resources:`, and TLS termination patterns in docs/TLS.md.
+For ops, see the README and the sizing-matrix comment in values.yaml
+above `resources:`. Front the broker with an L4/L7 TLS terminator for
+mqtts://1883 / wss://8083 — pgmqttd doesn't terminate TLS itself.

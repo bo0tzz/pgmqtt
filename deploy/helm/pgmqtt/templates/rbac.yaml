@@ -3,10 +3,9 @@
 # User CR. The User CRD is namespaced and intentionally lives anywhere —
 # operators put Users in whatever namespace makes sense for their
 # workload (per-app, per-team, etc.). Cross-namespace Secret RBAC is the
-# trade-off for that flexibility; the threat is documented in
-# docs/SECURITY.md (compromised broker pod can read any Secret cluster-
-# wide). To narrow scope, fork the chart and replace this ClusterRole
-# with a per-namespace Role wherever Users live.
+# trade-off for that flexibility — a compromised broker pod can read
+# any Secret cluster-wide. To narrow scope, fork the chart and replace
+# this ClusterRole with a per-namespace Role wherever Users live.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

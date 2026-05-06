@@ -19,9 +19,9 @@ var ErrAuthFailed = errors.New("authentication failed")
 // indistinguishable wall-clock time. The constant was generated once at
 // build time to avoid a one-off ~75 ms startup penalty per process.
 //
-// CWE-208 mitigation: docs/SECURITY.md previously claimed
-// "No timing-channel leak between 'user doesn't exist' and 'wrong
-// password'"; before this guard, that promise was unmet.
+// CWE-208 mitigation: without this guard, "user doesn't exist" and
+// "wrong password" would have measurably different wall-clock times
+// (one bcrypt vs zero), revealing username existence.
 var dummyHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
 
 // Authenticate verifies username/password against the users table.

@@ -53,8 +53,7 @@ type UserReconciler struct {
 	// Optional TLS endpoint for the User CR's Secret. When TLSHost is
 	// non-empty the operator emits an mqtts:// URI alongside the plain
 	// mqtt:// one. Operators wanting to push apps to TLS-only set the
-	// matching listener up out-of-band (ingress-nginx, HAProxy, etc.)
-	// — see docs/TLS.md.
+	// matching listener up out-of-band (ingress-nginx, HAProxy, etc.).
 	TLSHost string
 	TLSPort int    // e.g. 8883
 	WSSPort int    // e.g. 8443

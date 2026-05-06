@@ -143,7 +143,7 @@ that assume a default tick at or below 1s. Bumping the default tick to
 `test_will_delay` regressed.
 
 Fix: keep the default at 1s. Operators who want longer intervals set the
-env explicitly. Document the tradeoff in `docs/OPS.md`.
+env explicitly.
 
 ### Paho conformance flakes hide real signal in tier3
 
@@ -164,13 +164,3 @@ from the wrapper's exit-code calculation. Override with
 The summary line reads `v5: 24/27 passing (+3 known-flaky)` so operators
 see the real signal at a glance.
 
-## Reference
-
-- [`docs/TODO.md`](docs/TODO.md) — authoritative production-readiness
-  checklist. Always the source of truth for what's left.
-- [`docs/PLAN.md`](docs/PLAN.md) — the original architecture plan.
-- [`docs/OPS.md`](docs/OPS.md) — runbook for production operators.
-- [`docs/VERIFY.md`](docs/VERIFY.md) — verification checklist (manual,
-  superseded by `validate.sh` for the automatable surface).
-- [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — paho conformance
-  results and any known-failing tests.

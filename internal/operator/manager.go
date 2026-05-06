@@ -121,7 +121,8 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 		// Cache is unconstrained by namespace: Users live anywhere and
 		// their generated Secrets need to land in the same namespace as
 		// the CR. The chart's ClusterRole grants matching cluster-wide
-		// Secret RBAC; the trade-off is documented in docs/SECURITY.md.
+		// Secret RBAC; an RCE on the broker pod could read every Secret
+		// in the cluster — pin networkPolicy.enabled=true in production.
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)

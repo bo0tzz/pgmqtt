@@ -72,9 +72,9 @@ def main() -> int:
         "--known-flaky",
         default=(
             # Paho upstream `waitfor` typo (subscriber callback vs. publisher
-            # callback) — documented in docs/CONFORMANCE.md.
+            # callback).
             "test_request_response,test_subscribe_options,"
-            # Out-of-scope per docs/PLAN.md (no ACLs, no shared subs).
+            # Out-of-scope (no ACLs, no shared subs).
             "test_subscribe_failure,test_shared_subscriptions"
         ),
         help="comma-separated test names whose failure is reported as WARN, "

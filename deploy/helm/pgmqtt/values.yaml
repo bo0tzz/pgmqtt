@@ -177,7 +177,7 @@ tests:
 ## an extra Deployment + Service. The UI is a static SPA that connects to
 ## the broker via WebSocket from the user's browser — the user will have to
 ## paste credentials they pull from the User CR's auto-generated Secret
-## (browsers can't read kube secrets). See docs/UI.md for the workflow.
+## (browsers can't read kube secrets).
 ##
 ## To enable:  helm install ... --set ui.enabled=true
 ui:
@@ -412,7 +412,7 @@ operator:
 janitor:
   intervalMs: 1000
 
-## v5 server policy. See protocol-spec links in docs/CONFORMANCE.md.
+## v5 server policy.
 ##   receiveMaximum: cap on un-ACKed inbound QoS>0 PUBLISHes per conn.
 ##   keepaliveMaxSec: server cap on the negotiated keepalive interval; v5
 ##                    clients are notified via the ServerKeepAlive property.
