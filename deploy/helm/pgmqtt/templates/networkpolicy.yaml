@@ -10,6 +10,7 @@ spec:
   podSelector:
     matchLabels:
       {{- include "pgmqtt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: broker
   policyTypes:
     - Ingress
     - Egress

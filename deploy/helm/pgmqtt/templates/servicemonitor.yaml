@@ -13,6 +13,7 @@ spec:
   selector:
     matchLabels:
       {{- include "pgmqtt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: broker
   endpoints:
     - port: metrics
       interval: {{ .Values.serviceMonitor.interval }}

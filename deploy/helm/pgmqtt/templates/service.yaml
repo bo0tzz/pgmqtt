@@ -23,6 +23,7 @@ spec:
   {{- end }}
   selector:
     {{- include "pgmqtt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
   ports:
     {{- if .Values.listeners.tcp.enabled }}
     - name: mqtt

@@ -15,10 +15,12 @@ spec:
   selector:
     matchLabels:
       {{- include "pgmqtt.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: broker
   template:
     metadata:
       labels:
         {{- include "pgmqtt.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: broker
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -240,6 +242,7 @@ spec:
                 labelSelector:
                   matchLabels:
                     {{- include "pgmqtt.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: broker
         {{- end }}
       {{- end }}
       {{- with .Values.tolerations }}
