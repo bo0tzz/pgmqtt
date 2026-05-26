@@ -74,6 +74,15 @@ type Conn struct {
 	closed            chan struct{}
 	once              sync.Once
 
+	// quotaOnce gates the full QuotaExceededLocally side-effect chain
+	// (log + DISCONNECT 0x97 write + metric Inc + Shutdown) against
+	// repeated invocation for the same conn. Without this, a local quota
+	// trip racing a cross-pod NOTIFY for the same client_id would have
+	// both goroutines pass the ConnFor check and double-count
+	// pgmqtt_quota_exceeded_total. Shutdown itself is already idempotent
+	// (via `once` above) — this exists for the surrounding bookkeeping.
+	quotaOnce sync.Once
+
 	// Inbound rate limit (PUBLISH/SUBSCRIBE). Token-bucket: capacity equals
 	// MaxInboundMsgsPerSec; refills at 1/cap each tick, capped at the
 	// configured rate. 0 disables the limit. Burst=cap means a fully-filled

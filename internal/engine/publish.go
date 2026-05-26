@@ -364,17 +364,24 @@ func (e *Engine) QuotaExceededLocally(clientID string) {
 	if !ok {
 		return
 	}
-	e.logger.Info("quota exceeded — disconnecting", "client", clientID)
-	if conn.protocol == mqttwire.ProtocolMQTT5 {
-		_ = conn.write(&packets.Packet{
-			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
-			ReasonCode:  0x97, // Quota Exceeded
-		})
-	}
-	if e.metrics != nil {
-		e.metrics.QuotaExceededTotal.Inc()
-	}
-	conn.Shutdown()
+	// Two goroutines (local quota trip + cross-pod NOTIFY arriving in
+	// the same window) can both pass the ConnFor check before either
+	// disconnects the socket; quotaOnce gates the side-effects so the
+	// metric counts the event once and the log/DISCONNECT-write happens
+	// at most once per conn.
+	conn.quotaOnce.Do(func() {
+		e.logger.Info("quota exceeded — disconnecting", "client", clientID)
+		if conn.protocol == mqttwire.ProtocolMQTT5 {
+			_ = conn.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x97, // Quota Exceeded
+			})
+		}
+		if e.metrics != nil {
+			e.metrics.QuotaExceededTotal.Inc()
+		}
+		conn.Shutdown()
+	})
 }
 
 // dispatchQuotaExceeded resolves each over-cap client's owning broker via
