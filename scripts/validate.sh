@@ -86,6 +86,22 @@ OVERALL_START=$(date +%s)
 t1_vet()         { go vet ./...; }
 t1_test_race()   { go test ./... -count=1 -race -timeout 10m; }
 
+# govulncheck — matches the CI step. Installs `@latest` on first run
+# (cached in $GOPATH/bin afterwards). Pinned to @latest deliberately:
+# a vulnerability scanner is *more* useful the newer it is, because each
+# release ships a larger known-vuln database. Local first-run is ~15s
+# (download + scan); subsequent runs are ~5s.
+#
+# This catches stdlib CVEs that landed since the Go toolchain was bumped
+# (typical fix: bump the `go` directive in go.mod to the patch version
+# noted in the govulncheck output, e.g. 1.26.2 -> 1.26.3).
+t1_govulncheck() {
+    if ! command -v govulncheck >/dev/null 2>&1; then
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+    fi
+    govulncheck ./...
+}
+
 t1_helm_lint() {
     helm lint deploy/helm/pgmqtt --set database.url='postgres://x/y'
 }
@@ -118,6 +134,7 @@ t1_helm_template() {
 
 run_tier1() {
     phase "go vet"           t1_vet
+    phase "govulncheck"      t1_govulncheck
     phase "make test-race"   t1_test_race
     phase "helm lint"        t1_helm_lint
     phase "helm template"    t1_helm_template
