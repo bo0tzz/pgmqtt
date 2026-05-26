@@ -761,12 +761,21 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 	// Step 2 — every remaining session under the dead broker (no will,
 	// or will already fired immediately above): clear broker_id AND all
 	// will_* columns so a future fireDueWills tick can't double-fire.
-	_, err = conn.Exec(ctx,
+	//
+	// RowsAffected gates `claimed`. Holding the advisory lock alone isn't
+	// enough — a second janitor that grabs the lock *after* the first
+	// already NULLed broker_id finds nothing to clean up and shouldn't
+	// inflate pgmqtt_dead_brokers_handled_total. This matches the
+	// docstring ("false if another pod beat us to it").
+	ct, err := conn.Exec(ctx,
 		`UPDATE sessions SET connected=false, broker_id=NULL, last_seen=now(),
 		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
 		    will_retain=NULL, will_delay=NULL, will_properties=NULL
 		 WHERE broker_id=$1`, brokerID)
-	return true, err
+	if err != nil {
+		return true, err
+	}
+	return ct.RowsAffected() > 0, nil
 }
 
 // sweepOrphanMessages deletes messages with no referencing deliveries that are
