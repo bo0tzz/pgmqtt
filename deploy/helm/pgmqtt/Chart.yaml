@@ -8,8 +8,8 @@ description: |
   state live in Postgres. Run N replicas behind one Service; killing any
   Pod is safe — clients reconnect transparently.
 type: application
-version: 0.1.3
-appVersion: "0.1.3"
+version: 0.1.4
+appVersion: "0.1.4"
 keywords:
   - mqtt
   - homelab
