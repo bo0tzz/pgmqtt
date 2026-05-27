@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	neturl "net/url"
 	"strconv"
 	"strings"
@@ -49,6 +50,17 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", ScrubURLError(err, url))
 	}
+	// Aggressive TCP keepalive on the client-side socket so a zombie
+	// (peer pod killed without sending FIN/RST — common when a CNPG
+	// primary is evicted, OOM-killed, or otherwise exits non-gracefully)
+	// gets detected by the kernel in seconds instead of Linux's default
+	// ~2 hours. Without this, every pool query on a dead conn hangs until
+	// statement_timeout fires; pgxpool's HealthCheckPeriod ping succeeds
+	// against the half-open socket; new conns may dial a still-stale IP
+	// before kube-proxy updates. Symptom observed in production: 110-min
+	// wedge of CONNECT auth queries timing out at 30s each, silent at the
+	// protocol layer. The listener uses the same dialer (see listener.go).
+	cfg.ConnConfig.DialFunc = keepalivedDialer
 	if cfg.MaxConns < 8 {
 		cfg.MaxConns = 8
 	}
@@ -76,4 +88,17 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 		return nil, fmt.Errorf("ping: %w", ScrubURLError(err, url))
 	}
 	return pool, nil
+}
+
+// keepalivedDialer is the pool's net.Dialer with aggressive TCP keepalive.
+// Matches the listener's dialer so both broker→PG paths fail fast when the
+// peer dies without sending FIN/RST. Go's `KeepAlive` field maps to
+// TCP_KEEPIDLE only; the interval (TCP_KEEPINTVL) and count (TCP_KEEPCNT)
+// use the Linux defaults of 75 s × 9, so a dead peer is detected after
+// ~10 s of idle + ~11 min of probing. Beats the ~2-hour bare default by
+// an order of magnitude. For tighter detection an operator can layer
+// tcp_user_timeout via the OS / sysctl.
+func keepalivedDialer(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 10 * time.Second}
+	return d.DialContext(ctx, network, addr)
 }
