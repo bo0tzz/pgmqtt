@@ -53,14 +53,20 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 	// Aggressive TCP keepalive on the client-side socket so a zombie
 	// (peer pod killed without sending FIN/RST — common when a CNPG
 	// primary is evicted, OOM-killed, or otherwise exits non-gracefully)
-	// gets detected by the kernel in seconds instead of Linux's default
-	// ~2 hours. Without this, every pool query on a dead conn hangs until
-	// statement_timeout fires; pgxpool's HealthCheckPeriod ping succeeds
-	// against the half-open socket; new conns may dial a still-stale IP
-	// before kube-proxy updates. Symptom observed in production: 110-min
-	// wedge of CONNECT auth queries timing out at 30s each, silent at the
-	// protocol layer. The listener uses the same dialer (see listener.go).
+	// surfaces as a kernel-level socket error within ~11 min instead of
+	// Linux's default ~2 hours. The listener uses the same dialer (see
+	// listener.go).
 	cfg.ConnConfig.DialFunc = keepalivedDialer
+	// PingTimeout bounds the on-Acquire liveness ping. pgxpool's default
+	// ShouldPing pings any conn idle > 1s before handing it out; with
+	// PingTimeout=0 (upstream default) that ping inherits the caller's
+	// context and blocks indefinitely against a half-open socket.
+	// Setting a small explicit timeout means a wedged conn is detected
+	// and destroyed on the NEXT Acquire — recovery in seconds, not the
+	// ~11 min the kernel keepalive needs in the idle case. 2s is
+	// generous for an in-cluster PG RTT (<1ms typical) and short enough
+	// that callers don't perceive it as a hang.
+	cfg.PingTimeout = 2 * time.Second
 	if cfg.MaxConns < 8 {
 		cfg.MaxConns = 8
 	}
