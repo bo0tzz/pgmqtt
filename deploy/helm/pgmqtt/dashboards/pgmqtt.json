@@ -1,0 +1,378 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "pgmqtt broker — health, throughput, latency, resources. Auto-shipped by the chart when grafana.dashboard.enabled=true.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "id": 100
+    },
+    {
+      "type": "stat",
+      "title": "Connections",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(pgmqtt_connections{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Publishes/sec",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(rate(pgmqtt_publishes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 2, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "E2E publish→deliver p99",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "histogram_quantile(0.99, sum by(le)(rate(pgmqtt_e2e_publish_to_deliver_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "s", "decimals": 3, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.1}, {"color": "red", "value": 0.5}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Listener restarts",
+      "description": "Non-zero means a Pod's LISTEN conn was rebuilt. Watch for sustained increases.",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(increase(pgmqtt_listener_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\"}[1h]))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "pg_notify queue usage",
+      "description": "Above 0.5 = a slow listener is letting NOTIFYs back up. At 1.0 every commit cluster-wide errors with SQLSTATE 54000.",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(pgmqtt_pg_notify_queue_usage_ratio{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "red", "value": 0.8}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 5
+    },
+    {
+      "type": "stat",
+      "title": "Pod restarts (1h)",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\",container=\"pgmqttd\"}[1h]))", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 3}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "id": 6
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false,
+      "id": 101
+    },
+    {
+      "type": "timeseries",
+      "title": "Publishes/sec by QoS",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum by (qos)(rate(pgmqtt_publishes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))", "refId": "A", "legendFormat": "qos={{qos}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"fillOpacity": 15, "lineWidth": 2, "stacking": {"mode": "normal"}}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Deliveries/sec by stage",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum by (stage)(rate(pgmqtt_delivery_seconds_count{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))", "refId": "A", "legendFormat": "{{stage}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"fillOpacity": 10, "lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 8
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 14},
+      "collapsed": false,
+      "id": 102
+    },
+    {
+      "type": "timeseries",
+      "title": "publish_seconds p99 by stage",
+      "description": "Per-stage attribution of inbound PUBLISH latency. mqtt_publish_query is the usual hot path under multi-publisher fanout.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (le,stage)(rate(pgmqtt_publish_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "A", "legendFormat": "{{stage}}"}],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "delivery_seconds p99 by stage",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (le,stage)(rate(pgmqtt_delivery_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "A", "legendFormat": "{{stage}}"}],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "E2E publish → deliver",
+      "description": "Single-number ingest→deliver SLO. p50/p95/p99 over 15m.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by(le)(rate(pgmqtt_e2e_publish_to_deliver_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by(le)(rate(pgmqtt_e2e_publish_to_deliver_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "B", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by(le)(rate(pgmqtt_e2e_publish_to_deliver_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "C", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "pgxpool acquire p99",
+      "description": "Pool saturation signal. Sustained > 10ms = pool starving callers; bump pool_max_conns.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by(le)(rate(pgmqtt_pgx_acquire_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "A", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.99, sum by(le)(rate(pgmqtt_pgx_acquire_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))", "refId": "B", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.01}]}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 12
+    },
+    {
+      "type": "row",
+      "title": "State",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "collapsed": false,
+      "id": 103
+    },
+    {
+      "type": "stat",
+      "title": "Sessions",
+      "description": "Each pod reports the same global count; using max to dedupe.",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(pgmqtt_sessions{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 13
+    },
+    {
+      "type": "stat",
+      "title": "Subscriptions",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(pgmqtt_subscriptions{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 14
+    },
+    {
+      "type": "stat",
+      "title": "Retained",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(pgmqtt_retained_count{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 15
+    },
+    {
+      "type": "stat",
+      "title": "Inbound QoS-2 pending",
+      "description": "Stuck QoS-2 PUBLISH→PUBREL pairs. Sustained growth = pathological clients.",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max(pgmqtt_inbound_qos2_pending{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 100}, {"color": "red", "value": 1000}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Deliveries inflight by state",
+      "description": "queued = waiting for owning Pod / flow-control slot; inflight = QoS≥1 mid-PUBACK; awaiting_pubcomp = QoS-2 mid-handshake.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "max by (state)(pgmqtt_deliveries_inflight{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A", "legendFormat": "{{state}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"fillOpacity": 15, "lineWidth": 2, "stacking": {"mode": "normal"}}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "Janitor errors by job",
+      "description": "Non-zero = a PG-side problem on a specific janitor sub-job. Cross-reference with broker logs.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum by (job)(rate(pgmqtt_janitor_errors_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))", "refId": "A", "legendFormat": "{{job}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 18
+    },
+    {
+      "type": "row",
+      "title": "Auth & connect-drop",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 44},
+      "collapsed": false,
+      "id": 104
+    },
+    {
+      "type": "timeseries",
+      "title": "Auth failures by reason",
+      "description": "bad_credentials (CONNACK 0x86), not_authorized (0x87), banned (0x88), bad_auth_method (0x8C), other (e.g. statement_timeout on the users lookup — symptom of PG churn).",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 45},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum by (reason)(rate(pgmqtt_auth_failures_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))", "refId": "A", "legendFormat": "{{reason}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Connect dropped by reason",
+      "description": "rate_limit = over the per-IP CONNECTs/sec budget; penalty_box = IP exhausted its auth-failure budget. Both are bcrypt-CPU DoS mitigation.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "sum by (reason)(rate(pgmqtt_connect_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))", "refId": "A", "legendFormat": "{{reason}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 20
+    },
+    {
+      "type": "row",
+      "title": "Resources",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 53},
+      "collapsed": false,
+      "id": 105
+    },
+    {
+      "type": "timeseries",
+      "title": "RSS per pod",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "process_resident_memory_bytes{namespace=~\"$namespace\",pod=~\"$pod\",job=\"pgmqtt\"}", "refId": "A", "legendFormat": "{{pod}}"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Goroutines per pod",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [{"expr": "go_goroutines{namespace=~\"$namespace\",pod=~\"$pod\",job=\"pgmqtt\"}", "refId": "A", "legendFormat": "{{pod}}"}],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "pgxpool depth",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 54},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {"expr": "sum(pgmqtt_pgx_total_conns{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "A", "legendFormat": "total"},
+        {"expr": "sum(pgmqtt_pgx_in_use_conns{namespace=~\"$namespace\",pod=~\"$pod\"})", "refId": "B", "legendFormat": "in use"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"fillOpacity": 10, "lineWidth": 2}}},
+      "options": {"legend": {"showLegend": true, "displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "id": 23
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["pgmqtt", "mqtt"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "skipUrlSync": false
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(pgmqtt_connections, namespace)",
+        "definition": "label_values(pgmqtt_connections, namespace)",
+        "current": {"text": "All", "value": ".*"},
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "skipUrlSync": false,
+        "sort": 1
+      },
+      {
+        "name": "pod",
+        "label": "Pod",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(pgmqtt_connections{namespace=~\"$namespace\"}, pod)",
+        "definition": "label_values(pgmqtt_connections{namespace=~\"$namespace\"}, pod)",
+        "current": {"text": "All", "value": ".*"},
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "options": [],
+        "refresh": 1,
+        "skipUrlSync": false,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "pgmqtt",
+  "uid": "pgmqtt",
+  "version": 1,
+  "weekStart": ""
+}

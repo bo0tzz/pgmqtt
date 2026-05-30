@@ -113,6 +113,29 @@ metrics:
   enabled: true
   port: 9090
 
+## Ship the canonical pgmqtt Grafana dashboard as a GrafanaDashboard CRD
+## (grafana-operator, grafana.integreatly.org/v1beta1). Off by default;
+## enable when you have grafana-operator installed and a Grafana CR with
+## a matching label set.
+##
+##   instanceSelector: operator-convention default targets any Grafana
+##                     instance labelled `dashboards: grafana`. Override
+##                     to scope the dashboard to a specific Grafana.
+##   folder:           optional folder name in Grafana; empty = root.
+##   resyncPeriod:     how often the operator re-applies the dashboard.
+##   allowCrossNamespaceImport:
+##                     true if the target Grafana lives in a different
+##                     namespace; the operator's RBAC must permit it.
+grafana:
+  dashboard:
+    enabled: false
+    instanceSelector:
+      matchLabels:
+        dashboards: grafana
+    folder: ""
+    resyncPeriod: 5m
+    allowCrossNamespaceImport: false
+
 ## PodDisruptionBudget. Default minAvailable=1 prevents a rolling cluster
 ## upgrade from taking every replica down at once. Set to false if you
 ## prefer to manage disruption budgets out-of-band.

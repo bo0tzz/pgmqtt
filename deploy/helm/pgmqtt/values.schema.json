@@ -129,6 +129,25 @@
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
       }
     },
+    "grafana": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dashboard": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "instanceSelector": {
+              "type": "object"
+            },
+            "folder": { "type": "string" },
+            "resyncPeriod": { "type": "string" },
+            "allowCrossNamespaceImport": { "type": "boolean" }
+          }
+        }
+      }
+    },
     "podDisruptionBudget": {
       "type": "object",
       "additionalProperties": false,

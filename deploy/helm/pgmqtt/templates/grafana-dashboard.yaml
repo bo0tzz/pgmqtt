@@ -1,0 +1,19 @@
+{{- if .Values.grafana.dashboard.enabled }}
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: {{ include "pgmqtt.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pgmqtt.labels" . | nindent 4 }}
+spec:
+  resyncPeriod: {{ .Values.grafana.dashboard.resyncPeriod | quote }}
+  allowCrossNamespaceImport: {{ .Values.grafana.dashboard.allowCrossNamespaceImport }}
+  instanceSelector:
+    {{- toYaml .Values.grafana.dashboard.instanceSelector | nindent 4 }}
+  {{- with .Values.grafana.dashboard.folder }}
+  folder: {{ . | quote }}
+  {{- end }}
+  json: |-
+    {{- .Files.Get "dashboards/pgmqtt.json" | nindent 4 }}
+{{- end }}
