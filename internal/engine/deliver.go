@@ -248,6 +248,18 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		}
 		return false, err
 	}
+	// QoS-0 has no ack path. The deliveries row was only ever needed as
+	// a cross-broker routing handoff (publisher's broker → NOTIFY →
+	// owning broker's Deliver scan). Once the packet is on the wire the
+	// row has no further purpose; without this delete, rows pile up in
+	// state=0 until the per-client cap silently blocks all further
+	// deliveries to this client. Best-effort: the orphan sweep catches
+	// any leaks if the DELETE fails transiently.
+	if qos == 0 {
+		if _, derr := e.pool.Exec(ctx, `DELETE FROM deliveries WHERE id=$1`, deliveryID); derr != nil {
+			e.logger.Warn("qos-0 delivery delete", "id", deliveryID, "client", clientID, "err", derr)
+		}
+	}
 	return true, nil
 }
 

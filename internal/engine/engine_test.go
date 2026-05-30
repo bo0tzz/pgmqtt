@@ -93,6 +93,70 @@ func TestRetainedDelivery(t *testing.T) {
 	}
 }
 
+// TestQoS0DeliveriesDoNotAccumulate is the regression guard for the
+// May 2026 zigbee2mqtt-blackhole bug: QoS-0 publishes inserted a
+// `deliveries` row at fanout (cross-broker routing handoff) but never
+// deleted it after the wire write. Over time, a stable QoS-0 subscriber
+// hit MaxQueuedDeliveriesPerClient (10000) and `mqtt_publish` silently
+// dropped further inserts — with no DISCONNECT, log, or metric — so
+// the subscriber stopped receiving every matching message.
+//
+// The fix deletes the row after a successful conn.write on QoS-0. This
+// test publishes far more messages than would have ever drained pre-fix,
+// then asserts the subscriber's live deliveries count stays bounded.
+func TestQoS0DeliveriesDoNotAccumulate(t *testing.T) {
+	t.Parallel()
+	const N = 200
+	h := enginetest.NewHarness(t)
+
+	sub := h.Connect(t, "qos0-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "qos0/flood", 0)
+
+	pub := h.Connect(t, "qos0-pub")
+	for i := 0; i < N; i++ {
+		pub.Publish(t, "qos0/flood", []byte("ping"), 0, false)
+	}
+	pub.Close()
+
+	// Drain the subscriber side so the wire write — and therefore the
+	// delete — has actually run for every message before we count.
+	deadline := time.Now().Add(5 * time.Second)
+	received := 0
+	for received < N && time.Now().Before(deadline) {
+		pk := sub.TryRead(500 * time.Millisecond)
+		if pk == nil {
+			break
+		}
+		if pk.FixedHeader.Type == packets.Publish {
+			received++
+		}
+	}
+	if received < N {
+		t.Fatalf("received %d of %d QoS-0 publishes", received, N)
+	}
+
+	// Allow a small in-flight slack — the DELETE is best-effort async
+	// relative to the read above; a few unfinished ones is fine, an
+	// accumulating monotonic count is not.
+	deadline = time.Now().Add(2 * time.Second)
+	var live int
+	for time.Now().Before(deadline) {
+		if err := h.Pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM deliveries WHERE client_id=$1 AND state=0`,
+			"qos0-sub").Scan(&live); err != nil {
+			t.Fatalf("count deliveries: %v", err)
+		}
+		if live <= 10 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if live > 10 {
+		t.Fatalf("QoS-0 deliveries accumulated: %d rows live for qos0-sub after %d publishes (want bounded)", live, N)
+	}
+}
+
 // TestHADiscoveryFlood simulates Home Assistant's startup pattern: a single
 // client publishes hundreds of retained PUBLISHes in rapid succession
 // (auto-discovery topics + their initial state). We then connect a fresh

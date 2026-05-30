@@ -20,7 +20,7 @@ jobs:
   soak-incluster:
     name: soak (kind + helm + in-cluster pod)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
 
@@ -80,6 +80,25 @@ jobs:
             --pubs 3 --subs 3 \
             --inflight 25 \
             --qos 1
+
+      - name: in-cluster soak (30m × 10 msg/s × QoS 0, homelab shape)
+        # Mirrors how pgmqtt is actually deployed (HA + Z2M class):
+        # long-lived QoS-0 subscribers at low rate. The high-rate QoS-1
+        # soak above doesn't surface QoS-0 specific bugs — that gap let
+        # the May 2026 zigbee2mqtt-blackhole regression land. At 10 msg/s
+        # × 30min × 3 subs each subscriber drains 18000 deliveries, well
+        # past MaxQueuedDeliveriesPerClient (10000). Pre-fix the third
+        # sub wedges silently; the soak rig reports loss. Post-fix the
+        # deliveries table stays near-empty throughout.
+        run: |
+          bash scripts/soak-incluster.sh \
+            --cluster pgmqtt-soak \
+            --namespace mqtt \
+            --duration 30m \
+            --rate 10 \
+            --pubs 1 --subs 3 \
+            --inflight 1 \
+            --qos 0
 
       - name: tier3 multi-broker paho (optional)
         # The existing tier3 helper spins its own kind cluster (it predates

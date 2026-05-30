@@ -263,16 +263,33 @@ t3_soak_smoke() {
         --pubs 3 --subs 3 --inflight 25 --qos 1
 }
 
+t3_soak_homelab() {
+    # Homelab-shape sibling of t3_soak_smoke: QoS-0, multiple subs, more
+    # publishes per sub than the per-client cap so a regression of the
+    # May 2026 zigbee2mqtt-blackhole bug (QoS-0 deliveries accumulating
+    # past MaxQueuedDeliveriesPerClient) hard-fails this phase. 120s ×
+    # 100 msg/s × 3 subs = 36000 deliveries each subscriber must drain;
+    # with the QoS-0 delete-on-send fix the deliveries table stays
+    # near-empty throughout, without it the third sub wedges long
+    # before completion and the soak rig reports loss.
+    bash scripts/soak-incluster.sh \
+        --cluster "$T3_CLUSTER" \
+        --namespace "$T3_NS" \
+        --duration 120s --rate 100 \
+        --pubs 1 --subs 3 --inflight 1 --qos 0
+}
+
 run_tier3() {
     run_tier2
     # tier3 reuses one kind cluster for both multi-broker paho and the
-    # soak smoke — same broker install, no per-phase teardown. The
+    # soak smokes — same broker install, no per-phase teardown. The
     # cluster is created in t3_multi_broker_setup and torn down in
     # t3_multi_broker_teardown.
     phase "tier3 cluster setup" t3_multi_broker_setup
     trap t3_multi_broker_teardown EXIT
     phase "multi-broker paho"   t3_multi_broker
-    phase "soak smoke"          t3_soak_smoke
+    phase "soak smoke (qos1)"   t3_soak_smoke
+    phase "soak smoke (qos0)"   t3_soak_homelab
     phase "tier3 cluster teardown" t3_multi_broker_teardown
     trap - EXIT
 }

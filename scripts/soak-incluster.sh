@@ -268,5 +268,18 @@ if [ "$PUBLISHED" = "0" ] || [ "$RECEIVED" = "0" ]; then
     echo "soak-incluster: FAIL — published=$PUBLISHED received=$RECEIVED (no traffic flowed)" >&2
     exit 1
 fi
+# QoS-0 is at-most-once so the cmd/soak per-message-loss gate above
+# doesn't fire for it. In a sane in-cluster setup we still expect near-
+# total delivery though, and a regression of the May 2026 deliveries-
+# accumulate wedge manifests as ~100% loss past the first ~10k messages
+# per subscriber. Gate on aggregate delivery rate to catch that
+# specifically. 95% threshold gives some slack to genuine at-most-once
+# noise without letting a wedge pass.
+EXPECTED=$((PUBLISHED * SUBS))
+MIN=$((EXPECTED * 95 / 100))
+if [ "$RECEIVED" -lt "$MIN" ]; then
+    echo "soak-incluster: FAIL — received=$RECEIVED below 95%% of expected=$EXPECTED at qos=$QOS (published=$PUBLISHED × subs=$SUBS)" >&2
+    exit 1
+fi
 
 echo "soak-incluster: OK — published=$PUBLISHED received=$RECEIVED lost=$LOST dups=$DUPS at qos=$QOS"

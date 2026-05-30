@@ -593,12 +593,32 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 // removed by an out-of-band path (operator psql, restore from backup);
 // the in-broker delete paths clean explicitly. Rare in steady state.
 func (j *Janitor) sweepOrphanDeliveries(ctx context.Context) error {
+	// Two cases both yield deliveries that no live client will ever drain:
+	//
+	//   (a) The session row is gone (graceful clean_start=true disconnect,
+	//       or an out-of-band DELETE). Pre-existing case.
+	//   (b) The session row is still there but the client disconnected as
+	//       clean_start=true a while ago. v3 doesn't model session expiry,
+	//       and ungraceful disconnects don't always run the session-DELETE
+	//       cleanup path, so these can sit indefinitely with their
+	//       deliveries (real-world: 11.7k stranded rows from a 3-day-old
+	//       `auto-aa1256f3` session). Wait `orphanGrace` past last_seen
+	//       before deleting so a momentary reconnect-flap doesn't lose
+	//       in-flight QoS-1 rows.
+	cutoff := time.Now().Add(-j.orphanGrace)
 	_, err := j.pool.Exec(ctx, `
 		DELETE FROM deliveries
 		 WHERE NOT EXISTS (
 		    SELECT 1 FROM sessions s WHERE s.client_id = deliveries.client_id
 		 )
-	`)
+		    OR client_id IN (
+		    SELECT s.client_id FROM sessions s
+		     WHERE s.client_id = deliveries.client_id
+		       AND s.connected = false
+		       AND s.clean_start = true
+		       AND s.last_seen < $1
+		 )
+	`, cutoff)
 	return err
 }
 
