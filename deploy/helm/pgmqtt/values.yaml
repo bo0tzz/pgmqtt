@@ -366,11 +366,18 @@ automountServiceAccountToken: true
 ## stall doesn't restart the broker mid-stream.
 probes:
   enabled: true
-  ## When true, liveness/readiness use httpGet against /healthz/{live,ready}
-  ## on the metrics port. /healthz/ready pings the pgxpool with a tight
-  ## timeout, so a wedged Postgres flips this Pod out of the Service. Off
-  ## by default to keep tier3 conformance behaviour predictable.
-  useHTTP: false
+  ## Probe mode. true = httpGet against /healthz/{live,ready} on the
+  ## metrics port. /healthz/ready pings the pgxpool with a tight timeout,
+  ## so a wedged Postgres flips this Pod out of the Service rather than
+  ## stalling on a dead listener that still accepts TCP. /healthz/live
+  ## stays green regardless of PG state — process aliveness only.
+  ##
+  ## When false the chart falls back to a tcpSocket probe on the MQTT
+  ## port. This generates a "read connect" DEBUG log line on every probe
+  ## (kubelet opens TCP, doesn't speak MQTT, the broker reads EOF) and
+  ## can't distinguish "process is up" from "process is up AND can reach
+  ## PG". Set false only for environments without an HTTP metrics port.
+  useHTTP: true
   liveness:
     initialDelaySeconds: 5
     periodSeconds: 10

@@ -155,13 +155,13 @@ spec:
               protocol: TCP
             {{- end }}
           {{- if .Values.probes.enabled }}
-          # Liveness probe on the MQTT TCP listener — failing this
-          # restarts the pod. Metrics-port httpGet would more cleanly
-          # distinguish "process alive" from "PG wedged"; the
-          # /healthz/live and /healthz/ready endpoints are exposed on
-          # the metrics port for operators who want to opt in (set
-          # probes.useHTTP=true). Default stays TCP for predictable
-          # tier3 behaviour.
+          # Default is httpGet on /healthz/{live,ready} (probes.useHTTP=true)
+          # because the metrics-port endpoints can distinguish "process
+          # alive" from "PG wedged" — readiness flips the pod out of the
+          # Service when the pgxpool can't reach Postgres. The tcpSocket
+          # fallback below stays for environments without an HTTP metrics
+          # port; it also emits a "read connect" DEBUG line per probe
+          # because kubelet doesn't speak MQTT.
           {{- if .Values.probes.useHTTP }}
           livenessProbe:
             httpGet:
