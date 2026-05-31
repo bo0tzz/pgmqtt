@@ -190,8 +190,13 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if !controllerutil.ContainsFinalizer(&user, finalizerName) {
+		// MergeFrom Patch instead of Update so two concurrent reconciles
+		// during a leader-lease handoff don't fight over ResourceVersion.
+		// The metadata.finalizers list is the only field changing here —
+		// a strategic merge of just that slice is enough.
+		before := user.DeepCopy()
 		controllerutil.AddFinalizer(&user, finalizerName)
-		if err := r.Update(ctx, &user); err != nil {
+		if err := r.Patch(ctx, &user, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -217,8 +222,9 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
 	if renamed {
 		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
+			before := user.DeepCopy()
 			setReady(&user, false, "DBError", scrubReason(err))
-			logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+			logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
 				"rename-cleanup DBError", err)
 			return ctrl.Result{}, err
 		}
@@ -226,8 +232,9 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
+		before := user.DeepCopy()
 		setReady(&user, false, "SecretError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
 			"resolveCredentialSecret SecretError", err)
 		return ctrl.Result{}, err
 	}
@@ -270,8 +277,9 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
 		}
 		if storedCost >= cost {
+			before := user.DeepCopy()
 			setReady(&user, true, "Reconciled", "")
-			return ctrl.Result{}, r.Status().Update(ctx, &user)
+			return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
 		}
 		rehashReason = "cost_bump"
 	} else {
@@ -287,18 +295,20 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		INSERT INTO users(username, password_hash) VALUES($1, $2)
 		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
 	`, username, string(bcryptHash)); err != nil {
+		before := user.DeepCopy()
 		setReady(&user, false, "DBError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
 			"users upsert DBError", err)
 		return ctrl.Result{}, err
 	}
 	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
+	before := user.DeepCopy()
 	user.Status.ObservedSecretHash = hash
 	user.Status.ObservedUsername = username
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 	setReady(&user, true, "Reconciled", "")
-	if err := r.Status().Update(ctx, &user); err != nil {
+	if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
 	}
 	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
@@ -343,8 +353,11 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 	if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, username); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Finalizer-removal via Patch (MergeFrom) — same lease-handoff
+	// rationale as finalizer-add above. Spec is untouched.
+	before := user.DeepCopy()
 	controllerutil.RemoveFinalizer(user, finalizerName)
-	return ctrl.Result{}, r.Update(ctx, user)
+	return ctrl.Result{}, r.Patch(ctx, user, client.MergeFrom(before))
 }
 
 // resolveCredentialSecret returns the Secret referenced by spec.PasswordSecretRef,
