@@ -201,6 +201,27 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		username = user.Name
 	}
 
+	// Rename handling: if spec.username has been edited since the last
+	// successful reconcile, the row keyed by the OLD username must be
+	// removed — otherwise the old credentials remain valid for auth and
+	// the old username slot stays occupied even after the slot is
+	// logically free. status.observedUsername is the authoritative
+	// pointer to the row we last wrote, so we delete that row first and
+	// fall through to the upsert which writes the new one.
+	//
+	// Idempotency: the DELETE is a no-op when the row is already gone,
+	// so a mid-reconcile failure that prevents the status update is
+	// safe — the next pass observes the same observedUsername, re-runs
+	// the (no-op) DELETE, and tries the upsert again.
+	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
+	if renamed {
+		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
+			setReady(&user, false, "DBError", scrubReason(err))
+			_ = r.Status().Update(ctx, &user)
+			return ctrl.Result{}, err
+		}
+	}
+
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
 		setReady(&user, false, "SecretError", scrubReason(err))
@@ -218,9 +239,23 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// row is at-or-above the configured cost. Bumping operator.bcryptCost
 	// must NOT leave existing rows on the old cost forever — see
 	// pgmqtt_user_rehash_total{reason="cost_bump"} for rollout tracking.
+	//
+	// On a rename we skip the short-circuit entirely: even when the
+	// password is unchanged the new-username row may not yet exist in PG
+	// (storedBcryptCost would return 0 → cost-bump branch), but more
+	// importantly we want the upsert path to run unconditionally so the
+	// new row lands and status.observedUsername advances.
+	//
+	// Requiring ObservedUsername == username (NOT just !renamed) also
+	// handles the upgrade path: an old User CR reconciled by a pre-rename-
+	// handling broker has ObservedSecretHash set but ObservedUsername
+	// empty. The first reconcile on the new broker bypasses the short-
+	// circuit, runs the (idempotent) upsert, and backfills
+	// ObservedUsername so subsequent reconciles short-circuit normally.
 	hash := sha256Hex(password)
 	rehashReason := ""
-	if user.Status.ObservedSecretHash == hash &&
+	if user.Status.ObservedUsername == username &&
+		user.Status.ObservedSecretHash == hash &&
 		user.Status.CredentialsSecretRef != nil &&
 		user.Status.CredentialsSecretRef.Name == secret.Name {
 		// Cleartext is unchanged — still need to verify the stored hash
@@ -256,6 +291,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
 	user.Status.ObservedSecretHash = hash
+	user.Status.ObservedUsername = username
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 	setReady(&user, true, "Reconciled", "")
 	if err := r.Status().Update(ctx, &user); err != nil {
