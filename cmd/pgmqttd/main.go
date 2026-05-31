@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sync/atomic"
 	"syscall"
 
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -140,8 +141,18 @@ func main() {
 	// reconciliation responsibility at a time. Loss/handoff is handled
 	// inside controller-runtime; on loss the manager exits and a peer
 	// Pod's manager takes over (no Pod restart needed).
+	//
+	// Panic handling differs from the other background goroutines:
+	// recoverPanic() logs and returns, leaving the broker running. For
+	// the operator that's catastrophic — controller-runtime would be
+	// dead, no User reconciles would land, and BYO Secret rotations
+	// would silently skip. Operators wouldn't get paged because the
+	// broker keeps serving traffic. Instead, fatalRecoverOperator
+	// cancels the root context (giving the engine/janitor/listener a
+	// chance to drain cleanly via their ctx-aware loops) and signals
+	// main() to exit non-zero so K8s restarts the pod and re-elects.
 	go func() {
-		defer recoverPanic(logger, "operator run")
+		defer fatalRecoverOperator(logger, cancel)
 		opts := operator.Options{
 			ServiceHost:             cfg.ServiceHost,
 			ServicePort:             cfg.ServicePort,
@@ -159,6 +170,13 @@ func main() {
 		logger.Error("serve", "err", err)
 		os.Exit(1)
 	}
+	// If the operator goroutine panicked, fatalRecoverOperator set this
+	// flag and cancelled the root context (which brought Serve out
+	// cleanly). Exit non-zero so K8s restarts the pod and re-elects.
+	if operatorPanicked.Load() {
+		logger.Error("exiting after operator panic")
+		operatorExit(1)
+	}
 	logger.Info("shutdown complete")
 }
 
@@ -171,4 +189,44 @@ func recoverPanic(logger *slog.Logger, scope string) {
 		logger.Error("goroutine panic", "scope", scope,
 			"panic", r, "stack", string(debug.Stack()))
 	}
+}
+
+// operatorPanicked records whether the operator goroutine has bailed
+// out via a panic; main() reads it after eng.Serve returns so a
+// graceful shutdown still exits with code 1 to trigger a K8s restart.
+// atomic.Bool because operator goroutine writes; main reads.
+var operatorPanicked atomic.Bool
+
+// operatorExit is the process-exit function called when the operator
+// has panicked and the broker has finished draining. Defaults to
+// os.Exit so production exits cleanly; tests swap it with a recorder
+// to assert the exit was triggered without actually terminating the
+// test process.
+var operatorExit = os.Exit
+
+// fatalRecoverOperator is the deferred panic recovery used by the
+// operator goroutine only. Unlike recoverPanic, it does NOT swallow
+// the panic and continue running the broker — a dead controller-
+// runtime means no User reconciles land, BYO Secret rotations stall,
+// and there's no signal to oncall. Instead it:
+//
+//  1. Logs the panic + stack.
+//  2. Cancels the root context so engine/janitor/listener wind down
+//     via their existing ctx-aware loops (graceful drain).
+//  3. Sets operatorPanicked so main() knows to exit non-zero after
+//     Serve returns.
+//
+// The brief shutdown delay before exit is intentional: we want
+// pool.Close + lst.Stop to run via main()'s deferred cleanup; an
+// immediate os.Exit here would skip them. Defer-stacked cleanup runs
+// only when main() returns.
+func fatalRecoverOperator(logger *slog.Logger, cancel context.CancelFunc) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	logger.Error("operator panic; broker exiting for K8s to restart",
+		"panic", r, "stack", string(debug.Stack()))
+	operatorPanicked.Store(true)
+	cancel()
 }
