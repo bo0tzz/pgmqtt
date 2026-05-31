@@ -32,7 +32,9 @@ const publishTimeout = 5 * time.Second
 func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	startTotal := time.Now()
 	defer func() {
-		c.eng.metrics.ObservePublishStage("total", time.Since(startTotal))
+		dur := time.Since(startTotal)
+		c.eng.metrics.ObservePublishStage("total", dur)
+		c.eng.logSlowStage("publish", "total", dur, "client", c.clientID, "topic", pk.TopicName, "qos", pk.FixedHeader.Qos)
 	}()
 	if err := mqttwire.ValidateTopicName(pk.TopicName); err != nil {
 		return err
@@ -188,7 +190,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 			FixedHeader: packets.FixedHeader{Type: packets.Puback},
 			PacketID:    pk.PacketID,
 		})
-		c.eng.metrics.ObservePublishStage("response_write", time.Since(startWrite))
+		rwDur := time.Since(startWrite)
+		c.eng.metrics.ObservePublishStage("response_write", rwDur)
+		c.eng.logSlowStage("publish", "response_write", rwDur, "client", c.clientID, "pid", pk.PacketID)
 		return err
 	case 2:
 		// PUBREC alone doesn't close the slot — we're still waiting for
@@ -200,7 +204,9 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 			FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
 			PacketID:    pk.PacketID,
 		})
-		c.eng.metrics.ObservePublishStage("response_write", time.Since(startWrite))
+		rwDur := time.Since(startWrite)
+		c.eng.metrics.ObservePublishStage("response_write", rwDur)
+		c.eng.logSlowStage("publish", "response_write", rwDur, "client", c.clientID, "pid", pk.PacketID)
 		return err
 	default:
 		return errors.New("invalid qos")
@@ -294,7 +300,9 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 
 	startBegin := time.Now()
 	tx, err := e.beginTxTimed(ctx, pgx.TxOptions{})
-	e.metrics.ObservePublishStage("tx_begin", time.Since(startBegin))
+	beginDur := time.Since(startBegin)
+	e.metrics.ObservePublishStage("tx_begin", beginDur)
+	e.logSlowStage("publish", "tx_begin", beginDur, "topic", p.Topic)
 	if err != nil {
 		return res, err
 	}
@@ -306,7 +314,9 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 			INSERT INTO inbound_qos2(client_id, packet_id) VALUES ($1, $2)
 			ON CONFLICT DO NOTHING
 		`, p.QoS2DedupKey.ClientID, p.QoS2DedupKey.PacketID)
-		e.metrics.ObservePublishStage("qos2_dedup", time.Since(startQ2))
+		q2Dur := time.Since(startQ2)
+		e.metrics.ObservePublishStage("qos2_dedup", q2Dur)
+		e.logSlowStage("publish", "qos2_dedup", q2Dur, "client", p.QoS2DedupKey.ClientID, "pid", p.QoS2DedupKey.PacketID)
 		if err != nil {
 			return res, err
 		}
@@ -335,7 +345,9 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 				return res, err
 			}
 		}
-		e.metrics.ObservePublishStage("retain", time.Since(startRetain))
+		retainDur := time.Since(startRetain)
+		e.metrics.ObservePublishStage("retain", retainDur)
+		e.logSlowStage("publish", "retain", retainDur, "topic", p.Topic)
 	}
 
 	var publisher any
@@ -355,7 +367,9 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 	if err := row.Scan(&res.MessageID, &brokers, &overflow, &delivered); err != nil {
 		return res, err
 	}
-	e.metrics.ObservePublishStage("mqtt_publish_query", time.Since(startQuery))
+	queryDur := time.Since(startQuery)
+	e.metrics.ObservePublishStage("mqtt_publish_query", queryDur)
+	e.logSlowStage("publish", "mqtt_publish_query", queryDur, "topic", p.Topic, "fanout", delivered)
 	e.metrics.ObservePublishFanout(delivered)
 
 	// pg_notify INSIDE the publish tx, not after commit. Postgres queues
@@ -375,14 +389,18 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 			channels, strconv.FormatInt(res.MessageID, 10)); err != nil {
 			return res, err
 		}
-		e.metrics.ObservePublishStage("notify", time.Since(startNotify))
+		notifyDur := time.Since(startNotify)
+		e.metrics.ObservePublishStage("notify", notifyDur)
+		e.logSlowStage("publish", "notify", notifyDur, "topic", p.Topic, "peers", len(brokers))
 	}
 
 	startCommit := time.Now()
 	if err := tx.Commit(ctx); err != nil {
 		return res, err
 	}
-	e.metrics.ObservePublishStage("tx_commit", time.Since(startCommit))
+	commitDur := time.Since(startCommit)
+	e.metrics.ObservePublishStage("tx_commit", commitDur)
+	e.logSlowStage("publish", "tx_commit", commitDur, "topic", p.Topic)
 	res.BrokerIDs = brokers
 	res.OverflowClients = overflow
 	// Symmetric drop signal: count each over-cap subscriber as a dropped

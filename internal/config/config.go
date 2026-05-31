@@ -124,6 +124,14 @@ type Config struct {
 	// internally, so idle DB churn is ~5× lower than naive "every-job-
 	// every-tick". 0 leaves the janitor's own default (1s).
 	JanitorInterval time.Duration
+
+	// SlowStageLogMs gates a structured WARN log whenever any publish/
+	// delivery/pgx-acquire stage observation exceeds this many ms. The
+	// histograms already capture the distribution; this surfaces the
+	// specific events behind a p99 spike so operators can correlate a
+	// slow observation with what was happening (which message, which
+	// client, what stage). 0 disables (default).
+	SlowStageLogMs int
 }
 
 func FromEnv() (*Config, error) {
@@ -152,6 +160,7 @@ func FromEnv() (*Config, error) {
 		LogFormat:                    getenvDefaultEmpty("PGMQTT_LOG_FORMAT", "text"),
 		WSAllowedOrigins:             splitTrimmed(os.Getenv("PGMQTT_WS_ALLOWED_ORIGINS"), ","),
 		JanitorInterval:              time.Duration(getenvInt("PGMQTT_JANITOR_INTERVAL_MS", 1000)) * time.Millisecond,
+		SlowStageLogMs:               getenvInt("PGMQTT_SLOW_STAGE_LOG_MS", 0),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("PGMQTT_DATABASE_URL is required")

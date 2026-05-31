@@ -205,8 +205,35 @@ func (e *Engine) Metrics() *metrics.Metrics {
 func (e *Engine) beginTxTimed(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
 	start := time.Now()
 	tx, err := e.pool.BeginTx(ctx, opts)
-	e.metrics.ObservePgxAcquire(time.Since(start))
+	dur := time.Since(start)
+	e.metrics.ObservePgxAcquire(dur)
+	e.logSlowStage("pgx", "acquire", dur)
 	return tx, err
+}
+
+// logSlowStage emits a structured WARN when a stage exceeds the operator-
+// configured PGMQTT_SLOW_STAGE_LOG_MS threshold. Histograms already capture
+// the distribution; this surfaces the specific events that produce p99
+// spikes so operators can correlate a slow observation with what was
+// happening (which message, which client, what concurrent ops).
+//
+// extras is alternating key/value pairs the way slog.Warn consumes them.
+// No-op when SlowStageLogMs is 0 (default) or the observation is under
+// threshold — cost is one struct field read + one comparison, hot-path
+// safe.
+func (e *Engine) logSlowStage(kind, stage string, dur time.Duration, extras ...any) {
+	if e.cfg == nil || e.cfg.SlowStageLogMs <= 0 {
+		return
+	}
+	if dur < time.Duration(e.cfg.SlowStageLogMs)*time.Millisecond {
+		return
+	}
+	args := append([]any{
+		"kind", kind,
+		"stage", stage,
+		"dur_ms", dur.Milliseconds(),
+	}, extras...)
+	e.logger.Warn("slow stage", args...)
 }
 
 // Serve runs the accept loops until ctx is cancelled or a fatal accept error.

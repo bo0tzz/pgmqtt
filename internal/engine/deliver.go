@@ -24,7 +24,9 @@ import (
 func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 	totalStart := time.Now()
 	defer func() {
-		e.metrics.ObserveDeliveryStage("total", time.Since(totalStart))
+		dur := time.Since(totalStart)
+		e.metrics.ObserveDeliveryStage("total", dur)
+		e.logSlowStage("delivery", "total", dur, "msg_id", messageID)
 	}()
 	self := e.BrokerID()
 	scanStart := time.Now()
@@ -53,7 +55,9 @@ func (e *Engine) Deliver(ctx context.Context, messageID int64) error {
 		return err
 	}
 	defer rows.Close()
-	e.metrics.ObserveDeliveryStage("scan", time.Since(scanStart))
+	scanDur := time.Since(scanStart)
+	e.metrics.ObserveDeliveryStage("scan", scanDur)
+	e.logSlowStage("delivery", "scan", scanDur, "msg_id", messageID)
 
 	type item struct {
 		deliveryID         int64
@@ -218,7 +222,9 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 				UPDATE deliveries SET packet_id=$1, state=1
 				 WHERE id=$2 AND state=0
 			`, int(allocated), deliveryID)
-			e.metrics.ObserveDeliveryStage("alloc", time.Since(allocStart))
+			allocDur := time.Since(allocStart)
+			e.metrics.ObserveDeliveryStage("alloc", allocDur)
+			e.logSlowStage("delivery", "alloc", allocDur, "client", clientID, "delivery_id", deliveryID)
 			if err != nil {
 				conn.returnInflight()
 				return false, err
@@ -267,7 +273,9 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 
 	writeStart := time.Now()
 	err = conn.write(pk)
-	e.metrics.ObserveDeliveryStage("write", time.Since(writeStart))
+	writeDur := time.Since(writeStart)
+	e.metrics.ObserveDeliveryStage("write", writeDur)
+	e.logSlowStage("delivery", "write", writeDur, "client", clientID, "topic", topic, "qos", qos)
 	if err != nil {
 		if qos > 0 {
 			conn.returnInflight()
