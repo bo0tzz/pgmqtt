@@ -65,13 +65,22 @@ type Listener struct {
 	uuid      uuid.UUID
 	logger    *slog.Logger
 	eng       *engine.Engine
-	url       string
 	cancel    context.CancelFunc
 	doneCh    chan struct{}
 	closeOnce sync.Once
-	mu        sync.Mutex // guards conn — swapped on reconnect.
+	mu        sync.Mutex // guards conn + url — both swapped from outside the run goroutine.
 	conn      *pgx.Conn
+	url       string
 	mtx       *metrics.Metrics
+}
+
+// loadURL returns the current connect URL under l.mu. The URL is
+// effectively immutable in production; the lock exists only so
+// SetURLForTest can race-safely swap it from a test goroutine.
+func (l *Listener) loadURL() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.url
 }
 
 // SetMetrics installs a Metrics for listener counters. Call before Start
@@ -203,6 +212,17 @@ func (l *Listener) run(ctx context.Context) {
 				l.mtx.ListenerRestartsTotal.WithLabelValues("wait_error").Inc()
 			}
 			if !l.reconnect(ctx) {
+				// Distinguish "ctx cancelled mid-reconnect" (clean Stop())
+				// from "we burned through reconnectMaxAttempts". The
+				// former must return cleanly so graceful shutdown doesn't
+				// crash the pod; the latter is the kubelet-replacement
+				// path that signals failure via osExit.
+				if ctx.Err() != nil {
+					if l.mtx != nil {
+						l.mtx.ListenerRestartsTotal.WithLabelValues("ctx_cancel").Inc()
+					}
+					return
+				}
 				if l.mtx != nil {
 					l.mtx.ListenerRestartsTotal.WithLabelValues("exhausted_retries").Inc()
 				}
@@ -251,7 +271,7 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		newConn, err := dialAndRegister(ctx, l.url, l.uuid)
+		newConn, err := dialAndRegister(ctx, l.loadURL(), l.uuid)
 		if err == nil {
 			l.mu.Lock()
 			l.conn = newConn
