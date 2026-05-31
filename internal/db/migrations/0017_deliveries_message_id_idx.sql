@@ -1,0 +1,31 @@
+-- 0017_deliveries_message_id_idx.sql
+--
+-- `Engine.Deliver(messageID)` is the cross-broker handoff path: a peer
+-- pod's `pg_notify` lands and we run
+--
+--   SELECT ... FROM deliveries d
+--     JOIN sessions s ON s.client_id = d.client_id
+--     ...
+--    WHERE d.message_id = $1 AND s.broker_id = $2 AND d.state = 0
+--
+-- Every existing index on `deliveries` is keyed on `client_id` first
+-- (state-and-id, packet-id, the qos>0 partial). None of them can answer
+-- a `message_id = $1` lookup, so Postgres seqscan'd `deliveries` on
+-- every Deliver call.
+--
+-- This wasn't visible in production where deliveries drains keep the
+-- table small. But during a tier3-shape soak (3 pubs × 1000 msg/s ×
+-- 3 subs QoS-1) the table can hold tens of thousands of state=0 rows
+-- transiently if the subs can't drain at line rate. A 3-run soak loop
+-- demonstrated 5-10× progressive delivery latency growth, all in the
+-- scan stage of `Deliver`, exactly tracking the deliveries-table size.
+--
+-- A partial-index on (message_id) WHERE state=0 makes the lookup an
+-- index scan. Partial because the query always filters state=0 — the
+-- (state=1,2) inflight rows are queued for ack-tracking, not fanout.
+-- Partial also keeps the index small: ack'd rows roll through state=2
+-- and then get DELETE'd, so the index size tracks queue depth, not
+-- total throughput.
+CREATE INDEX deliveries_message_id_state0_idx
+    ON deliveries (message_id)
+    WHERE state = 0;
