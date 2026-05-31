@@ -211,7 +211,11 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 
 	// Register this Conn locally; if the prior owner was *us*, close it.
+	// Mark the prior conn as taken-over so its handleDisconnect suppresses
+	// will firing — same-pod takeover is also a session migration, not
+	// the client dying (MQTT-3.1.2.5).
 	if prev := c.eng.registerConn(c.clientID, c); prev != nil {
+		prev.takenOver.Store(true)
 		prev.shutdown()
 	}
 

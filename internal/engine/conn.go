@@ -71,6 +71,15 @@ type Conn struct {
 
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool
+	// takenOver is set by the listener's takeover dispatch immediately
+	// before calling Shutdown on a stale Conn. handleDisconnect reads it
+	// to suppress will fire/schedule: a session-takeover-driven server-
+	// side shutdown is NOT abnormal termination, so per MQTT-3.1.2.5
+	// the Will Message must not be published. Without this, a client
+	// that just successfully roamed to a new pod would have its previous
+	// pod's stale conn fire the will (and with willRetain=true, stamp
+	// "offline" on top of the device's new live presence).
+	takenOver         atomic.Bool
 	closed            chan struct{}
 	once              sync.Once
 
@@ -664,6 +673,16 @@ func (c *Conn) shutdown() {
 // goroutine — used by takeover and at server shutdown.
 func (c *Conn) Shutdown() { c.shutdown() }
 
+// ShutdownForTakeover marks the Conn as superseded by a peer takeover and
+// then closes it. handleDisconnect uses the takenOver flag to suppress
+// the will (per MQTT-3.1.2.5 the Will Message is for ABNORMAL termination,
+// not for server-side shutdown of a stale conn whose session has been
+// adopted by a new owner). Safe to call from outside the conn's goroutine.
+func (c *Conn) ShutdownForTakeover() {
+	c.takenOver.Store(true)
+	c.shutdown()
+}
+
 // SessionToken returns the per-conn session_token captured at takeover
 // time. Used by the listener's takeover dispatch to ignore a late
 // notification whose payload doesn't match this Conn's token.
@@ -718,9 +737,19 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	defer cancel()
 
 	// Compute will-fire timing.
+	//
+	// Suppress will entirely when this Conn was taken over by a peer (the
+	// listener's takeover dispatch sets c.takenOver before calling
+	// Shutdown). Per MQTT-3.1.2.5, the Will Message is published when
+	// the Network Connection is closed for reasons OTHER than reception
+	// of a DISCONNECT — but a session-takeover-driven server shutdown is
+	// not "the client died", it's "the same client moved sessions". For
+	// users with willRetain=true (z2m / HA), firing the will here would
+	// stamp the device as offline immediately after it successfully
+	// moved to a new pod.
 	willFireImmediate := false
 	willFireAt := (*time.Time)(nil)
-	if c.willTopic != "" {
+	if c.willTopic != "" && !c.takenOver.Load() {
 		switch c.protocol {
 		case mqttwire.ProtocolMQTT5:
 			delay := c.willDelay

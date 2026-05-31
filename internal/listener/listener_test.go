@@ -386,6 +386,126 @@ func TestTakeoverDoesNotClobberNewSession(t *testing.T) {
 	}
 }
 
+// TestTakeoverSuppressesWillFire exercises BUG-2: a takeover-driven
+// Shutdown of a stale Conn must NOT fire that Conn's will. Per
+// MQTT-3.1.2.5, the Will Message is published for ABNORMAL termination
+// — a session takeover (client moved sessions) is not "the client died".
+// For users with willRetain=true (zigbee2mqtt / Home Assistant), firing
+// the will after a successful roam would stamp the device as offline
+// over its newly-live presence.
+//
+// Scenario: client A connects to pod 0 with a will on "presence/A".
+// A subscriber on a different client_id subscribes to "presence/A".
+// Same client_id reconnects on pod 1 → pod 0's stale Conn takeover-
+// shut-down. We assert the subscriber receives NO publish on
+// "presence/A" within a generous deadline.
+func TestTakeoverSuppressesWillFire(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	for _, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		t.Cleanup(l.Stop)
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	const clientID = "willful-roamer"
+	const willTopic = "presence/willful-roamer"
+
+	// Subscriber on pod 1 watching the will topic.
+	sub := mh.Pods[1].Connect(t, "presence-watcher")
+	defer sub.Close()
+	sub.Subscribe(t, willTopic, 1)
+
+	// Client A: connect to pod 0 with a will (qos=1, retain=true).
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = willTopic
+		p.Connect.WillPayload = []byte("offline")
+		p.Connect.WillQos = 1
+		p.Connect.WillRetain = true
+		// Persistent session so the takeover-not-cleanStart path runs.
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := mh.Pods[0].Connect(t, clientID, withWill)
+	defer c1.Close()
+
+	// Same client_id reconnects on pod 1 — takeover fires.
+	c2 := mh.Pods[1].Connect(t, clientID, withWill)
+	defer c2.Close()
+
+	// Wait long enough for the takeover NOTIFY → Shutdown →
+	// handleDisconnect chain to complete on pod 0. The will, if fired,
+	// would publish via pg_notify and reach the subscriber on pod 1
+	// within a few hundred ms. We give it 2s and assert silence.
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := sub.NextRaw()
+	if err == nil && pk.FixedHeader.Type == packets.Publish && pk.TopicName == willTopic {
+		t.Fatalf("will fired on takeover (got publish %q payload=%q) — MQTT-3.1.2.5 violated",
+			pk.TopicName, pk.Payload)
+	}
+	// err != nil (timeout) is the success case.
+}
+
+// TestSamePodTakeoverSuppressesWillFire exercises BUG-2's same-pod
+// variant: a client reconnects to the same pod it was on. The prior
+// Conn's prev.shutdown() must mark the conn as taken-over so its
+// handleDisconnect suppresses will firing.
+func TestSamePodTakeoverSuppressesWillFire(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, newPodLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	const clientID = "same-pod-roamer"
+	const willTopic = "presence/same-pod-roamer"
+
+	sub := pod.Connect(t, "same-pod-watcher")
+	defer sub.Close()
+	sub.Subscribe(t, willTopic, 1)
+
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = willTopic
+		p.Connect.WillPayload = []byte("offline")
+		p.Connect.WillQos = 1
+		p.Connect.WillRetain = true
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := pod.Connect(t, clientID, withWill)
+	defer c1.Close()
+
+	// Same-pod takeover: another CONNECT with the same client_id.
+	c2 := pod.Connect(t, clientID, withWill)
+	defer c2.Close()
+
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := sub.NextRaw()
+	if err == nil && pk.FixedHeader.Type == packets.Publish && pk.TopicName == willTopic {
+		t.Fatalf("same-pod takeover fired will (got publish %q payload=%q)",
+			pk.TopicName, pk.Payload)
+	}
+}
+
 func TestTakeoverClosesPriorPodSocket(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 2, nil)
