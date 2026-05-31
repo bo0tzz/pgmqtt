@@ -39,11 +39,16 @@ const (
 	tcpKeepaliveCount    = 3
 
 	// Reconnect backoff. On a non-EOF NOTIFY wait error we tear down the
-	// dedicated conn (which auto-releases the advisory lock), sleep, and
-	// re-acquire LISTEN + lock. Backoff doubles 1→2→4→8→16 s; the loop
-	// gives up after reconnectMaxAttempts and the Pod exits so kubelet
-	// replaces it (advisory lock + LISTEN registration are per-conn so
-	// the new Pod gets a clean state).
+	// dedicated conn (which auto-releases the advisory lock) and try to
+	// re-acquire LISTEN + lock. First attempt fires immediately — only a
+	// FAILED attempt sleeps, with backoff doubling 1→2→4→8→16 s. The
+	// loop gives up after reconnectMaxAttempts and the Pod exits so
+	// kubelet replaces it (advisory lock + LISTEN registration are
+	// per-conn so the new Pod gets a clean state). Firing the first
+	// attempt immediately closes the dead-broker-reap race: during the
+	// reconnect window our advisory lock is unheld, so a peer Pod's
+	// janitor that grabs it would treat us as a dead broker and kick
+	// every owning client.
 	reconnectInitialBackoff = 1 * time.Second
 	reconnectMaxBackoff     = 16 * time.Second
 	reconnectMaxAttempts    = 5
@@ -60,13 +65,22 @@ type Listener struct {
 	uuid      uuid.UUID
 	logger    *slog.Logger
 	eng       *engine.Engine
-	url       string
 	cancel    context.CancelFunc
 	doneCh    chan struct{}
 	closeOnce sync.Once
-	mu        sync.Mutex // guards conn — swapped on reconnect.
+	mu        sync.Mutex // guards conn + url — both swapped from outside the run goroutine.
 	conn      *pgx.Conn
+	url       string
 	mtx       *metrics.Metrics
+}
+
+// loadURL returns the current connect URL under l.mu. The URL is
+// effectively immutable in production; the lock exists only so
+// SetURLForTest can race-safely swap it from a test goroutine.
+func (l *Listener) loadURL() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.url
 }
 
 // SetMetrics installs a Metrics for listener counters. Call before Start
@@ -198,6 +212,17 @@ func (l *Listener) run(ctx context.Context) {
 				l.mtx.ListenerRestartsTotal.WithLabelValues("wait_error").Inc()
 			}
 			if !l.reconnect(ctx) {
+				// Distinguish "ctx cancelled mid-reconnect" (clean Stop())
+				// from "we burned through reconnectMaxAttempts". The
+				// former must return cleanly so graceful shutdown doesn't
+				// crash the pod; the latter is the kubelet-replacement
+				// path that signals failure via osExit.
+				if ctx.Err() != nil {
+					if l.mtx != nil {
+						l.mtx.ListenerRestartsTotal.WithLabelValues("ctx_cancel").Inc()
+					}
+					return
+				}
 				if l.mtx != nil {
 					l.mtx.ListenerRestartsTotal.WithLabelValues("exhausted_retries").Inc()
 				}
@@ -205,6 +230,16 @@ func (l *Listener) run(ctx context.Context) {
 					"broker", l.uuid)
 				osExit(1)
 				return
+			}
+			// Reconnect succeeded: peer Pods' `pg_notify` fan-outs for
+			// our local subscribers landed on a deaf channel during the
+			// reconnect window. The delivery rows they wrote sit at
+			// state=0 with no kick. Wake every local Conn's drain loop
+			// so QoS-1 subscribers that don't publish/ack frequently
+			// don't have their queued rows sit indefinitely. Best
+			// effort: kicks coalesce, drainOnce iterates the queue.
+			if l.eng != nil {
+				l.eng.KickAllDrains()
 			}
 			continue
 		}
@@ -231,16 +266,22 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 		cancel()
 	}
 
+	// Reconnect strategy: fire the first attempt IMMEDIATELY, only sleep
+	// after a FAILED attempt. The old code's leading 1 s sleep gave peer
+	// Pods' janitor.findDeadBrokerCandidates + handleDeadBroker enough
+	// time to grab our (now-unheld) per-broker advisory lock and reap
+	// every session whose broker_id = us — the broker is alive, just
+	// reconnecting, but every owning client gets kicked. Trying once
+	// fast closes that window for the common CNPG primary-failover case
+	// where Postgres comes back in <100ms.
 	backoff := reconnectInitialBackoff
 	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
-		// Sleep first (so we don't hammer PG immediately on the same
-		// transient failure), respecting context cancellation.
-		select {
-		case <-ctx.Done():
+		// Bail before the dial on ctx cancellation so Stop() during
+		// reconnect returns promptly.
+		if ctx.Err() != nil {
 			return false
-		case <-time.After(backoff):
 		}
-		newConn, err := dialAndRegister(ctx, l.url, l.uuid)
+		newConn, err := dialAndRegister(ctx, l.loadURL(), l.uuid)
 		if err == nil {
 			l.mu.Lock()
 			l.conn = newConn
@@ -249,6 +290,16 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 			return true
 		}
 		l.logger.Warn("listener reconnect failed", "attempt", attempt, "err", err)
+		// Last attempt — don't sleep, just bail.
+		if attempt == reconnectMaxAttempts {
+			break
+		}
+		// Back off before the next attempt (and respect ctx).
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
 		if backoff < reconnectMaxBackoff {
 			backoff *= 2
 			if backoff > reconnectMaxBackoff {
