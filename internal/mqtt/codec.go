@@ -55,6 +55,14 @@ type Reader struct {
 	// allocation. 0 means "use PreConnectMaxPacketSize". Set via
 	// SetMaxPacketSize after the engine has resolved the post-CONNECT cap.
 	maxPacketSize uint32
+	// LastConnectBody retains the raw v5 CONNECT body bytes after Read
+	// returns a CONNECT packet. Needed by the engine to detect presence
+	// of certain properties that mochi's Properties struct decodes
+	// without setting a presence flag (notably MaximumPacketSize, where
+	// value 0 collides with "absent" and is itself a Protocol Error per
+	// [MQTT-3.1.2-25]). Cleared on every non-CONNECT Read so the slice
+	// doesn't leak.
+	LastConnectBody []byte
 }
 
 // NewReader wraps r. If r is already a *bufio.Reader it is reused.
@@ -117,6 +125,11 @@ func (r *Reader) Read() (packets.Packet, error) {
 	// CONNECT carries its own protocol version; remember it for subsequent reads.
 	if pk.FixedHeader.Type == packets.Connect {
 		r.ProtocolVersion = pk.ProtocolVersion
+		// Stash the raw body so the engine can detect property presence
+		// where the decoded struct loses that information.
+		r.LastConnectBody = body
+	} else {
+		r.LastConnectBody = nil
 	}
 	return pk, nil
 }
@@ -249,4 +262,125 @@ func Encode(pk *packets.Packet) ([]byte, error) {
 	}
 	out := append([]byte(nil), buf.b.Bytes()...)
 	return out, nil
+}
+
+// V5ConnectMaximumPacketSize parses the raw v5 CONNECT body and returns
+// whether the MaximumPacketSize property was explicitly present and its
+// value. mochi's Properties decoder collapses "absent" and "present with
+// value 0" — both leave Properties.MaximumPacketSize == 0 — so we can't
+// distinguish the legal "I have no opinion" case from the spec-illegal
+// "Maximum Packet Size = 0" Protocol Error [MQTT-3.1.2-25] without
+// re-walking the wire bytes.
+//
+// Returns (present, value, err). err is non-nil only on a malformed
+// CONNECT body — in which case the caller should already be rejecting
+// via mochi's ConnectDecode.
+func V5ConnectMaximumPacketSize(body []byte) (bool, uint32, error) {
+	// CONNECT body layout (v5, post-ConnectDecode):
+	//   protocol name (2-byte len + N)
+	//   protocol level (1 byte) — must be 5
+	//   connect flags  (1 byte)
+	//   keepalive      (2 bytes)
+	//   properties     (varint length + N)
+	//   payload        (clientID etc.)
+	if len(body) < 2 {
+		return false, 0, fmt.Errorf("connect body too short")
+	}
+	pnLen := int(body[0])<<8 | int(body[1])
+	off := 2 + pnLen
+	if len(body) < off+4 {
+		return false, 0, fmt.Errorf("connect body truncated")
+	}
+	pv := body[off]
+	off += 1 + 1 + 2 // protocol level, flags, keepalive
+	if pv != 5 {
+		return false, 0, nil // not v5 — no properties section
+	}
+
+	// Property block: varint length, then N bytes of (id, value...) pairs.
+	propLen, n, err := decodeVarint(body[off:])
+	if err != nil {
+		return false, 0, err
+	}
+	off += n
+	if propLen <= 0 {
+		return false, 0, nil
+	}
+	end := off + propLen
+	if end > len(body) {
+		return false, 0, fmt.Errorf("property block extends past body")
+	}
+
+	// Walk the property block, returning early on PropMaximumPacketSize.
+	// Stepping over each property requires knowing its wire shape; only
+	// the v5 properties valid for CONNECT are handled here. An unknown
+	// identifier is a malformed CONNECT (mochi would already have
+	// rejected) — we return an error rather than risk a runaway scan.
+	for off < end {
+		id := body[off]
+		off++
+		switch id {
+		case 0x11: // SessionExpiryInterval — uint32
+			off += 4
+		case 0x15: // AuthenticationMethod — UTF-8 string
+			if off+2 > end {
+				return false, 0, fmt.Errorf("string header truncated")
+			}
+			off += 2 + int(body[off])<<8 + int(body[off+1])
+		case 0x16: // AuthenticationData — binary
+			if off+2 > end {
+				return false, 0, fmt.Errorf("binary header truncated")
+			}
+			off += 2 + int(body[off])<<8 + int(body[off+1])
+		case 0x17: // RequestProblemInfo — byte
+			off++
+		case 0x19: // RequestResponseInfo — byte
+			off++
+		case 0x21: // ReceiveMaximum — uint16
+			off += 2
+		case 0x22: // TopicAliasMaximum — uint16
+			off += 2
+		case 0x26: // UserProperty — UTF-8 pair
+			for i := 0; i < 2; i++ {
+				if off+2 > end {
+					return false, 0, fmt.Errorf("user property string truncated")
+				}
+				off += 2 + int(body[off])<<8 + int(body[off+1])
+			}
+		case 0x27: // MaximumPacketSize — uint32
+			if off+4 > end {
+				return false, 0, fmt.Errorf("mps value truncated")
+			}
+			v := uint32(body[off])<<24 |
+				uint32(body[off+1])<<16 |
+				uint32(body[off+2])<<8 |
+				uint32(body[off+3])
+			return true, v, nil
+		default:
+			return false, 0, fmt.Errorf("unknown CONNECT property 0x%X", id)
+		}
+		if off > end {
+			return false, 0, fmt.Errorf("property block overflow")
+		}
+	}
+	return false, 0, nil
+}
+
+// decodeVarint decodes a variable-byte integer (MQTT v5 property length
+// prefix). Returns value, bytes consumed, and error.
+func decodeVarint(b []byte) (int, int, error) {
+	var v, mult, n int
+	mult = 1
+	for n = 0; n < 4; n++ {
+		if n >= len(b) {
+			return 0, 0, fmt.Errorf("varint truncated")
+		}
+		x := b[n]
+		v += int(x&0x7F) * mult
+		if x&0x80 == 0 {
+			return v, n + 1, nil
+		}
+		mult *= 128
+	}
+	return 0, 0, fmt.Errorf("varint too long")
 }

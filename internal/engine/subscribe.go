@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -22,6 +23,18 @@ const (
 )
 
 func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
+	// [MQTT-3.8.3-2]: SUBSCRIBE MUST contain at least one Topic Filter.
+	// A zero-filter SUBSCRIBE previously produced an empty SUBACK, which
+	// some clients treat as "all filters accepted" and silently never
+	// receive any messages.
+	if len(pk.Filters) == 0 {
+		_ = c.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  0x82, // Protocol Error
+		})
+		return errors.New("SUBSCRIBE with zero filters")
+	}
+
 	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -173,10 +186,18 @@ type subscriptionOpts struct {
 // — but only published-not-as-retained logic applies for fresh sends; for
 // retained-on-subscribe we always set retain=1 per [MQTT-3.3.1-8]).
 func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opts subscriptionOpts) error {
+	// [MQTT-3.3.2.3.3]: filter out expired retained rows here, not just at
+	// janitor sweep time. The janitor runs every 5s, so without this
+	// filter a SUBSCRIBE landing during the window between expiry and
+	// sweep would replay an expired retained — and worse, would forward
+	// the original MessageExpiryInterval verbatim instead of the
+	// remaining budget. SELECT expires_at so we can rewrite MEI on the
+	// outgoing PUBLISH.
 	rows, err := c.eng.pool.Query(ctx, `
-		SELECT topic, payload, qos, properties
+		SELECT topic, payload, qos, properties, expires_at
 		  FROM retained
 		 WHERE mqtt_topic_match($1, topic)
+		   AND (expires_at IS NULL OR expires_at > now())
 	`, filter)
 	if err != nil {
 		return err
@@ -184,15 +205,16 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 	defer rows.Close()
 
 	type retained struct {
-		topic   string
-		payload []byte
-		qos     int
-		props   []byte
+		topic     string
+		payload   []byte
+		qos       int
+		props     []byte
+		expiresAt *time.Time
 	}
 	var batch []retained
 	for rows.Next() {
 		var r retained
-		if err := rows.Scan(&r.topic, &r.payload, &r.qos, &r.props); err != nil {
+		if err := rows.Scan(&r.topic, &r.payload, &r.qos, &r.props, &r.expiresAt); err != nil {
 			return err
 		}
 		batch = append(batch, r)
@@ -216,6 +238,16 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 			if err := json.Unmarshal(r.props, &p); err == nil {
 				pk.Properties = p
 			}
+		}
+		// v5: rewrite MessageExpiryInterval to the remaining budget so a
+		// subscriber joining N seconds after the retained PUBLISH sees
+		// MEI-N, not the original MEI. Mirrors deliver.go:154-160.
+		if r.expiresAt != nil && c.protocol == mqttwire.ProtocolMQTT5 {
+			remaining := time.Until(*r.expiresAt).Seconds()
+			if remaining < 1 {
+				remaining = 1
+			}
+			pk.Properties.MessageExpiryInterval = uint32(remaining)
 		}
 		if opts.SubscriptionID != 0 && c.protocol == mqttwire.ProtocolMQTT5 {
 			pk.Properties.SubscriptionIdentifier = []int{opts.SubscriptionID}

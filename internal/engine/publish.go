@@ -94,6 +94,19 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 		}
 	}
 
+	// [MQTT-3.3.4-6]: clients MUST NOT include SubscriptionIdentifier in
+	// a PUBLISH. (That property is server-to-client only — set by the
+	// broker on outbound deliveries to identify the matching SUBSCRIBE.)
+	// Without this guard we'd persist the client-supplied SubID in
+	// messages.properties and forward it verbatim to subscribers.
+	if c.protocol == mqttwire.ProtocolMQTT5 && len(pk.Properties.SubscriptionIdentifier) > 0 {
+		_ = c.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  0x82, // Protocol Error
+		})
+		return fmt.Errorf("inbound PUBLISH carried SubscriptionIdentifier")
+	}
+
 	// v5 inbound TopicAlias validation. We advertise serverTopicAliasMaximum=0
 	// so any client-side alias is a protocol violation per [MQTT-3.3.2-12].
 	if c.protocol == mqttwire.ProtocolMQTT5 && pk.Properties.TopicAliasFlag {

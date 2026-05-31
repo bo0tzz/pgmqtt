@@ -157,6 +157,21 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			v := pk.Properties.SessionExpiryInterval
 			c.sessionExpiry = &v
 		}
+		// [MQTT-3.1.2-25]: MaximumPacketSize=0 is a Protocol Error. mochi's
+		// codec doesn't surface a presence flag for this property (a missing
+		// property and value=0 both decode to MaximumPacketSize==0), so we
+		// re-walk the raw CONNECT body to disambiguate. A present-and-zero
+		// would otherwise disable our outbound size cap entirely
+		// (c.write treats c.maxPacketSize==0 as "unlimited").
+		present, mps, err := mqttwire.V5ConnectMaximumPacketSize(c.reader.LastConnectBody)
+		if err != nil {
+			_ = c.writeConnackReject(pv, cackUnspecified)
+			return fmt.Errorf("parse CONNECT mps: %w", err)
+		}
+		if present && mps == 0 {
+			_ = c.writeConnackReject(pv, 0x95) // Packet too large
+			return fmt.Errorf("CONNECT MaximumPacketSize=0 is a Protocol Error")
+		}
 		c.maxPacketSize = pk.Properties.MaximumPacketSize
 		c.receiveMaximum = pk.Properties.ReceiveMaximum
 		c.topicAliasMaximumOut = pk.Properties.TopicAliasMaximum
