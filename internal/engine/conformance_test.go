@@ -401,6 +401,30 @@ func TestSubscribeEmptyFiltersRejected(t *testing.T) {
 	}
 }
 
+// TestMqttRetainedExpiresAtIsStable: migration 0004 created
+// mqtt_retained_expires_at with IMMUTABLE volatility, but the body
+// calls now() — so the function depends on transaction time and the
+// IMMUTABLE contract is a lie. The planner is free to fold IMMUTABLE
+// function calls at plan time, which could materialise the wrong
+// expiry timestamp. Migration 0016 redeclares it STABLE.
+func TestMqttRetainedExpiresAtIsStable(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	ctx := context.Background()
+
+	var volatility string
+	// provolatile is char(1); cast to text so pgx scans into string.
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT provolatile::text FROM pg_proc WHERE proname='mqtt_retained_expires_at'`).
+		Scan(&volatility); err != nil {
+		t.Fatalf("query volatility: %v", err)
+	}
+	// 's' = STABLE, 'i' = IMMUTABLE, 'v' = VOLATILE.
+	if volatility != "s" {
+		t.Errorf("mqtt_retained_expires_at volatility = %q, want 's' (STABLE)", volatility)
+	}
+}
+
 // writeConnectWithMPS encodes a CONNECT with MaximumPacketSize=1 (so
 // mochi's encoder emits the property), then patches the 4-byte value in
 // place. Used to construct a "MaximumPacketSize present, value 0"
