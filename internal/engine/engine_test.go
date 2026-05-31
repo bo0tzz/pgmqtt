@@ -968,3 +968,83 @@ func TestDeliverAndDrainRaceClaimsExactlyOnce(t *testing.T) {
 		t.Fatalf("delivery row not deleted after winning claim: %d row(s)", n)
 	}
 }
+
+// TestPubackBogusPacketIDDoesNotReleaseSlot is the regression guard for
+// BUG-B: PUBACK / PUBCOMP for an unknown packet id used to call
+// returnInflight() unconditionally, freeing a slot that wasn't actually
+// held. A misbehaving v5 client could inflate the outbound flow-control
+// window past ReceiveMaximum. Fix: gate the release on RowsAffected > 0.
+//
+// We can't probe the internal channel from the test package; instead, we
+// fill the outbound window to capacity (one queued QoS-1 publish that
+// holds a slot), send a PUBACK with a bogus packet id, then send a real
+// PUBACK and assert the broker still rejects further sends until the
+// real PUBACK arrives — i.e. the bogus PUBACK didn't free anything.
+//
+// Implementation: set ReceiveMaximum=1 on CONNECT. Pub one QoS-1 message
+// to the subscriber. The subscriber gets one PUBLISH; without acking it,
+// publish a second QoS-1 to the same subscriber — should not be
+// delivered (slot held). Send bogus PUBACK; second publish should still
+// not be delivered (bug would deliver it because the bogus PUBACK
+// "freed" the slot).
+func TestPubackBogusPacketIDDoesNotReleaseSlot(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	sub := h.Connect(t, "puback-bogus-sub", func(p *packets.Packet) {
+		p.Properties.ReceiveMaximum = 1
+	})
+	defer sub.Close()
+	sub.Subscribe(t, "bogus/#", 1)
+
+	pub := h.Connect(t, "puback-bogus-pub")
+	defer pub.Close()
+
+	// First QoS-1 publish — should land on the subscriber and consume
+	// the single outbound slot. We deliberately do NOT PUBACK it.
+	pub.Publish(t, "bogus/x", []byte("first"), 1, false)
+	first, err := sub.NextRaw()
+	if err != nil {
+		t.Fatalf("read first PUBLISH: %v", err)
+	}
+	if first.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected first PUBLISH, got type=%d", first.FixedHeader.Type)
+	}
+
+	// Second QoS-1 publish — slot is held, so the broker must queue it
+	// and not deliver until PUBACK for the first arrives.
+	pub.Publish(t, "bogus/y", []byte("second"), 1, false)
+
+	// Send a bogus PUBACK (packet id = 0xBEEF, unknown). Pre-fix this
+	// would release the inflight slot and cause "second" to be delivered.
+	if err := mqttwire.Write(sub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Puback},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		PacketID:        0xBEEF,
+	}); err != nil {
+		t.Fatalf("write bogus PUBACK: %v", err)
+	}
+
+	// Give the broker time to (mis)react. The second publish should NOT
+	// have been delivered because the bogus PUBACK didn't actually free
+	// a slot. TryRead with a short timeout — if we read a PUBLISH here
+	// the fix has regressed.
+	if pk := sub.TryRead(500 * time.Millisecond); pk != nil && pk.FixedHeader.Type == packets.Publish {
+		t.Fatalf("bogus PUBACK released a slot it did not hold: second PUBLISH delivered prematurely")
+	}
+
+	// Sanity: real PUBACK for the first should free the slot and allow
+	// the second to flow. (This both proves the broker is still alive
+	// and that we measured the right thing.)
+	if err := mqttwire.Write(sub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Puback},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		PacketID:        first.PacketID,
+	}); err != nil {
+		t.Fatalf("write real PUBACK: %v", err)
+	}
+	second := sub.TryRead(2 * time.Second)
+	if second == nil || second.FixedHeader.Type != packets.Publish {
+		t.Fatalf("real PUBACK didn't free the slot; second PUBLISH never arrived")
+	}
+}

@@ -864,11 +864,23 @@ func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) e
 // acknowledgement of QoS>0 deliveries this Pod sent.
 
 func (c *Conn) handlePuback(ctx context.Context, pk *packets.Packet) error {
-	_, err := c.eng.pool.Exec(ctx,
+	ct, err := c.eng.pool.Exec(ctx,
 		`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=1`,
 		c.clientID, pk.PacketID)
-	c.returnInflight()
-	return err
+	if err != nil {
+		return err
+	}
+	// Only release the outbound flow-control slot when we actually
+	// completed a known QoS-1 delivery. A PUBACK for an unknown packet
+	// id (bogus pid, replay, or a misbehaving v5 client) consumed no
+	// slot — unconditionally calling returnInflight here would inflate
+	// the outbound window past ReceiveMaximum on subsequent sends.
+	// Spec-wise this is a Protocol Error and a v5 server SHOULD emit
+	// DISCONNECT 0x82; that's owned by a separate change.
+	if ct.RowsAffected() > 0 {
+		c.returnInflight()
+	}
+	return nil
 }
 
 func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
@@ -924,11 +936,19 @@ func (c *Conn) handlePubrel(ctx context.Context, pk *packets.Packet) error {
 }
 
 func (c *Conn) handlePubcomp(ctx context.Context, pk *packets.Packet) error {
-	_, err := c.eng.pool.Exec(ctx,
+	ct, err := c.eng.pool.Exec(ctx,
 		`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=2`,
 		c.clientID, pk.PacketID)
-	c.returnInflight()
-	return err
+	if err != nil {
+		return err
+	}
+	// Same gating as handlePuback: a PUBCOMP for an unknown packet id
+	// consumed no outbound slot; releasing one would inflate the window
+	// past ReceiveMaximum.
+	if ct.RowsAffected() > 0 {
+		c.returnInflight()
+	}
+	return nil
 }
 
 func (c *Conn) handleUnsubscribe(ctx context.Context, pk *packets.Packet) error {
