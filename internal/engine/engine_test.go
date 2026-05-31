@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -883,5 +884,87 @@ func TestConnectWithAuthenticationMethodRejected(t *testing.T) {
 	}
 	if resp.ReasonCode != 0x8C {
 		t.Fatalf("expected CONNACK 0x8C (bad auth method), got 0x%X", resp.ReasonCode)
+	}
+}
+
+// TestDeliverAndDrainRaceClaimsExactlyOnce is the regression guard for
+// BUG-A (v0.1.9 QoS-0 fix had a hole): for QoS-0, the post-write DELETE
+// left a window where a concurrent caller (drainSessionQueue on reconnect
+// vs. NOTIFY-driven Deliver) saw the same row in state=0 and both wrote
+// to the wire. The fix moves the claim to a DELETE-RETURNING BEFORE the
+// write so only one caller wins.
+//
+// We provoke the race directly: insert a single QoS-0 deliveries row for
+// a connected subscriber, then fire N parallel Deliver calls against the
+// same message id. With the fix, exactly one PUBLISH reaches the
+// subscriber and the row is gone. Without the fix, the subscriber sees
+// the message multiple times.
+func TestDeliverAndDrainRaceClaimsExactlyOnce(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	sub := h.Connect(t, "race-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "race/topic", 0)
+
+	ctx := context.Background()
+	const N = 16
+
+	// Insert one message + one QoS-0 deliveries row directly so we can
+	// fire Deliver against a single known message id and assert the
+	// at-most-once invariant.
+	var msgID int64
+	if err := h.Pool.QueryRow(ctx, `
+		INSERT INTO messages(topic, payload, qos, retain) VALUES ('race/topic', $1, 0, false)
+		RETURNING id`, []byte("racing")).Scan(&msgID); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ($1, $2, 0, 0)
+	`, "race-sub", msgID); err != nil {
+		t.Fatalf("seed delivery: %v", err)
+	}
+
+	// Fire N concurrent Deliver calls. With the CAS-claim fix, exactly
+	// one wins the DELETE-RETURNING and writes; the rest see RowsAffected==0
+	// and skip.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = h.Engine.Deliver(ctx, msgID)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Count PUBLISHes received by the subscriber within a short window.
+	received := 0
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		pk := sub.TryRead(200 * time.Millisecond)
+		if pk == nil {
+			break
+		}
+		if pk.FixedHeader.Type == packets.Publish {
+			received++
+		}
+	}
+	if received != 1 {
+		t.Fatalf("expected exactly one PUBLISH (at-most-once QoS-0 with CAS-claim), got %d", received)
+	}
+
+	// And the row should be gone — the winning Deliver DELETE-RETURNINGed it.
+	var n int
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM deliveries WHERE id IN (SELECT id FROM deliveries WHERE client_id=$1 AND message_id=$2)`,
+		"race-sub", msgID).Scan(&n); err != nil {
+		t.Fatalf("count deliveries: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("delivery row not deleted after winning claim: %d row(s)", n)
 	}
 }

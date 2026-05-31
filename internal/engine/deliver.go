@@ -241,6 +241,30 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		}
 	}
 
+	// QoS-0: atomically claim the row before the wire write so a
+	// concurrent caller (e.g. drainSessionQueue racing the NOTIFY-driven
+	// Deliver fan-out for the same client) cannot also send the same
+	// delivery. The v0.1.9 fix moved the DELETE inside the success path
+	// but kept it AFTER conn.write, leaving a window where both callers
+	// see the row in state=0 and both write to the wire. DELETE-RETURNING
+	// makes the claim the serialisation point: only the caller whose
+	// DELETE returned a row proceeds to write.
+	if qos == 0 {
+		ct, derr := e.pool.Exec(ctx, `DELETE FROM deliveries WHERE id=$1`, deliveryID)
+		if derr != nil {
+			// Best-effort: the orphan sweep catches the row if the
+			// DELETE fails transiently. Don't write — we can't tell
+			// whether we'd have won the claim, and a double-send is
+			// worse than a missed one for QoS-0 (at-most-once).
+			e.logger.Warn("qos-0 delivery claim", "id", deliveryID, "client", clientID, "err", derr)
+			return false, nil
+		}
+		if ct.RowsAffected() == 0 {
+			// Sister caller already claimed and is (or has) sending.
+			return false, nil
+		}
+	}
+
 	writeStart := time.Now()
 	err = conn.write(pk)
 	e.metrics.ObserveDeliveryStage("write", time.Since(writeStart))
@@ -250,18 +274,6 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		}
 		e.metrics.ObserveDeliveryDropped("write_error")
 		return false, err
-	}
-	// QoS-0 has no ack path. The deliveries row was only ever needed as
-	// a cross-broker routing handoff (publisher's broker → NOTIFY →
-	// owning broker's Deliver scan). Once the packet is on the wire the
-	// row has no further purpose; without this delete, rows pile up in
-	// state=0 until the per-client cap silently blocks all further
-	// deliveries to this client. Best-effort: the orphan sweep catches
-	// any leaks if the DELETE fails transiently.
-	if qos == 0 {
-		if _, derr := e.pool.Exec(ctx, `DELETE FROM deliveries WHERE id=$1`, deliveryID); derr != nil {
-			e.logger.Warn("qos-0 delivery delete", "id", deliveryID, "client", clientID, "err", derr)
-		}
 	}
 	return true, nil
 }
