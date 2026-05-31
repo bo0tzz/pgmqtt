@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgmqttv1alpha1 "github.com/bo0tzz/pgmqtt/api/v1alpha1"
 	"github.com/bo0tzz/pgmqtt/internal/db/dbtest"
@@ -1828,3 +1830,78 @@ func TestUsersForSecret_RotationDrivesReconcile(t *testing.T) {
 		t.Errorf("v2 password mismatch: %v", err)
 	}
 }
+
+// TestReconcile_StatusUpdateErrorIsLogged verifies that when an error
+// branch (here: a DB failure) needs to set Ready=False on the User
+// status AND the status write itself fails (simulating an RV-conflict
+// from lease-handoff overlap), the swallowed status-write error is
+// surfaced as a log line instead of being silently dropped. The
+// underlying reconcile error must still be returned — the status-write
+// failure is secondary.
+func TestReconcile_StatusUpdateErrorIsLogged(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	// Drop users so Pool.Exec fails with a known DB error → triggers the
+	// status-write branch that previously swallowed errors silently.
+	if _, err := pool.Exec(context.Background(), `DROP TABLE users`); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "swallowed",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	wantStatusErr := errors.New("simulated RV conflict on status write")
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" {
+				return wantStatusErr
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if sub == "status" {
+				return wantStatusErr
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+
+	// Capture the controller's logger output via log.IntoContext.
+	var buf strings.Builder
+	logger := funcr.New(func(prefix, args string) {
+		buf.WriteString(args)
+		buf.WriteString("\n")
+	}, funcr.Options{Verbosity: 2})
+	ctx := log.IntoContext(context.Background(), logger)
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "swallowed"}})
+	if err == nil {
+		t.Fatal("expected the underlying reconcile error to surface")
+	}
+	// The error returned MUST be the underlying reconcile error (DB failure),
+	// not the swallowed status-write error — the status write is secondary.
+	if errors.Is(err, wantStatusErr) {
+		t.Errorf("Reconcile returned the status-write error; expected the underlying DB error: %v", err)
+	}
+	// The status-write error must be surfaced in the log output rather than
+	// silently dropped.
+	out := buf.String()
+	if !strings.Contains(out, "status update failed") {
+		t.Errorf("expected 'status update failed' log line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "simulated RV conflict on status write") {
+		t.Errorf("expected swallowed status-write error to appear in logs, got:\n%s", out)
+	}
+}
+

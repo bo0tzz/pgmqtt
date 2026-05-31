@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -217,7 +218,8 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if renamed {
 		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
 			setReady(&user, false, "DBError", scrubReason(err))
-			_ = r.Status().Update(ctx, &user)
+			logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+				"rename-cleanup DBError", err)
 			return ctrl.Result{}, err
 		}
 	}
@@ -225,7 +227,8 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
 		setReady(&user, false, "SecretError", scrubReason(err))
-		_ = r.Status().Update(ctx, &user)
+		logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+			"resolveCredentialSecret SecretError", err)
 		return ctrl.Result{}, err
 	}
 
@@ -285,7 +288,8 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
 	`, username, string(bcryptHash)); err != nil {
 		setReady(&user, false, "DBError", scrubReason(err))
-		_ = r.Status().Update(ctx, &user)
+		logStatusUpdateError(logger, r.Status().Update(ctx, &user),
+			"users upsert DBError", err)
 		return ctrl.Result{}, err
 	}
 	userRehashTotal.WithLabelValues(rehashReason).Inc()
@@ -522,6 +526,21 @@ func scrubReason(err error) string {
 // SetupWithManager; this helper is only for unit-test assertions.
 func (r *UserReconciler) UsersForSecretForTest(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.usersForSecret(ctx, obj)
+}
+
+// logStatusUpdateError surfaces a swallowed Status().Update() error as a
+// WARN log alongside the underlying reconcile error. Callers still
+// propagate the underlying reconcile error to controller-runtime (status-
+// write failures are secondary), but losing the diagnostic was making
+// lease-handoff RV conflicts and other transient status-write failures
+// invisible to operators.
+func logStatusUpdateError(logger logr.Logger, statusErr error, scope string, underlying error) {
+	if statusErr == nil {
+		return
+	}
+	logger.Info("status update failed; original reconcile error preserved",
+		"scope", scope, "status_err", statusErr.Error(),
+		"underlying_err", underlying.Error())
 }
 
 func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
