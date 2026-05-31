@@ -161,6 +161,24 @@ type Metrics struct {
 	// fanout) can be distinguished without a metric rename.
 	DrainSessionQueueTotal *prometheus.CounterVec
 
+	// DeliveriesDroppedTotal counts delivery rows that were destroyed
+	// before a successful wire write reached the subscriber. The MQTT
+	// spec allows silent loss in each of these cases but the broker
+	// previously had no aggregate signal for any of them — the May 2026
+	// zigbee2mqtt-blackhole bug stayed invisible because there was no
+	// counter behind the silent over-cap drop. Reasons:
+	//   expired      — MessageExpiryInterval elapsed before delivery
+	//                  ([MQTT-3.3.2-5]). Bounded by orphan-grace ×
+	//                  publish rate at steady state.
+	//   oversized    — Encoded packet exceeded the client's
+	//                  MaximumPacketSize ([MQTT-3.1.2-25]). A sustained
+	//                  rate here means a publisher is producing payloads
+	//                  bigger than some subscriber configured for.
+	//   write_error  — conn.write returned an error (broken socket, slow
+	//                  client, kernel-level backpressure timeout). Each
+	//                  drop is also logged at Warn from the Deliver loop.
+	DeliveriesDroppedTotal *prometheus.CounterVec
+
 	// PublishFanoutSubscribers — distribution of subscriber counts per
 	// inbound publish, sampled at the mqtt_publish CTE return. Tracks the
 	// per-message fanout shape an operator most cares about: "is one topic
@@ -336,6 +354,13 @@ func New() *Metrics {
 				"deliveries for the returning session). " +
 				"Bounded by the reconnect rate; sustained spikes here indicate flapping clients.",
 		}, []string{"reason"}),
+		DeliveriesDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_deliveries_dropped_total",
+			Help: "Delivery rows destroyed before a successful wire write. " +
+				"Reasons: expired (MessageExpiryInterval elapsed), " +
+				"oversized (encoded packet > client's MaximumPacketSize), " +
+				"write_error (socket write failed).",
+		}, []string{"reason"}),
 		PublishFanoutSubscribers: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "pgmqtt_publish_fanout_subscribers",
 			Help: "Subscribers fanned out per inbound publish (deliveries-table inserts). " +
@@ -370,6 +395,9 @@ func New() *Metrics {
 	// Pre-create label series at zero so /metrics surfaces them before any
 	// traffic — cold-start visibility for dashboards and alerts.
 	m.DrainSessionQueueTotal.WithLabelValues("reconnect")
+	m.DeliveriesDroppedTotal.WithLabelValues("expired")
+	m.DeliveriesDroppedTotal.WithLabelValues("oversized")
+	m.DeliveriesDroppedTotal.WithLabelValues("write_error")
 
 	reg.MustRegister(
 		m.Connections,
@@ -401,6 +429,7 @@ func New() *Metrics {
 		m.ConnectionsCapacityRatio,
 		m.ListenerRestartsTotal,
 		m.DrainSessionQueueTotal,
+		m.DeliveriesDroppedTotal,
 		m.PublishFanoutSubscribers,
 		m.EndToEndPublishToDeliverSeconds,
 		m.PgxAcquireSeconds,
@@ -417,6 +446,15 @@ func (m *Metrics) ObserveDeliveryStage(stage string, d time.Duration) {
 		return
 	}
 	m.DeliveryStageSeconds.WithLabelValues(stage).Observe(d.Seconds())
+}
+
+// ObserveDeliveryDropped increments pgmqtt_deliveries_dropped_total for
+// the given reason. Safe to call when m is nil.
+func (m *Metrics) ObserveDeliveryDropped(reason string) {
+	if m == nil {
+		return
+	}
+	m.DeliveriesDroppedTotal.WithLabelValues(reason).Inc()
 }
 
 // ObservePublishStage records a duration sample for one stage of the publish

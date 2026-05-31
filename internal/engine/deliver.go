@@ -134,6 +134,7 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 	// re-trigger on reconnect.
 	if expiresAt != nil && !expiresAt.After(time.Now()) {
 		_, _ = e.pool.Exec(ctx, `DELETE FROM deliveries WHERE id=$1`, deliveryID)
+		e.metrics.ObserveDeliveryDropped("expired")
 		return false, nil
 	}
 
@@ -183,6 +184,7 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		buf, err := mqttwire.Encode(&probe)
 		if err == nil && uint32(len(buf)) > conn.maxPacketSize {
 			_, _ = e.pool.Exec(ctx, `DELETE FROM deliveries WHERE id=$1`, deliveryID)
+			e.metrics.ObserveDeliveryDropped("oversized")
 			return false, nil
 		}
 	}
@@ -246,6 +248,7 @@ func (e *Engine) deliverOneTracked(ctx context.Context, deliveryID int64, client
 		if qos > 0 {
 			conn.returnInflight()
 		}
+		e.metrics.ObserveDeliveryDropped("write_error")
 		return false, err
 	}
 	// QoS-0 has no ack path. The deliveries row was only ever needed as

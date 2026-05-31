@@ -962,7 +962,7 @@
     },
     {
       "type": "row",
-      "title": "Auth & connect-drop",
+      "title": "Drops",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -978,7 +978,7 @@
       "description": "bad_credentials (CONNACK 0x86), not_authorized (0x87), banned (0x88), bad_auth_method (0x8C), other (e.g. statement_timeout on the users lookup \u2014 symptom of PG churn).",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 45
       },
@@ -1019,7 +1019,7 @@
       "description": "rate_limit = over the per-IP CONNECTs/sec budget; penalty_box = IP exhausted its auth-failure budget. Both are bcrypt-CPU DoS mitigation.",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 12,
         "y": 45
       },
@@ -1053,6 +1053,47 @@
         }
       },
       "id": 20
+    },
+    {
+      "type": "timeseries",
+      "title": "Deliveries dropped by reason",
+      "description": "Delivery rows destroyed before a successful wire write. expired = MessageExpiryInterval elapsed; oversized = packet > client's MaximumPacketSize; write_error = socket write failed. All are MQTT-spec-legal silent drops; this surfaces the rate so 'why is sub X missing messages' has a first-look answer.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 45
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason)(rate(pgmqtt_deliveries_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))",
+          "refId": "A",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 24
     },
     {
       "type": "row",
