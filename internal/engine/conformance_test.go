@@ -365,6 +365,42 @@ func TestPublishWithSubscriptionIdentifierRejected(t *testing.T) {
 	}
 }
 
+// TestSubscribeEmptyFiltersRejected: [MQTT-3.8.3-2] requires SUBSCRIBE
+// to carry at least one Topic Filter. The server MUST treat a
+// zero-filter SUBSCRIBE as Protocol Error (0x82). Previously the
+// broker emitted an empty SUBACK and proceeded as if successful.
+func TestSubscribeEmptyFiltersRejected(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	c := h.Connect(t, "sub-empty")
+	defer c.Close()
+
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Subscribe, Qos: 1},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		PacketID:        1,
+		Filters:         packets.Subscriptions{},
+	}
+	if err := mqttwire.Write(c.Conn, pk); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+
+	if err := c.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	got, err := c.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT 0x82, got read err: %v", err)
+	}
+	if got.FixedHeader.Type != packets.Disconnect {
+		t.Fatalf("expected DISCONNECT, got type=%d", got.FixedHeader.Type)
+	}
+	if got.ReasonCode != 0x82 {
+		t.Errorf("expected reason 0x82, got 0x%X", got.ReasonCode)
+	}
+}
+
 // writeConnectWithMPS encodes a CONNECT with MaximumPacketSize=1 (so
 // mochi's encoder emits the property), then patches the 4-byte value in
 // place. Used to construct a "MaximumPacketSize present, value 0"

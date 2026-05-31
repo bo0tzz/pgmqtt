@@ -23,6 +23,18 @@ const (
 )
 
 func (c *Conn) handleSubscribe(ctx context.Context, pk *packets.Packet) error {
+	// [MQTT-3.8.3-2]: SUBSCRIBE MUST contain at least one Topic Filter.
+	// A zero-filter SUBSCRIBE previously produced an empty SUBACK, which
+	// some clients treat as "all filters accepted" and silently never
+	// receive any messages.
+	if len(pk.Filters) == 0 {
+		_ = c.write(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  0x82, // Protocol Error
+		})
+		return errors.New("SUBSCRIBE with zero filters")
+	}
+
 	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
