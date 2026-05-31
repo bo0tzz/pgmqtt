@@ -27,7 +27,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	pgmqttv1alpha1 "github.com/bo0tzz/pgmqtt/api/v1alpha1"
 )
@@ -64,12 +66,81 @@ type UserReconciler struct {
 }
 
 // SetupWithManager wires the controller for User into the manager.
+//
+// The Owns() relationship enqueues reconciles when an auto-generated
+// credentials Secret (the kind the operator creates with an
+// OwnerReference back to the User) changes. BYO Secrets — those
+// supplied by the cluster operator via spec.PasswordSecretRef and
+// pointing at a Secret they manage themselves — carry NO owner ref,
+// so Owns() will never fire for them.
+//
+// Without the Watches() clause below, a rotated BYO Secret would not
+// trigger a reconcile until either the User CR itself changed or the
+// controller-runtime resync period fired (default 10h). The Postgres
+// users table would carry the stale bcrypt for that whole window,
+// which is far too slow for any sensible rotation flow.
+//
+// The map function lists User CRs in the changed Secret's namespace
+// (cheap — served from the informer cache) and enqueues the ones
+// whose spec.PasswordSecretRef.Name matches the Secret. Non-matching
+// Secret events return an empty slice, keeping the cost of cluster-
+// wide Secret churn bounded to a single namespaced List per event.
 func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("pgmqtt-user").
 		For(&pgmqttv1alpha1.User{}).
 		Owns(&corev1.Secret{}, builder.MatchEveryOwner).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.usersForSecret),
+		).
 		Complete(r)
+}
+
+// usersForSecret maps a Secret change to the set of User CRs that
+// reference that Secret via spec.PasswordSecretRef. Used by the
+// Watches() clause in SetupWithManager so BYO Secret rotations
+// propagate to Postgres within one reconcile tick instead of waiting
+// for the controller-runtime resync period (default 10h).
+//
+// Performance: the function runs on every Secret create/update/delete
+// in every namespace the manager's cache covers. The namespaced User
+// List is served from the informer cache and is cheap; the early
+// return for empty UserList keeps non-pgmqtt Secret churn essentially
+// free. Returning nil for non-matching events is required — handler
+// machinery treats a nil/empty slice as "do not enqueue".
+func (r *UserReconciler) usersForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return nil
+	}
+	var users pgmqttv1alpha1.UserList
+	if err := r.List(ctx, &users, client.InNamespace(secret.GetNamespace())); err != nil {
+		// Logging here is best-effort: the next reconcile (or the
+		// resync) will eventually re-process. We don't want to fail
+		// the watch loop on a transient cache miss.
+		log.FromContext(ctx).WithName("pgmqtt-user").Error(err,
+			"usersForSecret: list users in namespace failed",
+			"namespace", secret.GetNamespace(), "secret", secret.GetName())
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range users.Items {
+		u := &users.Items[i]
+		if u.Spec.PasswordSecretRef == nil {
+			continue
+		}
+		if u.Spec.PasswordSecretRef.Name != secret.GetName() {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: client.ObjectKey{
+				Namespace: u.Namespace,
+				Name:      u.Name,
+			},
+		})
+	}
+	return reqs
 }
 
 // Reconcile implements controller-runtime.Reconciler.
@@ -406,6 +477,15 @@ func scrubReason(err error) string {
 	default:
 		return "internal error"
 	}
+}
+
+// UsersForSecretForTest exposes the Watches map function so external
+// tests can validate the BYO-Secret → User fan-out without spinning up
+// a full controller-runtime manager. Production code paths go through
+// the handler/EnqueueRequestsFromMapFunc wiring set up in
+// SetupWithManager; this helper is only for unit-test assertions.
+func (r *UserReconciler) UsersForSecretForTest(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.usersForSecret(ctx, obj)
 }
 
 func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
