@@ -546,11 +546,20 @@ func (c *Conn) returnInflight() {
 	case <-c.inflight:
 	default:
 	}
-	if c.drainKick != nil {
-		select {
-		case c.drainKick <- struct{}{}:
-		default:
-		}
+	c.KickDrain()
+}
+
+// KickDrain signals the drain loop to scan for queued deliveries. Safe
+// to call from any goroutine and non-blocking: drainKick is a 1-slot
+// channel and a pending kick coalesces with a second one. No-op for
+// conns that haven't completed CONNECT (drainKick is allocated there).
+func (c *Conn) KickDrain() {
+	if c.drainKick == nil {
+		return
+	}
+	select {
+	case c.drainKick <- struct{}{}:
+	default:
 	}
 }
 

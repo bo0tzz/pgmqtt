@@ -231,6 +231,16 @@ func (l *Listener) run(ctx context.Context) {
 				osExit(1)
 				return
 			}
+			// Reconnect succeeded: peer Pods' `pg_notify` fan-outs for
+			// our local subscribers landed on a deaf channel during the
+			// reconnect window. The delivery rows they wrote sit at
+			// state=0 with no kick. Wake every local Conn's drain loop
+			// so QoS-1 subscribers that don't publish/ack frequently
+			// don't have their queued rows sit indefinitely. Best
+			// effort: kicks coalesce, drainOnce iterates the queue.
+			if l.eng != nil {
+				l.eng.KickAllDrains()
+			}
 			continue
 		}
 		l.dispatchNotification(ctx, notif, pubCh, takeoverCh, quotaCh)

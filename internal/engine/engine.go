@@ -569,6 +569,27 @@ func (e *Engine) ConnFor(clientID string) (*Conn, bool) {
 	return c, ok
 }
 
+// KickAllDrains signals every local Conn's drain loop to scan
+// `deliveries` for queued rows. Used by the listener after a successful
+// reconnect: while the LISTEN socket was down, peer Pods' `pg_notify`
+// fan-outs for our subscribers landed on a deaf channel, so the delivery
+// rows they inserted (state=0) never wake the per-conn drain loop. A
+// single kick per client picks those up — drainOnce iterates until the
+// queue is empty. Best-effort and non-blocking: drainKick is a 1-slot
+// channel and the select default skips any client whose kick is already
+// pending.
+func (e *Engine) KickAllDrains() {
+	e.connsMu.RLock()
+	conns := make([]*Conn, 0, len(e.conns))
+	for _, c := range e.conns {
+		conns = append(conns, c)
+	}
+	e.connsMu.RUnlock()
+	for _, c := range conns {
+		c.KickDrain()
+	}
+}
+
 func isClosedNetErr(err error) bool {
 	if err == nil {
 		return false
