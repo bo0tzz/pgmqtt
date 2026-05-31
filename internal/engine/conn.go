@@ -834,11 +834,22 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 }
 
 // handleGracefulDisconnect implements MQTT-3.14 (v3.1.1) and v5 normal
-// disconnect: the will is dropped (must not be sent), the session may persist
-// or be cleaned per cleanStart. v5 SessionExpiryInterval extension is ignored
-// here for v1 — we treat any non-zero as "keep until evicted".
+// disconnect: the will is dropped (must not be sent) unless the v5 reason
+// code is 0x04 ("Disconnect with Will Message"), the session may persist
+// or be cleaned per cleanStart.
 func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) error {
-	c.willTopic = "" // [MQTT-3.14.4-3]
+	// [MQTT-3.14.4-3]: v5 DISCONNECT with reason 0x04 means "publish the
+	// will" — leave c.willTopic intact so handleDisconnect fires it. Every
+	// other reason (0x00 success, 0x82 protocol error from server, etc.)
+	// means "suppress the will". v3.1.1 has no reason codes; spec is
+	// "suppress on graceful DISCONNECT", which is the default behavior.
+	suppressWill := true
+	if c.protocol == mqttwire.ProtocolMQTT5 && pk.ReasonCode == 0x04 {
+		suppressWill = false
+	}
+	if suppressWill {
+		c.willTopic = ""
+	}
 	// v5 [MQTT-3.14.2.2.2]: a DISCONNECT may override SessionExpiryInterval.
 	// Per spec, the server treats the packet as a Protocol Error if the
 	// original CONNECT had SessionExpiryInterval=0 (or was absent — spec
