@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -189,8 +190,13 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if !controllerutil.ContainsFinalizer(&user, finalizerName) {
+		// MergeFrom Patch instead of Update so two concurrent reconciles
+		// during a leader-lease handoff don't fight over ResourceVersion.
+		// The metadata.finalizers list is the only field changing here —
+		// a strategic merge of just that slice is enough.
+		before := user.DeepCopy()
 		controllerutil.AddFinalizer(&user, finalizerName)
-		if err := r.Update(ctx, &user); err != nil {
+		if err := r.Patch(ctx, &user, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -216,16 +222,20 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
 	if renamed {
 		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
+			before := user.DeepCopy()
 			setReady(&user, false, "DBError", scrubReason(err))
-			_ = r.Status().Update(ctx, &user)
+			logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
+				"rename-cleanup DBError", err)
 			return ctrl.Result{}, err
 		}
 	}
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
+		before := user.DeepCopy()
 		setReady(&user, false, "SecretError", scrubReason(err))
-		_ = r.Status().Update(ctx, &user)
+		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
+			"resolveCredentialSecret SecretError", err)
 		return ctrl.Result{}, err
 	}
 
@@ -267,8 +277,9 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
 		}
 		if storedCost >= cost {
+			before := user.DeepCopy()
 			setReady(&user, true, "Reconciled", "")
-			return ctrl.Result{}, r.Status().Update(ctx, &user)
+			return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
 		}
 		rehashReason = "cost_bump"
 	} else {
@@ -284,17 +295,20 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		INSERT INTO users(username, password_hash) VALUES($1, $2)
 		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
 	`, username, string(bcryptHash)); err != nil {
+		before := user.DeepCopy()
 		setReady(&user, false, "DBError", scrubReason(err))
-		_ = r.Status().Update(ctx, &user)
+		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
+			"users upsert DBError", err)
 		return ctrl.Result{}, err
 	}
 	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
+	before := user.DeepCopy()
 	user.Status.ObservedSecretHash = hash
 	user.Status.ObservedUsername = username
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 	setReady(&user, true, "Reconciled", "")
-	if err := r.Status().Update(ctx, &user); err != nil {
+	if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
 	}
 	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
@@ -339,8 +353,11 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 	if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, username); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Finalizer-removal via Patch (MergeFrom) — same lease-handoff
+	// rationale as finalizer-add above. Spec is untouched.
+	before := user.DeepCopy()
 	controllerutil.RemoveFinalizer(user, finalizerName)
-	return ctrl.Result{}, r.Update(ctx, user)
+	return ctrl.Result{}, r.Patch(ctx, user, client.MergeFrom(before))
 }
 
 // resolveCredentialSecret returns the Secret referenced by spec.PasswordSecretRef,
@@ -524,12 +541,34 @@ func (r *UserReconciler) UsersForSecretForTest(ctx context.Context, obj client.O
 	return r.usersForSecret(ctx, obj)
 }
 
+// logStatusUpdateError surfaces a swallowed Status().Update() error as a
+// WARN log alongside the underlying reconcile error. Callers still
+// propagate the underlying reconcile error to controller-runtime (status-
+// write failures are secondary), but losing the diagnostic was making
+// lease-handoff RV conflicts and other transient status-write failures
+// invisible to operators.
+func logStatusUpdateError(logger logr.Logger, statusErr error, scope string, underlying error) {
+	if statusErr == nil {
+		return
+	}
+	logger.Info("status update failed; original reconcile error preserved",
+		"scope", scope, "status_err", statusErr.Error(),
+		"underlying_err", underlying.Error())
+}
+
 func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
+	// ObservedGeneration pins the condition to the user.Generation that
+	// the reconcile observed. Without it, `kubectl wait
+	// --for=condition=Ready` on a freshly-edited CR returns immediately
+	// against the previous reconcile's True — even though the new
+	// generation hasn't been reconciled yet. With it, the field flags
+	// the staleness and `--for=condition=Ready=true` works as expected.
 	cond := metav1.Condition{
 		Type:               "Ready",
 		LastTransitionTime: metav1.Now(),
 		Reason:             reason,
 		Message:            msg,
+		ObservedGeneration: user.Generation,
 	}
 	if ready {
 		cond.Status = metav1.ConditionTrue
@@ -538,7 +577,8 @@ func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
 	}
 	for i, c := range user.Status.Conditions {
 		if c.Type == "Ready" {
-			if c.Status == cond.Status && c.Reason == cond.Reason && c.Message == cond.Message {
+			if c.Status == cond.Status && c.Reason == cond.Reason &&
+				c.Message == cond.Message && c.ObservedGeneration == cond.ObservedGeneration {
 				return
 			}
 			user.Status.Conditions[i] = cond

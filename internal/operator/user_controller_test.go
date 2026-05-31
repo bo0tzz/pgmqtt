@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgmqttv1alpha1 "github.com/bo0tzz/pgmqtt/api/v1alpha1"
 	"github.com/bo0tzz/pgmqtt/internal/db/dbtest"
@@ -659,8 +661,12 @@ func TestReconcile_BYOSecretPasswordRotation(t *testing.T) {
 }
 
 // TestReconcile_UpdateRequeuesOnFinalizerAddFailure exercises the
-// transient-failure path on the finalizer-add Update. A failed Update
+// transient-failure path on the finalizer-add Patch. A failed write
 // must propagate as a non-nil error so controller-runtime requeues.
+//
+// The finalizer-add was switched from Update to Patch (MergeFrom) to
+// avoid spurious ResourceVersion conflicts during leader-lease handoff;
+// this test follows by intercepting Patch.
 func TestReconcile_UpdateRequeuesOnFinalizerAddFailure(t *testing.T) {
 	t.Parallel()
 	pool := dbtest.FreshPool(t)
@@ -672,11 +678,11 @@ func TestReconcile_UpdateRequeuesOnFinalizerAddFailure(t *testing.T) {
 		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
 	want := errors.New("simulated etcd failure")
 	cli := interceptor.NewClient(base, interceptor.Funcs{
-		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 			if _, ok := obj.(*pgmqttv1alpha1.User); ok {
 				return want
 			}
-			return c.Update(ctx, obj, opts...)
+			return c.Patch(ctx, obj, patch, opts...)
 		},
 	})
 	r := &operator.UserReconciler{
@@ -1828,3 +1834,328 @@ func TestUsersForSecret_RotationDrivesReconcile(t *testing.T) {
 		t.Errorf("v2 password mismatch: %v", err)
 	}
 }
+
+// TestReconcile_StatusUpdateErrorIsLogged verifies that when an error
+// branch (here: a DB failure) needs to set Ready=False on the User
+// status AND the status write itself fails (simulating an RV-conflict
+// from lease-handoff overlap), the swallowed status-write error is
+// surfaced as a log line instead of being silently dropped. The
+// underlying reconcile error must still be returned — the status-write
+// failure is secondary.
+func TestReconcile_StatusUpdateErrorIsLogged(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	// Drop users so Pool.Exec fails with a known DB error → triggers the
+	// status-write branch that previously swallowed errors silently.
+	if _, err := pool.Exec(context.Background(), `DROP TABLE users`); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "swallowed",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	wantStatusErr := errors.New("simulated RV conflict on status write")
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" {
+				return wantStatusErr
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if sub == "status" {
+				return wantStatusErr
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+
+	// Capture the controller's logger output via log.IntoContext.
+	var buf strings.Builder
+	logger := funcr.New(func(prefix, args string) {
+		buf.WriteString(args)
+		buf.WriteString("\n")
+	}, funcr.Options{Verbosity: 2})
+	ctx := log.IntoContext(context.Background(), logger)
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "swallowed"}})
+	if err == nil {
+		t.Fatal("expected the underlying reconcile error to surface")
+	}
+	// The error returned MUST be the underlying reconcile error (DB failure),
+	// not the swallowed status-write error — the status write is secondary.
+	if errors.Is(err, wantStatusErr) {
+		t.Errorf("Reconcile returned the status-write error; expected the underlying DB error: %v", err)
+	}
+	// The status-write error must be surfaced in the log output rather than
+	// silently dropped.
+	out := buf.String()
+	if !strings.Contains(out, "status update failed") {
+		t.Errorf("expected 'status update failed' log line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "simulated RV conflict on status write") {
+		t.Errorf("expected swallowed status-write error to appear in logs, got:\n%s", out)
+	}
+}
+
+// TestReconcile_ObservedGenerationSetOnReadyCondition verifies that the
+// Ready condition's ObservedGeneration field is pinned to
+// user.Generation after a reconcile. Without this, `kubectl wait
+// --for=condition=Ready` on a freshly-edited User CR sees stale Ready=
+// True from the previous generation and returns prematurely.
+func TestReconcile_ObservedGenerationSetOnReadyCondition(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gen",
+			Namespace:  "mqtt",
+			Generation: 7, // simulate a freshly-edited CR
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "gen"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "gen"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	var ready *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == "Ready" {
+			ready = &got.Status.Conditions[i]
+			break
+		}
+	}
+	if ready == nil {
+		t.Fatalf("expected Ready condition, got conditions: %+v", got.Status.Conditions)
+	}
+	if ready.ObservedGeneration != got.Generation {
+		t.Errorf("ObservedGeneration: got %d, want %d (user.Generation)",
+			ready.ObservedGeneration, got.Generation)
+	}
+
+	// Error-branch coverage: when the reconcile fails (BYO secret missing),
+	// the Ready=False condition must also carry ObservedGeneration.
+	failUser := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gen-fail",
+			Namespace:  "mqtt",
+			Generation: 11,
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "missing"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli2 := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(failUser).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r.Client = cli2
+	_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "gen-fail"}})
+	var got2 pgmqttv1alpha1.User
+	if err := cli2.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "gen-fail"}, &got2); err != nil {
+		t.Fatalf("get user fail: %v", err)
+	}
+	for _, c := range got2.Status.Conditions {
+		if c.Type == "Ready" && c.Status == metav1.ConditionFalse {
+			if c.ObservedGeneration != got2.Generation {
+				t.Errorf("error-branch ObservedGeneration: got %d, want %d",
+					c.ObservedGeneration, got2.Generation)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected Ready=False on failed reconcile, got: %+v", got2.Status.Conditions)
+}
+
+// TestReconcile_FinalizerAddUsesMergePatch verifies the finalizer-add
+// path uses a Patch (MergeFrom) rather than a full Update. The fake
+// client's interceptor lets us verify which call shape the reconciler
+// chose — the reason the switch matters in production is two
+// concurrent reconciles during a leader-lease handoff don't race on
+// ResourceVersion. The test reduces that to a simpler check: Patch was
+// called, Update was not.
+func TestReconcile_FinalizerAddUsesMergePatch(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "patch-finalizer", Namespace: "mqtt"},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	var patchSeen, updateSeen bool
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*pgmqttv1alpha1.User); ok {
+				patchSeen = true
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*pgmqttv1alpha1.User); ok {
+				updateSeen = true
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "patch-finalizer"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !patchSeen {
+		t.Error("expected Patch on the User CR for finalizer-add, never saw one")
+	}
+	if updateSeen {
+		t.Error("expected no Update on the User CR for finalizer-add; the fix is Patch-only")
+	}
+}
+
+// TestReconcile_StatusWritesUsePatch verifies the success-path status
+// write goes through Status().Patch rather than Status().Update.
+// MergeFrom-based status patches don't carry an RV precondition by
+// default, so two concurrent reconciles during a leader-lease handoff
+// can both apply their patch without one losing on ResourceVersion.
+func TestReconcile_StatusWritesUsePatch(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "status-patch",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	var statusPatchSeen, statusUpdateSeen bool
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if sub == "status" {
+				statusPatchSeen = true
+			}
+			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if sub == "status" {
+				statusUpdateSeen = true
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "status-patch"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !statusPatchSeen {
+		t.Error("expected Status().Patch but the success path didn't invoke it")
+	}
+	if statusUpdateSeen {
+		t.Error("expected no Status().Update on the success path; the fix is Patch-only")
+	}
+}
+
+// TestReconcile_StatusPatchToleratesConcurrentSpecEdit demonstrates the
+// operational benefit of the Update→Patch switch: a third party (e.g. a
+// peer reconcile, or a `kubectl edit`) bumps the User's spec/metadata
+// between the reconcile's Get and the reconcile's status write. With
+// Update, the reconciler's stale ResourceVersion would cause a
+// 409 Conflict and a requeue. With Patch (MergeFrom), no RV
+// precondition is carried by default, so the status patch lands.
+func TestReconcile_StatusPatchToleratesConcurrentSpecEdit(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "race",
+			Namespace:  "mqtt",
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+
+	// Splice a concurrent edit into the User between the reconcile's
+	// initial Get and its subsequent writes by mutating spec the moment
+	// we observe the Get. This is the cheapest model of a parallel
+	// `kubectl edit` (or a peer reconcile during lease-handoff overlap)
+	// that bumps ResourceVersion.
+	var raced bool
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if u, ok := obj.(*pgmqttv1alpha1.User); ok && !raced {
+				raced = true
+				var live pgmqttv1alpha1.User
+				if err := c.Get(ctx, key, &live); err == nil {
+					live.Annotations = map[string]string{"raced": "true"}
+					_ = c.Update(ctx, &live)
+				}
+				// u still carries the OLD ResourceVersion seen by the
+				// reconciler — exactly the lease-handoff stale-RV state.
+				_ = u
+			}
+			return nil
+		},
+	})
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "race"}}); err != nil {
+		t.Fatalf("reconcile under concurrent spec edit: %v", err)
+	}
+
+	// Status should reflect the reconcile result despite the spec race.
+	var got pgmqttv1alpha1.User
+	if err := base.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "race"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if !hasReadyCondition(got, metav1.ConditionTrue, "Reconciled") {
+		t.Errorf("expected Ready=True after race-tolerant patch, got: %+v", got.Status.Conditions)
+	}
+	// Confirm the racing annotation survived — i.e. the patch didn't
+	// stomp the concurrent spec edit.
+	if got.Annotations["raced"] != "true" {
+		t.Errorf("racing annotation lost; status patch may have overwritten unrelated fields: %+v", got.Annotations)
+	}
+}
+
