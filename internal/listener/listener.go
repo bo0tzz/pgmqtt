@@ -39,11 +39,16 @@ const (
 	tcpKeepaliveCount    = 3
 
 	// Reconnect backoff. On a non-EOF NOTIFY wait error we tear down the
-	// dedicated conn (which auto-releases the advisory lock), sleep, and
-	// re-acquire LISTEN + lock. Backoff doubles 1→2→4→8→16 s; the loop
-	// gives up after reconnectMaxAttempts and the Pod exits so kubelet
-	// replaces it (advisory lock + LISTEN registration are per-conn so
-	// the new Pod gets a clean state).
+	// dedicated conn (which auto-releases the advisory lock) and try to
+	// re-acquire LISTEN + lock. First attempt fires immediately — only a
+	// FAILED attempt sleeps, with backoff doubling 1→2→4→8→16 s. The
+	// loop gives up after reconnectMaxAttempts and the Pod exits so
+	// kubelet replaces it (advisory lock + LISTEN registration are
+	// per-conn so the new Pod gets a clean state). Firing the first
+	// attempt immediately closes the dead-broker-reap race: during the
+	// reconnect window our advisory lock is unheld, so a peer Pod's
+	// janitor that grabs it would treat us as a dead broker and kick
+	// every owning client.
 	reconnectInitialBackoff = 1 * time.Second
 	reconnectMaxBackoff     = 16 * time.Second
 	reconnectMaxAttempts    = 5
@@ -231,14 +236,20 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 		cancel()
 	}
 
+	// Reconnect strategy: fire the first attempt IMMEDIATELY, only sleep
+	// after a FAILED attempt. The old code's leading 1 s sleep gave peer
+	// Pods' janitor.findDeadBrokerCandidates + handleDeadBroker enough
+	// time to grab our (now-unheld) per-broker advisory lock and reap
+	// every session whose broker_id = us — the broker is alive, just
+	// reconnecting, but every owning client gets kicked. Trying once
+	// fast closes that window for the common CNPG primary-failover case
+	// where Postgres comes back in <100ms.
 	backoff := reconnectInitialBackoff
 	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
-		// Sleep first (so we don't hammer PG immediately on the same
-		// transient failure), respecting context cancellation.
-		select {
-		case <-ctx.Done():
+		// Bail before the dial on ctx cancellation so Stop() during
+		// reconnect returns promptly.
+		if ctx.Err() != nil {
 			return false
-		case <-time.After(backoff):
 		}
 		newConn, err := dialAndRegister(ctx, l.url, l.uuid)
 		if err == nil {
@@ -249,6 +260,16 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 			return true
 		}
 		l.logger.Warn("listener reconnect failed", "attempt", attempt, "err", err)
+		// Last attempt — don't sleep, just bail.
+		if attempt == reconnectMaxAttempts {
+			break
+		}
+		// Back off before the next attempt (and respect ctx).
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
 		if backoff < reconnectMaxBackoff {
 			backoff *= 2
 			if backoff > reconnectMaxBackoff {
