@@ -38,13 +38,17 @@ type PgQuotaNotifier struct {
 }
 
 // NewQuotaNotifier returns a QuotaNotifier emitting pg_notify on
-// pgmqtt_quota_<broker_id> with the client_id as payload.
+// pgmqtt_quota_<broker_id>. Payload format: <36-char sessionToken><clientID>
+// — same shape as the takeover notify so the receiver can token-scope the
+// kick (and ignore a stale notify that arrived after the client moved).
 func NewQuotaNotifier(pool *pgxpool.Pool) engine.QuotaNotifier {
 	return &PgQuotaNotifier{pool: pool}
 }
 
-func (n *PgQuotaNotifier) NotifyQuota(ctx context.Context, brokerID uuid.UUID, clientID string) error {
+func (n *PgQuotaNotifier) NotifyQuota(ctx context.Context, brokerID uuid.UUID, clientID string, sessionToken uuid.UUID) error {
 	_, err := n.pool.Exec(ctx,
-		`SELECT pg_notify($1, $2)`, "pgmqtt_quota_"+brokerID.String(), clientID)
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_quota_"+brokerID.String(),
+		sessionToken.String()+clientID)
 	return err
 }

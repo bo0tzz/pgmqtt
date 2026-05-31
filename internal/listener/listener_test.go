@@ -299,6 +299,284 @@ func TestStaleTakeoverNotifyDoesNotKillFreshConn(t *testing.T) {
 	}
 }
 
+// TestTakeoverDoesNotClobberNewSession exercises BUG-1: a takeover-driven
+// Shutdown of a stale Conn (handleDisconnect on the prior owner) must NOT
+// wipe the broker_id of the new owner that has since taken over the
+// sessions row. The persist-path UPDATE (broker_id=NULL, ...) is token-
+// scoped exactly like the clean-session DELETE.
+//
+// Scenario: persistent client (no-clean, expiry>0) connects to pod 0;
+// reconnects on pod 1. Pod 0's listener fires the takeover Shutdown of
+// the now-stale Conn → handleDisconnect runs the persist-path UPDATE.
+// If the UPDATE isn't token-scoped, it clears pod 1's broker_id back
+// to NULL and the ownership sweeper kicks the healthy reconnect later.
+// With the guard, pod 1's row survives unchanged.
+func TestTakeoverDoesNotClobberNewSession(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	for _, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		t.Cleanup(l.Stop)
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	persistent := func(p *packets.Packet) {
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+
+	const clientID = "takeover-clobber"
+
+	// First connect to pod 0.
+	c1 := mh.Pods[0].Connect(t, clientID, persistent)
+	defer c1.Close()
+
+	// Reconnect same client_id on pod 1.
+	c2 := mh.Pods[1].Connect(t, clientID, persistent)
+	defer c2.Close()
+
+	// Wait for the takeover NOTIFY to fire on pod 0's listener and
+	// the stale Conn's handleDisconnect to complete its UPDATE. The
+	// listener is async over pg_notify so we poll the sessions row.
+	wantBroker := mh.Pods[1].BrokerID
+	deadline := time.Now().Add(5 * time.Second)
+	var (
+		observedBroker *uuid.UUID
+		observedConn   bool
+	)
+	for time.Now().Before(deadline) {
+		var b *uuid.UUID
+		var connected bool
+		if err := mh.Pool.QueryRow(context.Background(),
+			`SELECT broker_id, connected FROM sessions WHERE client_id=$1`,
+			clientID).Scan(&b, &connected); err != nil {
+			t.Fatalf("session lookup: %v", err)
+		}
+		observedBroker = b
+		observedConn = connected
+		// Give the stale handleDisconnect a window to clobber, then
+		// re-read once more and assert.
+		time.Sleep(50 * time.Millisecond)
+		if b != nil && *b == wantBroker && connected {
+			time.Sleep(300 * time.Millisecond)
+			if err := mh.Pool.QueryRow(context.Background(),
+				`SELECT broker_id, connected FROM sessions WHERE client_id=$1`,
+				clientID).Scan(&b, &connected); err != nil {
+				t.Fatalf("session re-read: %v", err)
+			}
+			observedBroker = b
+			observedConn = connected
+			break
+		}
+	}
+	if observedBroker == nil {
+		t.Fatalf("sessions.broker_id NULL after takeover — stale handleDisconnect clobbered the new owner")
+	}
+	if *observedBroker != wantBroker {
+		t.Fatalf("sessions.broker_id=%s, want pod1=%s", observedBroker, wantBroker)
+	}
+	if !observedConn {
+		t.Fatalf("sessions.connected=false after takeover — stale handleDisconnect clobbered the new owner")
+	}
+}
+
+// TestTakeoverSuppressesWillFire exercises BUG-2: a takeover-driven
+// Shutdown of a stale Conn must NOT fire that Conn's will. Per
+// MQTT-3.1.2.5, the Will Message is published for ABNORMAL termination
+// — a session takeover (client moved sessions) is not "the client died".
+// For users with willRetain=true (zigbee2mqtt / Home Assistant), firing
+// the will after a successful roam would stamp the device as offline
+// over its newly-live presence.
+//
+// Scenario: client A connects to pod 0 with a will on "presence/A".
+// A subscriber on a different client_id subscribes to "presence/A".
+// Same client_id reconnects on pod 1 → pod 0's stale Conn takeover-
+// shut-down. We assert the subscriber receives NO publish on
+// "presence/A" within a generous deadline.
+func TestTakeoverSuppressesWillFire(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	for _, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		t.Cleanup(l.Stop)
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	const clientID = "willful-roamer"
+	const willTopic = "presence/willful-roamer"
+
+	// Subscriber on pod 1 watching the will topic.
+	sub := mh.Pods[1].Connect(t, "presence-watcher")
+	defer sub.Close()
+	sub.Subscribe(t, willTopic, 1)
+
+	// Client A: connect to pod 0 with a will (qos=1, retain=true).
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = willTopic
+		p.Connect.WillPayload = []byte("offline")
+		p.Connect.WillQos = 1
+		p.Connect.WillRetain = true
+		// Persistent session so the takeover-not-cleanStart path runs.
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := mh.Pods[0].Connect(t, clientID, withWill)
+	defer c1.Close()
+
+	// Same client_id reconnects on pod 1 — takeover fires.
+	c2 := mh.Pods[1].Connect(t, clientID, withWill)
+	defer c2.Close()
+
+	// Wait long enough for the takeover NOTIFY → Shutdown →
+	// handleDisconnect chain to complete on pod 0. The will, if fired,
+	// would publish via pg_notify and reach the subscriber on pod 1
+	// within a few hundred ms. We give it 2s and assert silence.
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := sub.NextRaw()
+	if err == nil && pk.FixedHeader.Type == packets.Publish && pk.TopicName == willTopic {
+		t.Fatalf("will fired on takeover (got publish %q payload=%q) — MQTT-3.1.2.5 violated",
+			pk.TopicName, pk.Payload)
+	}
+	// err != nil (timeout) is the success case.
+}
+
+// TestSamePodTakeoverSuppressesWillFire exercises BUG-2's same-pod
+// variant: a client reconnects to the same pod it was on. The prior
+// Conn's prev.shutdown() must mark the conn as taken-over so its
+// handleDisconnect suppresses will firing.
+func TestSamePodTakeoverSuppressesWillFire(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, newPodLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	const clientID = "same-pod-roamer"
+	const willTopic = "presence/same-pod-roamer"
+
+	sub := pod.Connect(t, "same-pod-watcher")
+	defer sub.Close()
+	sub.Subscribe(t, willTopic, 1)
+
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = willTopic
+		p.Connect.WillPayload = []byte("offline")
+		p.Connect.WillQos = 1
+		p.Connect.WillRetain = true
+		p.Connect.Clean = false
+		p.Properties.SessionExpiryInterval = 3600
+		p.Properties.SessionExpiryIntervalFlag = true
+	}
+	c1 := pod.Connect(t, clientID, withWill)
+	defer c1.Close()
+
+	// Same-pod takeover: another CONNECT with the same client_id.
+	c2 := pod.Connect(t, clientID, withWill)
+	defer c2.Close()
+
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := sub.NextRaw()
+	if err == nil && pk.FixedHeader.Type == packets.Publish && pk.TopicName == willTopic {
+		t.Fatalf("same-pod takeover fired will (got publish %q payload=%q)",
+			pk.TopicName, pk.Payload)
+	}
+}
+
+// TestStaleQuotaNotifyDoesNotKillFreshConn exercises BUG-3: a quota-
+// kick NOTIFY whose session_token doesn't match the local Conn's
+// current token (because the slow client moved/rotated since) MUST NOT
+// disconnect the healthy new owner. Mirrors the takeover-token-aware
+// behaviour for the quota-exceeded fanout path.
+func TestStaleQuotaNotifyDoesNotKillFreshConn(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, newPodLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetQuotaNotifier(listener.NewQuotaNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	const clientID = "quota-stale-victim"
+
+	tc := pod.Connect(t, clientID)
+	defer tc.Close()
+	conn, ok := pod.Engine.ConnFor(clientID)
+	if !ok {
+		t.Fatalf("conn not registered")
+	}
+	freshToken := conn.SessionToken()
+
+	// Emit a stale quota notify whose token is random — the receiver
+	// must ignore it.
+	staleToken := uuid.New()
+	if staleToken == freshToken {
+		staleToken = uuid.New()
+	}
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_quota_"+l.BrokerID().String(),
+		staleToken.String()+clientID); err != nil {
+		t.Fatalf("emit stale quota notify: %v", err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := tc.NextRaw(); err == nil {
+		t.Fatalf("fresh conn was unexpectedly closed by a stale quota notify")
+	}
+
+	// Sanity-check: a matching-token quota notify DOES close it.
+	// v5 emits DISCONNECT 0x97 before shutting down — the client reads
+	// that packet (no error), then the socket closes (next read errors).
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_quota_"+l.BrokerID().String(),
+		freshToken.String()+clientID); err != nil {
+		t.Fatalf("emit matching quota notify: %v", err)
+	}
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := tc.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT 0x97, got read err: %v", err)
+	}
+	if pk.FixedHeader.Type != packets.Disconnect || pk.ReasonCode != 0x97 {
+		t.Fatalf("expected DISCONNECT 0x97, got type=%d reason=0x%X",
+			pk.FixedHeader.Type, pk.ReasonCode)
+	}
+}
+
 func TestTakeoverClosesPriorPodSocket(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 2, nil)

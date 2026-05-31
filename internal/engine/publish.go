@@ -357,18 +357,44 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 
 // QuotaExceededLocally writes DISCONNECT 0x97 (Quota Exceeded) to the named
 // client's currently-attached socket and tears it down. Called by the
-// listener when a peer Pod NOTIFYs us that a publish overflowed this client's
-// per-conn deliveries cap. Safe to call when the client isn't local — no-op.
+// engine's own dispatchQuotaExceeded (same-pod overflow) and by the
+// listener for legacy bare-clientID NOTIFY payloads. Safe to call when
+// the client isn't local — no-op.
 func (e *Engine) QuotaExceededLocally(clientID string) {
 	conn, ok := e.ConnFor(clientID)
 	if !ok {
 		return
 	}
-	// Two goroutines (local quota trip + cross-pod NOTIFY arriving in
-	// the same window) can both pass the ConnFor check before either
-	// disconnects the socket; quotaOnce gates the side-effects so the
-	// metric counts the event once and the log/DISCONNECT-write happens
-	// at most once per conn.
+	e.kickForQuota(conn, clientID)
+}
+
+// QuotaExceededLocallyForToken is the token-scoped variant called by the
+// listener when a cross-pod NOTIFY arrives. The notify payload carries the
+// session_token captured at the time the publishing pod observed the slow
+// client; if the local Conn's sessionToken has since rotated (the slow
+// client reconnected here or moved away and came back), the notify is
+// stale and MUST be ignored — otherwise it kills the healthy new owner.
+func (e *Engine) QuotaExceededLocallyForToken(clientID string, sessionToken uuid.UUID) {
+	conn, ok := e.ConnFor(clientID)
+	if !ok {
+		return
+	}
+	if conn.SessionToken() != sessionToken {
+		e.logger.Debug("stale quota kick ignored",
+			"client", clientID,
+			"payload_token", sessionToken,
+			"current_token", conn.SessionToken())
+		return
+	}
+	e.kickForQuota(conn, clientID)
+}
+
+// kickForQuota performs the local DISCONNECT + Shutdown side-effects.
+// Two goroutines (local quota trip + cross-pod NOTIFY arriving in the
+// same window) can both pass the ConnFor check before either disconnects
+// the socket; quotaOnce gates the side-effects so the metric counts the
+// event once and the log/DISCONNECT-write happens at most once per conn.
+func (e *Engine) kickForQuota(conn *Conn, clientID string) {
 	conn.quotaOnce.Do(func() {
 		e.logger.Info("quota exceeded — disconnecting", "client", clientID)
 		if conn.protocol == mqttwire.ProtocolMQTT5 {
@@ -387,12 +413,20 @@ func (e *Engine) QuotaExceededLocally(clientID string) {
 // dispatchQuotaExceeded resolves each over-cap client's owning broker via
 // the sessions table and emits the appropriate signal — local Disconnect
 // for our own clients, NOTIFY pgmqtt_quota_<broker_id> for peers.
+//
+// The session_token is read from the row and passed to the peer notify
+// so the receiver can ignore a stale kick (race shape: client moved off
+// the publishing pod's view of "current owner" between the SELECT here
+// and the listener consuming the NOTIFY over there). Same-pod kicks
+// also token-scope, since the slow client may have rotated session_token
+// between the publishing goroutine queueing the overflow and us
+// processing it.
 func (e *Engine) dispatchQuotaExceeded(ctx context.Context, clientIDs []string) {
 	if len(clientIDs) == 0 {
 		return
 	}
 	rows, err := e.pool.Query(ctx, `
-		SELECT client_id, broker_id
+		SELECT client_id, broker_id, session_token
 		  FROM sessions
 		 WHERE client_id = ANY($1) AND connected = true AND broker_id IS NOT NULL
 	`, clientIDs)
@@ -406,15 +440,16 @@ func (e *Engine) dispatchQuotaExceeded(ctx context.Context, clientIDs []string) 
 	for rows.Next() {
 		var cid string
 		var bid uuid.UUID
-		if err := rows.Scan(&cid, &bid); err != nil {
+		var token uuid.UUID
+		if err := rows.Scan(&cid, &bid, &token); err != nil {
 			e.logger.Warn("quota scan", "err", err)
 			continue
 		}
 		if bid == self {
-			e.QuotaExceededLocally(cid)
+			e.QuotaExceededLocallyForToken(cid, token)
 			continue
 		}
-		if err := e.quota.NotifyQuota(ctx, bid, cid); err != nil {
+		if err := e.quota.NotifyQuota(ctx, bid, cid, token); err != nil {
 			e.logger.Warn("quota notify", "broker", bid, "client", cid, "err", err)
 		}
 	}

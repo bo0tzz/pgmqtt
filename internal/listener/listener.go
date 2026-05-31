@@ -304,9 +304,22 @@ func (l *Listener) dispatchNotification(ctx context.Context, notif *pgconn.Notif
 			return
 		}
 		l.logger.Info("takeover from peer", "client", clientID)
-		c.Shutdown()
+		// ShutdownForTakeover marks the Conn so handleDisconnect
+		// suppresses will firing — a takeover-driven shutdown is not
+		// the same as the client dying (spec MQTT-3.1.2.5).
+		c.ShutdownForTakeover()
 	case quotaCh:
-		l.eng.QuotaExceededLocally(notif.Payload)
+		// Payload format mirrors takeover: <36-char token><clientID>.
+		// Forward-compat: a payload that doesn't parse as
+		// "uuid-then-anything" is treated as a bare clientID — older
+		// peers that emitted plain client_id still trigger a kick of
+		// any matching local Conn.
+		prevToken, clientID, parsed := parseTakeoverPayload(notif.Payload)
+		if parsed {
+			l.eng.QuotaExceededLocallyForToken(clientID, prevToken)
+		} else {
+			l.eng.QuotaExceededLocally(clientID)
+		}
 	}
 }
 
