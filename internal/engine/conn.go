@@ -394,6 +394,13 @@ func (e *Engine) SetMaxPacketSizeForTest(n int) {
 	e.maxPacketSizeAtomic.Store(int64(n))
 }
 
+// SetReceiveMaxV5ForTest overrides the v5 inbound ReceiveMaximum (the
+// server-side cap on un-ACKed inbound QoS>0 PUBLISHes per conn).
+// Test-only; production reads PGMQTT_RECEIVE_MAXIMUM.
+func (e *Engine) SetReceiveMaxV5ForTest(n int) {
+	e.receiveMaxV5Atomic.Store(int64(n))
+}
+
 // resolveAliasForOutbound returns (alias, isNew). If the client advertised
 // TopicAliasMaximum=0, returns (0,false). Otherwise looks up an existing
 // alias or allocates a new one when capacity remains.

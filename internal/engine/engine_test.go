@@ -1048,3 +1048,68 @@ func TestPubackBogusPacketIDDoesNotReleaseSlot(t *testing.T) {
 		t.Fatalf("real PUBACK didn't free the slot; second PUBLISH never arrived")
 	}
 }
+
+// TestQoS2DupRetransmitDoesNotDoubleCountInbound is the regression guard
+// for BUG-C: a QoS-2 PUBLISH with DUP=1 used to unconditionally Add(1)
+// against the inbound flow-control counter. When the publisher's
+// in-flight count was already at ReceiveMaximum, the retransmit would
+// trip "Receive Maximum exceeded" and earn DISCONNECT 0x93 — even though
+// [MQTT-3.3.4-9] says dup retransmits MUST NOT double-count.
+//
+// We set serverReceiveMaximum=1, send one QoS-2 PUBLISH (slot held
+// through PUBREL/PUBCOMP), then retransmit the same PUBLISH with DUP=1.
+// Pre-fix the broker DISCONNECTs us. Post-fix it re-sends PUBREC.
+func TestQoS2DupRetransmitDoesNotDoubleCountInbound(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetReceiveMaxV5ForTest(1)
+
+	pub := h.Connect(t, "qos2-dup-pub")
+	defer pub.Close()
+
+	// First QoS-2 PUBLISH — broker increments inbound counter to 1
+	// (== ReceiveMaximum), inserts inbound_qos2 dedup row, replies PUBREC.
+	// We deliberately do NOT send PUBREL, so the slot stays held.
+	pid := pub.NextPacketID()
+	if err := mqttwire.Write(pub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 2},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "qos2dup/x",
+		Payload:         []byte("first"),
+		PacketID:        pid,
+	}); err != nil {
+		t.Fatalf("write first PUBLISH: %v", err)
+	}
+	rec, err := pub.NextRaw()
+	if err != nil {
+		t.Fatalf("read first PUBREC: %v", err)
+	}
+	if rec.FixedHeader.Type != packets.Pubrec {
+		t.Fatalf("expected PUBREC, got type=%d", rec.FixedHeader.Type)
+	}
+
+	// Retransmit with DUP=1, same packet id. Pre-fix the broker increments
+	// the inbound counter to 2 (> ReceiveMaximum=1) and DISCONNECTs us
+	// with 0x93. Post-fix the broker sees the dedup row, skips the
+	// increment, and publishCore returns ErrQoS2Duplicate so we get a
+	// repeated PUBREC.
+	if err := mqttwire.Write(pub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 2, Dup: true},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "qos2dup/x",
+		Payload:         []byte("first"),
+		PacketID:        pid,
+	}); err != nil {
+		t.Fatalf("write dup PUBLISH: %v", err)
+	}
+	pk, err := pub.NextRaw()
+	if err != nil {
+		t.Fatalf("read response to DUP=1: %v", err)
+	}
+	if pk.FixedHeader.Type == packets.Disconnect {
+		t.Fatalf("dup retransmit was double-counted: got DISCONNECT 0x%X", pk.ReasonCode)
+	}
+	if pk.FixedHeader.Type != packets.Pubrec {
+		t.Fatalf("expected PUBREC for dup, got type=%d", pk.FixedHeader.Type)
+	}
+}
