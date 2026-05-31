@@ -256,6 +256,78 @@ func TestRetainedReplayDecrementsMEI(t *testing.T) {
 	}
 }
 
+// TestDisconnectInvalidSEIncreaseSends82: a CONNECT with SessionExpiry=0
+// (or absent) followed by DISCONNECT carrying SessionExpiry>0 is a
+// Protocol Error per [MQTT-3.14.2.2.2]. Server MUST send DISCONNECT
+// 0x82 before tearing the conn down — previously the broker silently
+// dropped the update with no signal to the client.
+func TestDisconnectInvalidSEIncreaseSends82(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	c, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	// CONNECT with no SessionExpiry property (defaults to 0).
+	connect := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte("MQTT"),
+			Clean:            true,
+			Keepalive:        60,
+			ClientIdentifier: "se-bad-1",
+			Username:         []byte("test"),
+			UsernameFlag:     true,
+			Password:         []byte("test"),
+			PasswordFlag:     true,
+		},
+	}
+	if err := mqttwire.Write(c, connect); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	r := mqttwire.NewReader(c)
+	r.ProtocolVersion = mqttwire.ProtocolMQTT5
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	resp, err := r.Read()
+	if err != nil {
+		t.Fatalf("read connack: %v", err)
+	}
+	if resp.FixedHeader.Type != packets.Connack || resp.ReasonCode != 0 {
+		t.Fatalf("connack: type=%d code=0x%X", resp.FixedHeader.Type, resp.ReasonCode)
+	}
+
+	// DISCONNECT with SE=10 — invalid increase from 0.
+	disc := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+	}
+	disc.Properties.SessionExpiryInterval = 10
+	disc.Properties.SessionExpiryIntervalFlag = true
+	if err := mqttwire.Write(c, disc); err != nil {
+		t.Fatalf("write disconnect: %v", err)
+	}
+
+	if err := c.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	got, err := r.Read()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT 0x82, got read err: %v", err)
+	}
+	if got.FixedHeader.Type != packets.Disconnect {
+		t.Fatalf("expected DISCONNECT, got type=%d", got.FixedHeader.Type)
+	}
+	if got.ReasonCode != 0x82 {
+		t.Errorf("expected reason 0x82, got 0x%X", got.ReasonCode)
+	}
+}
+
 // writeConnectWithMPS encodes a CONNECT with MaximumPacketSize=1 (so
 // mochi's encoder emits the property), then patches the 4-byte value in
 // place. Used to construct a "MaximumPacketSize present, value 0"

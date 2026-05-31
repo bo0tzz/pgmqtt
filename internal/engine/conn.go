@@ -875,7 +875,16 @@ func (c *Conn) handleGracefulDisconnect(_ context.Context, pk *packets.Packet) e
 			current = *c.sessionExpiry
 		}
 		invalidIncrease := current == 0 && v != 0
-		if !invalidIncrease {
+		if invalidIncrease {
+			// [MQTT-3.14.2.2.2]: extending SessionExpiry from 0 is a
+			// Protocol Error. Surface it as DISCONNECT 0x82 so the
+			// client doesn't silently believe the extension stuck —
+			// previously we just dropped the update with no signal.
+			_ = c.write(&packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+				ReasonCode:  0x82, // Protocol Error
+			})
+		} else {
 			c.sessionExpiry = &v
 		}
 	}
