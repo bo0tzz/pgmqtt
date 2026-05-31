@@ -372,6 +372,21 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 	e.metrics.ObservePublishStage("tx_commit", time.Since(startCommit))
 	res.BrokerIDs = brokers
 	res.OverflowClients = overflow
+	// Symmetric drop signal: count each over-cap subscriber as a dropped
+	// delivery with reason="overflow". The QoS-0 "row deleted after
+	// successful wire send" path already feeds DeliveriesDroppedTotal
+	// via expired/oversized/write_error; this is the QoS≥1 analog for
+	// the silent-skip-INSERT branch in mqtt_publish (slow-sub quota
+	// trip). Without this counter the "why is sub X missing messages"
+	// answer for over-cap drops requires log scraping. Each tripped
+	// subscriber is also DISCONNECTed with 0x97 (Quota Exceeded), so
+	// this counter trends with QuotaExceededTotal but at message
+	// granularity rather than per-trip.
+	if e.metrics != nil && len(overflow) > 0 {
+		for range overflow {
+			e.metrics.ObserveDeliveryDropped("overflow")
+		}
+	}
 	return res, nil
 }
 

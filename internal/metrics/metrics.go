@@ -177,6 +177,13 @@ type Metrics struct {
 	//   write_error  — conn.write returned an error (broken socket, slow
 	//                  client, kernel-level backpressure timeout). Each
 	//                  drop is also logged at Warn from the Deliver loop.
+	//   overflow     — The subscriber's per-client deliveries queue was
+	//                  at MaxQueuedDeliveriesPerClient when fanout ran;
+	//                  mqtt_publish skipped the INSERT for that client.
+	//                  The subscriber is also disconnected with DISCONNECT
+	//                  0x97 (Quota Exceeded). Sustained traffic here
+	//                  means a slow subscriber is being torn down rather
+	//                  than the broker stalling on its behalf.
 	DeliveriesDroppedTotal *prometheus.CounterVec
 
 	// PublishFanoutSubscribers — distribution of subscriber counts per
@@ -359,7 +366,10 @@ func New() *Metrics {
 			Help: "Delivery rows destroyed before a successful wire write. " +
 				"Reasons: expired (MessageExpiryInterval elapsed), " +
 				"oversized (encoded packet > client's MaximumPacketSize), " +
-				"write_error (socket write failed).",
+				"write_error (socket write failed), " +
+				"overflow (per-client deliveries queue at cap — QoS≥1 publish " +
+				"skipped the insert; the subscriber is also disconnected with " +
+				"DISCONNECT 0x97 Quota Exceeded).",
 		}, []string{"reason"}),
 		PublishFanoutSubscribers: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "pgmqtt_publish_fanout_subscribers",
@@ -398,6 +408,7 @@ func New() *Metrics {
 	m.DeliveriesDroppedTotal.WithLabelValues("expired")
 	m.DeliveriesDroppedTotal.WithLabelValues("oversized")
 	m.DeliveriesDroppedTotal.WithLabelValues("write_error")
+	m.DeliveriesDroppedTotal.WithLabelValues("overflow")
 
 	reg.MustRegister(
 		m.Connections,

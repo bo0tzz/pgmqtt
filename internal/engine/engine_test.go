@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
@@ -1111,5 +1112,83 @@ func TestQoS2DupRetransmitDoesNotDoubleCountInbound(t *testing.T) {
 	}
 	if pk.FixedHeader.Type != packets.Pubrec {
 		t.Fatalf("expected PUBREC for dup, got type=%d", pk.FixedHeader.Type)
+	}
+}
+
+// TestQoS1OverflowEmitsMetric is the regression guard for OBS-1: the
+// QoS≥1 over-cap drop path (mqtt_publish skipped the INSERT because the
+// subscriber's deliveries queue is at MaxQueuedDeliveriesPerClient) used
+// to have no counter. Fix: publishCore Inc's pgmqtt_deliveries_dropped_total
+// with reason="overflow" for each over-cap subscriber.
+//
+// We seed the session + subscription + cap-filling deliveries directly via
+// SQL so no live conn is involved on the subscriber side — that avoids
+// the drain-loop racing the assertion and lets us measure the counter
+// deterministically.
+func TestQoS1OverflowEmitsMetric(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetMaxQueuedDeliveriesForTest(2)
+
+	ctx := context.Background()
+	const target = "overflow-sub"
+
+	// Seed a disconnected session + subscription so mqtt_publish has
+	// something to match. broker_id=NULL is fine — the overflow path
+	// fires regardless of which Pod "owns" the session.
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, connected, protocol_version, clean_start)
+		VALUES ($1, false, 5, false)
+	`, target); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO subscriptions(client_id, topic_filter, qos)
+		VALUES ($1, 'ovf/#', 1)
+	`, target); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+	// Fill the deliveries table to cap.
+	for i := 0; i < 2; i++ {
+		var msgID int64
+		if err := h.Pool.QueryRow(ctx, `
+			INSERT INTO messages(topic, payload, qos, retain) VALUES ('ovf/x', $1, 1, false)
+			RETURNING id`, []byte("seed")).Scan(&msgID); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+		if _, err := h.Pool.Exec(ctx, `
+			INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ($1, $2, 1, 0)
+		`, target, msgID); err != nil {
+			t.Fatalf("seed delivery: %v", err)
+		}
+	}
+
+	metricsBefore := testutil.ToFloat64(
+		h.Engine.Metrics().DeliveriesDroppedTotal.WithLabelValues("overflow"),
+	)
+
+	// Publish QoS-1 from a separate client. mqtt_publish sees existing
+	// 2 ≥ cap=2 for `target`, skips the insert, returns `target` in
+	// overflow_clients, and publishCore Inc's the metric.
+	pub := h.Connect(t, "overflow-pub")
+	defer pub.Close()
+	pub.Publish(t, "ovf/y", []byte("over-cap"), 1, false)
+
+	// Poll briefly — Inc runs synchronously inside publishCore before
+	// publish.go writes PUBACK, so the counter is already bumped by the
+	// time pub.Publish returns. The small sleep covers goroutine slack.
+	deadline := time.Now().Add(2 * time.Second)
+	var got float64
+	for time.Now().Before(deadline) {
+		got = testutil.ToFloat64(
+			h.Engine.Metrics().DeliveriesDroppedTotal.WithLabelValues("overflow"),
+		)
+		if got > metricsBefore {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got <= metricsBefore {
+		t.Fatalf("pgmqtt_deliveries_dropped_total{reason=overflow} did not increment: before=%v after=%v", metricsBefore, got)
 	}
 }
