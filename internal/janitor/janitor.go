@@ -393,6 +393,10 @@ func (j *Janitor) refreshStateGauges(ctx context.Context) error {
 		{`SELECT count(*) FROM sessions`, j.metrics.Sessions},
 		{`SELECT count(*) FROM retained`, j.metrics.RetainedCount},
 		{`SELECT count(*) FROM inbound_qos2`, j.metrics.InboundQoS2Pending},
+		// messages_count compounded the v0.1.15 throughput-cliff investigation:
+		// orphan-messages sweep was falling behind the publish-side inflow,
+		// and there was no glance-able way to see the table growing.
+		{`SELECT count(*) FROM messages`, j.metrics.MessagesCount},
 	}
 	for _, q := range queries {
 		var n int64
@@ -535,7 +539,14 @@ func (j *Janitor) fireDueWills(ctx context.Context) error {
 	`, clientIDs); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobFireDueWills).
+			Add(float64(len(wills)))
+	}
+	return nil
 }
 
 // expireSessions deletes session rows whose v5 SessionExpiryInterval has
@@ -584,6 +595,8 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 	}
 	if j.metrics != nil {
 		j.metrics.SessionsExpired.Add(float64(len(ids)))
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobExpireSessions).
+			Add(float64(len(ids)))
 	}
 	return nil
 }
@@ -606,7 +619,7 @@ func (j *Janitor) sweepOrphanDeliveries(ctx context.Context) error {
 	//       before deleting so a momentary reconnect-flap doesn't lose
 	//       in-flight QoS-1 rows.
 	cutoff := time.Now().Add(-j.orphanGrace)
-	_, err := j.pool.Exec(ctx, `
+	ct, err := j.pool.Exec(ctx, `
 		DELETE FROM deliveries
 		 WHERE NOT EXISTS (
 		    SELECT 1 FROM sessions s WHERE s.client_id = deliveries.client_id
@@ -619,15 +632,23 @@ func (j *Janitor) sweepOrphanDeliveries(ctx context.Context) error {
 		       AND s.last_seen < $1
 		 )
 	`, cutoff)
+	if err == nil && j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobSweepOrphanDeliveries).
+			Add(float64(ct.RowsAffected()))
+	}
 	return err
 }
 
 // expireRetained drops retained rows past their MessageExpiryInterval.
 func (j *Janitor) expireRetained(ctx context.Context) error {
-	_, err := j.pool.Exec(ctx, `
+	ct, err := j.pool.Exec(ctx, `
 		DELETE FROM retained
 		 WHERE expires_at IS NOT NULL AND expires_at <= now()
 	`)
+	if err == nil && j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobExpireRetained).
+			Add(float64(ct.RowsAffected()))
+	}
 	return err
 }
 
@@ -649,6 +670,10 @@ func (j *Janitor) sweepInboundQoS2(ctx context.Context) error {
 	`, cutoff)
 	if err != nil {
 		return err
+	}
+	if j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobSweepInboundQoS2).
+			Add(float64(ct.RowsAffected()))
 	}
 	if ct.RowsAffected() > 0 {
 		j.logger.Debug("inbound_qos2 sweep", "deleted", ct.RowsAffected())
@@ -818,6 +843,10 @@ func (j *Janitor) sweepOrphanMessages(ctx context.Context) error {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobSweepOrphanMessages).
+			Add(float64(ct.RowsAffected()))
 	}
 	if ct.RowsAffected() > 0 {
 		j.logger.Debug("orphan sweep", "deleted", ct.RowsAffected())

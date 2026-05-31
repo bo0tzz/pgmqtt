@@ -678,7 +678,7 @@
       "description": "Each pod reports the same global count; using max to dedupe.",
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 5,
         "x": 0,
         "y": 32
       },
@@ -726,8 +726,8 @@
       "title": "Subscriptions",
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
+        "w": 5,
+        "x": 5,
         "y": 32
       },
       "datasource": {
@@ -774,8 +774,8 @@
       "title": "Retained",
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 12,
+        "w": 5,
+        "x": 10,
         "y": 32
       },
       "datasource": {
@@ -823,8 +823,8 @@
       "description": "Stuck QoS-2 PUBLISH\u2192PUBREL pairs. Sustained growth = pathological clients.",
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
+        "w": 5,
+        "x": 15,
         "y": 32
       },
       "datasource": {
@@ -875,12 +875,61 @@
       "id": 16
     },
     {
+      "type": "stat",
+      "title": "Messages",
+      "description": "Rows in the messages table. Should hover near the deliveries-inflight depth in steady state; sustained growth = sweep_orphan_messages falling behind publish-side inflow (the shape that hid the v0.1.15 throughput cliff).",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "max(pgmqtt_messages_count{namespace=~\"$namespace\",pod=~\"$pod\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "id": 30
+    },
+    {
       "type": "timeseries",
       "title": "Deliveries inflight by state",
       "description": "queued = waiting for owning Pod / flow-control slot; inflight = QoS\u22651 mid-PUBACK; awaiting_pubcomp = QoS-2 mid-handshake.",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 36
       },
@@ -925,8 +974,8 @@
       "description": "Non-zero = a PG-side problem on a specific janitor sub-job. Cross-reference with broker logs.",
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 36
       },
       "datasource": {
@@ -959,6 +1008,48 @@
         }
       },
       "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "Janitor swept rows/sec by job",
+      "description": "Rate of rows the janitor actually acted on per sweep job. Pair with state gauges (Sessions / Messages / Deliveries inflight) to see whether sweep is keeping up with inflow — when the gauge climbs while sweep stays flat, that's the bloat shape the v0.1.15 cliff exposed.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (job)(rate(pgmqtt_janitor_swept_rows_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 31
     },
     {
       "type": "row",

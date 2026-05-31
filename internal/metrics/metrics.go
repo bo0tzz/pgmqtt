@@ -83,13 +83,23 @@ type Metrics struct {
 	// alert on a specific job degrading without parsing logs.
 	JanitorErrorsTotal *prometheus.CounterVec
 
-	// Subscriptions / Sessions / RetainedCount / InboundQoS2Pending —
-	// gauges refreshed by janitor each tick. Cardinality detection,
-	// retained-flood detection, QoS-2 stuck detection.
+	// Subscriptions / Sessions / RetainedCount / InboundQoS2Pending /
+	// MessagesCount — gauges refreshed by janitor each tick. Cardinality
+	// detection, retained-flood detection, QoS-2 stuck detection.
+	// MessagesCount specifically catches the "deliveries drained but
+	// orphan-messages sweep is lagging" shape that compounded the
+	// v0.1.15 throughput-cliff investigation.
 	Subscriptions     prometheus.Gauge
 	Sessions          prometheus.Gauge
 	RetainedCount     prometheus.Gauge
 	InboundQoS2Pending prometheus.Gauge
+	MessagesCount     prometheus.Gauge
+
+	// JanitorSweptRowsTotal — rows acted on by each sweep job (deleted,
+	// expired, fired, etc.). Per-tick increments are the right denominator
+	// for "is the janitor keeping up with inflow?" — pair with the
+	// publishes_total / state-gauge deltas to detect bloat building up.
+	JanitorSweptRowsTotal *prometheus.CounterVec
 
 	// NotifyQueueUsageRatio — pg_notification_queue_usage(), sampled by
 	// the janitor. PG's notify queue is shared-memory and capped; once
@@ -315,6 +325,18 @@ func New() *Metrics {
 			Name: "pgmqtt_inbound_qos2_pending",
 			Help: "Rows in the inbound_qos2 dedup table (refreshed each janitor tick).",
 		}),
+		MessagesCount: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgmqtt_messages_count",
+			Help: "Rows in the messages table (refreshed each janitor tick). " +
+				"Pair with publishes_total / sweep yield to spot orphan-messages " +
+				"sweep lagging the publish-side inflow.",
+		}),
+		JanitorSweptRowsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_janitor_swept_rows_total",
+			Help: "Rows acted on by each janitor sweep job (deleted, expired, " +
+				"fired, etc.). Labels: job. Compare with the corresponding state " +
+				"gauge to detect sweep falling behind inflow.",
+		}, []string{"job"}),
 		NotifyQueueUsageRatio: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgmqtt_pg_notify_queue_usage_ratio",
 			Help: "pg_notification_queue_usage(), 0..1. Above ~0.5 means " +
@@ -451,6 +473,8 @@ func New() *Metrics {
 		m.Sessions,
 		m.RetainedCount,
 		m.InboundQoS2Pending,
+		m.MessagesCount,
+		m.JanitorSweptRowsTotal,
 		m.NotifyQueueUsageRatio,
 		m.WillsNotifyFailedTotal,
 		m.RetainedDispatchFailedTotal,

@@ -654,6 +654,17 @@ func TestJanitorRefreshStateGauges(t *testing.T) {
 		t.Fatalf("seed inbound_qos2: %v", err)
 	}
 
+	// Seed messages BEFORE the first tick so the gauge picks them up
+	// without needing a second tick (the refresh-state job has a 10s
+	// cadence; test would otherwise need a fake clock or SetJobIntervals
+	// just for one assertion).
+	if _, err := mh.Pool.Exec(ctx, `
+		INSERT INTO messages(topic, payload, qos, retain)
+		VALUES ('a/x', 'p1', 0, false), ('b/y', 'p2', 1, false), ('c/z', 'p3', 2, false)
+	`); err != nil {
+		t.Fatalf("seed messages: %v", err)
+	}
+
 	mtx := metrics.New()
 	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
 	jt.SetMetrics(mtx)
@@ -670,6 +681,7 @@ func TestJanitorRefreshStateGauges(t *testing.T) {
 		{"pgmqtt_subscriptions", mtx.Subscriptions, 5},
 		{"pgmqtt_retained_count", mtx.RetainedCount, 2},
 		{"pgmqtt_inbound_qos2_pending", mtx.InboundQoS2Pending, 4},
+		{"pgmqtt_messages_count", mtx.MessagesCount, 3},
 	}
 	for _, c := range checks {
 		var pb dto.Metric
