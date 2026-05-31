@@ -1476,3 +1476,232 @@ func hasReadyCondition(u pgmqttv1alpha1.User, status metav1.ConditionStatus, rea
 	}
 	return false
 }
+
+// TestUsersForSecret_BYORotationEnqueuesUser is the regression test
+// for the BYO-Secret-rotation latency bug. Before the Watches() wire-
+// up in SetupWithManager, an external change to a Secret that the
+// User CR referenced via spec.PasswordSecretRef did NOT enqueue a
+// reconcile — because the Secret has no OwnerReference back to the
+// User, the controller-runtime Owns() relationship never fired. The
+// users table in Postgres would then carry the stale bcrypt for up to
+// the controller-runtime resync period (default 10h).
+//
+// The fix adds a .Watches() clause backed by usersForSecret(), which
+// fans a Secret event out to every User in the Secret's namespace
+// whose spec.PasswordSecretRef.Name matches. This test verifies that
+// fan-out:
+//
+//   - A User with spec.PasswordSecretRef → Secret enqueues that User.
+//   - A User without spec.PasswordSecretRef in the same namespace
+//     does NOT get enqueued (no spurious work).
+//   - A User in a DIFFERENT namespace referencing a same-named
+//     Secret does NOT get enqueued (per-namespace List scope).
+//   - A Secret with no matching User produces an empty result (the
+//     cheap-fast path that protects against cluster-wide Secret churn).
+//   - A non-Secret object passed in produces an empty result (defensive
+//     against scheme misconfiguration in tests).
+func TestUsersForSecret_BYORotationEnqueuesUser(t *testing.T) {
+	t.Parallel()
+	scheme := newScheme(t)
+
+	// User A: references the BYO Secret by name — should be enqueued.
+	userA := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-a", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "shared-creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	// User B: same namespace but no PasswordSecretRef → must NOT enqueue.
+	userB := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-b", Namespace: "mqtt"},
+	}
+	// User C: references a different Secret name → must NOT enqueue.
+	userC := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-c", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "other-creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	// User D: matching Secret name but DIFFERENT namespace → must NOT enqueue
+	// because the map function lists Users in the Secret's namespace only.
+	userD := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-d", Namespace: "other-ns"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "shared-creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	// User E: a second user in the same namespace referencing the same
+	// Secret. Both A and E must enqueue when shared-creds changes.
+	userE := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-e", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "shared-creds"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(userA, userB, userC, userD, userE).
+		WithStatusSubresource(&pgmqttv1alpha1.User{}).
+		Build()
+
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme,
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+
+	// Case 1: the BYO Secret in mqtt namespace fires → enqueues A and E.
+	rotated := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-creds", Namespace: "mqtt"},
+		Data:       map[string][]byte{"password": []byte("v2-password")},
+	}
+	got := r.UsersForSecretForTest(context.Background(), rotated)
+	wantNames := map[string]bool{"user-a": true, "user-e": true}
+	if len(got) != len(wantNames) {
+		t.Fatalf("rotated mqtt/shared-creds: expected %d requests, got %d: %+v",
+			len(wantNames), len(got), got)
+	}
+	for _, req := range got {
+		if req.Namespace != "mqtt" {
+			t.Errorf("unexpected namespace in request: %+v", req)
+		}
+		if !wantNames[req.Name] {
+			t.Errorf("unexpected user enqueued: %+v", req)
+		}
+		delete(wantNames, req.Name)
+	}
+	if len(wantNames) != 0 {
+		t.Errorf("expected users not enqueued: %v", wantNames)
+	}
+
+	// Case 2: a Secret unrelated to any User → no requests.
+	unrelated := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "nobody-cares", Namespace: "mqtt"},
+	}
+	if got := r.UsersForSecretForTest(context.Background(), unrelated); len(got) != 0 {
+		t.Errorf("unrelated secret should not enqueue any user, got: %+v", got)
+	}
+
+	// Case 3: matching Secret name in a different namespace → cross-NS
+	// User must NOT be enqueued. We list users in the SECRET's namespace.
+	crossNS := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-creds", Namespace: "other-ns"},
+	}
+	gotCross := r.UsersForSecretForTest(context.Background(), crossNS)
+	for _, req := range gotCross {
+		if req.Name == "user-a" || req.Name == "user-e" {
+			t.Errorf("cross-namespace fan-out leaked: %+v", req)
+		}
+	}
+	// Only userD lives in other-ns and matches; verify it IS enqueued.
+	foundD := false
+	for _, req := range gotCross {
+		if req.Namespace == "other-ns" && req.Name == "user-d" {
+			foundD = true
+		}
+	}
+	if !foundD {
+		t.Errorf("expected user-d to be enqueued for other-ns/shared-creds, got: %+v", gotCross)
+	}
+
+	// Case 4: non-Secret object → defensive empty return.
+	notASecret := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "decoy", Namespace: "mqtt"},
+	}
+	if got := r.UsersForSecretForTest(context.Background(), notASecret); len(got) != 0 {
+		t.Errorf("non-Secret object should produce no requests, got: %+v", got)
+	}
+}
+
+// TestUsersForSecret_RotationDrivesReconcile is the end-to-end view of
+// the regression: simulate the controller-runtime watch by feeding a
+// rotated BYO Secret to the map function, then reconciling whatever
+// Users it returns. The DB hash must update to match the new cleartext
+// — which is the operational behaviour the watch was added to provide.
+//
+// This complements TestReconcile_BYOSecretPasswordRotation, which
+// hand-invokes Reconcile without exercising the dispatch step. Here
+// we drive Reconcile only via the map function's output to prove the
+// pipeline closes the loop end-to-end.
+func TestUsersForSecret_RotationDrivesReconcile(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+
+	byoSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "byo-rot", Namespace: "mqtt"},
+		Data:       map[string][]byte{"password": []byte("v1")},
+	}
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotator", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "byo-rot"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user, byoSec).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	// Settle finalizer + initial provision via direct reconcile.
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rotator"}}); err != nil {
+			t.Fatalf("seed reconcile %d: %v", i, err)
+		}
+	}
+	var hashV1 string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='rotator'`).Scan(&hashV1); err != nil {
+		t.Fatalf("query v1: %v", err)
+	}
+
+	// Rotate the BYO Secret — this is the event a controller-runtime
+	// watch would dispatch via usersForSecret().
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "byo-rot"}, &sec); err != nil {
+		t.Fatalf("get byo: %v", err)
+	}
+	sec.Data["password"] = []byte("v2")
+	if err := cli.Update(context.Background(), &sec); err != nil {
+		t.Fatalf("update byo: %v", err)
+	}
+
+	// Drive the dispatch step ourselves: the watch handler would have
+	// called the map function with the rotated Secret. Replay that.
+	reqs := r.UsersForSecretForTest(context.Background(), &sec)
+	if len(reqs) != 1 || reqs[0].Name != "rotator" {
+		t.Fatalf("expected single rotator request, got: %+v", reqs)
+	}
+
+	// Process the request the way the work queue would.
+	if _, err := r.Reconcile(context.Background(), reqs[0]); err != nil {
+		t.Fatalf("reconcile from map fn: %v", err)
+	}
+	var hashV2 string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='rotator'`).Scan(&hashV2); err != nil {
+		t.Fatalf("query v2: %v", err)
+	}
+	if hashV2 == hashV1 {
+		t.Error("expected password_hash to change after watch-driven reconcile")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hashV2), []byte("v2")); err != nil {
+		t.Errorf("v2 password mismatch: %v", err)
+	}
+}
