@@ -1427,7 +1427,12 @@ func TestRehashOnCostBump(t *testing.T) {
 // (cleartext unchanged AND stored hash already at configured cost) does
 // NOT increment the cost_bump metric. The short-circuit must fire.
 func TestRehashCostBumpHonoredAtNoOpReconcile(t *testing.T) {
-	t.Parallel()
+	// Deliberately NOT t.Parallel(). The assertion compares deltas on a
+	// package-global Prometheus CounterVec (userRehashTotal) — every
+	// other test in this file that reconciles a User increments the
+	// same counter. Running this test in serial-phase (no parallel
+	// siblings concurrent) is the cheapest fix for the flake that bit
+	// CI ~4× recently. Cost: ~2s of wall-clock vs being interleaved.
 	pool := dbtest.FreshPool(t)
 	scheme := newScheme(t)
 	user := &pgmqttv1alpha1.User{

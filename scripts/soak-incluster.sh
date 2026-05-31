@@ -38,6 +38,7 @@ QOS="1"
 USER_FLAG=""
 PASS_FLAG=""
 TOPIC="soak/incluster"
+DETACH=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do
         --user)      USER_FLAG="$2"; shift 2 ;;
         --pass)      PASS_FLAG="$2"; shift 2 ;;
         --topic)     TOPIC="$2"; shift 2 ;;
+        --detach)    DETACH=1; shift ;;
         *) echo "soak-incluster: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -95,7 +97,12 @@ WORK="$(mktemp -d -t pgmqtt-soak.XXXXXX)"
 cleanup() {
     local rc=$?
     set +e
-    if kubectl --context "$KCTX" -n "$NS" get pod "$POD" >/dev/null 2>&1; then
+    # In --detach mode the Pod must outlive this script. Skip the Pod
+    # delete so a host hiccup (sleep, network blip, terminal close)
+    # doesn't take the soak Pod down with the launcher script. Operator
+    # runs `scripts/soak-harvest.sh` later to collect logs + verdict
+    # and then explicitly removes the Pod.
+    if [ "$DETACH" = "0" ] && kubectl --context "$KCTX" -n "$NS" get pod "$POD" >/dev/null 2>&1; then
         kubectl --context "$KCTX" -n "$NS" delete pod "$POD" \
             --grace-period=0 --force >/dev/null 2>&1 || true
     fi
@@ -190,6 +197,20 @@ while :; do
     fi
     sleep 1
 done
+
+if [ "$DETACH" = "1" ]; then
+    echo "==> [5/5] detach (Pod runs to completion independent of this script)"
+    echo
+    echo "Pod:        $POD"
+    echo "Namespace:  $NS"
+    echo "Context:    $KCTX"
+    echo "Duration:   $DURATION"
+    echo "Shape:      qos=$QOS rate=$RATE pubs=$PUBS subs=$SUBS inflight=$INFLIGHT"
+    echo
+    echo "Harvest when done:"
+    echo "  scripts/soak-harvest.sh --cluster $CLUSTER --namespace $NS --pod $POD"
+    exit 0
+fi
 
 echo "==> [5/5] follow Pod logs → $OUT"
 # Stream logs to both the JSON file and stdout. cmd/soak prints periodic

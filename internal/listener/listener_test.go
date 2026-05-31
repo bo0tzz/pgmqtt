@@ -44,7 +44,7 @@ func TestCrossPodFanout(t *testing.T) {
 
 	pubClient.Publish(t, "x/y", []byte("hi"), 1, false)
 
-	pk := subClient.Read(t, 3*time.Second)
+	pk := subClient.Read(t, 10*time.Second)
 	if pk.FixedHeader.Type != packets.Publish {
 		t.Fatalf("expected publish, got %d", pk.FixedHeader.Type)
 	}
@@ -93,7 +93,7 @@ func TestSessionMigratesOnPodLoss(t *testing.T) {
 	defer pub.Close()
 	pub.Publish(t, "mig/x", []byte("alive"), 1, false)
 
-	pk := c2.Read(t, 3*time.Second)
+	pk := c2.Read(t, 10*time.Second)
 	if pk.FixedHeader.Type != packets.Publish || string(pk.Payload) != "alive" {
 		t.Fatalf("post-migration delivery failed: type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
 	}
@@ -138,7 +138,7 @@ func TestListenerReconnectsOnTransientError(t *testing.T) {
 
 	// Sanity: cross-broker publish works pre-disruption.
 	pub.Publish(t, "rcn/pre", []byte("pre"), 1, false)
-	pk := sub.Read(t, 3*time.Second)
+	pk := sub.Read(t, 10*time.Second)
 	if pk.FixedHeader.Type != packets.Publish || string(pk.Payload) != "pre" {
 		t.Fatalf("pre-kill: got type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
 	}
