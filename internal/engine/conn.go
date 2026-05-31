@@ -813,23 +813,38 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	// fireWill's commit and this UPDATE's commit" — eliminating it
 	// entirely would require an atomic publish+update tx, which the
 	// publishCore boundary doesn't currently allow.
-	_, err := c.eng.pool.Exec(bgCtx, `
+	//
+	// Token-scope this UPDATE for the same reason migration 0012 token-
+	// scoped the clean-session DELETE: a takeover-driven Shutdown of a
+	// stale Conn can run handleDisconnect AFTER the new owner has rotated
+	// session_token and stamped its own broker_id/connect_time/keepalive
+	// into the row. Without the guard, this UPDATE wipes the new owner's
+	// freshly-installed broker_id back to NULL; the ownership sweeper
+	// then notices the orphaned row and ~5 s later boots the healthy
+	// reconnect. With the guard, RowsAffected()==0 means the row has
+	// already been taken over and we leave it alone.
+	ct, err := c.eng.pool.Exec(bgCtx, `
 		UPDATE sessions SET
 			connected=false,
 			broker_id=NULL,
 			last_seen=now(),
-			will_fire_at=$2,
-			session_expires_at=$3,
-			will_topic      = CASE WHEN $4 THEN NULL ELSE will_topic END,
-			will_payload    = CASE WHEN $4 THEN NULL ELSE will_payload END,
-			will_qos        = CASE WHEN $4 THEN NULL ELSE will_qos END,
-			will_retain     = CASE WHEN $4 THEN NULL ELSE will_retain END,
-			will_delay      = CASE WHEN $4 THEN NULL ELSE will_delay END,
-			will_properties = CASE WHEN $4 THEN NULL ELSE will_properties END
-		WHERE client_id=$1`,
-		c.clientID, willFireAt, persistExpiresAt, willFired)
+			will_fire_at=$3,
+			session_expires_at=$4,
+			will_topic      = CASE WHEN $5 THEN NULL ELSE will_topic END,
+			will_payload    = CASE WHEN $5 THEN NULL ELSE will_payload END,
+			will_qos        = CASE WHEN $5 THEN NULL ELSE will_qos END,
+			will_retain     = CASE WHEN $5 THEN NULL ELSE will_retain END,
+			will_delay      = CASE WHEN $5 THEN NULL ELSE will_delay END,
+			will_properties = CASE WHEN $5 THEN NULL ELSE will_properties END
+		WHERE client_id=$1 AND session_token=$2`,
+		c.clientID, c.sessionToken, willFireAt, persistExpiresAt, willFired)
 	if err != nil {
 		c.eng.logger.Warn("mark disconnected", "client", c.clientID, "err", err)
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		c.eng.logger.Debug("takeover-superseded; skip session UPDATE",
+			"client", c.clientID)
 	}
 }
 
