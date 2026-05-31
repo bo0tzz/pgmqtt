@@ -4,6 +4,7 @@ package engine_test
 // audit work in v0.1.x surfaced as gaps.
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -160,6 +161,98 @@ func TestWillDelayClampedWhenSessionExpiryAbsent(t *testing.T) {
 	}
 	if string(pk.Payload) != "clamped-to-zero" {
 		t.Errorf("payload = %q", pk.Payload)
+	}
+}
+
+// TestRetainedExpiredNotReplayed: per [MQTT-3.3.2.3.3], a retained
+// message that has expired MUST NOT be delivered to new subscribers,
+// even before the janitor sweep (5s default) deletes the row.
+// dispatchRetainedForFilter now filters expired rows in the SELECT.
+func TestRetainedExpiredNotReplayed(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	ctx := context.Background()
+
+	pub := h.Connect(t, "ret-exp-pub")
+	defer pub.Close()
+
+	// Publish a retained message with 1s MessageExpiryInterval.
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 1, Retain: true},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "ret/exp",
+		Payload:         []byte("expired"),
+		PacketID:        1,
+	}
+	pk.Properties.MessageExpiryInterval = 1
+	if err := mqttwire.Write(pub.Conn, pk); err != nil {
+		t.Fatalf("write publish: %v", err)
+	}
+	pub.Read(t, 2*time.Second) // PUBACK
+
+	// Wait for the retained row to expire but still exist in PG (janitor
+	// sweep is 5s; we wait 2s).
+	time.Sleep(2 * time.Second)
+
+	var rowExpired bool
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT expires_at IS NOT NULL AND expires_at <= now() FROM retained WHERE topic=$1`,
+		"ret/exp").Scan(&rowExpired); err != nil {
+		t.Fatalf("query retained: %v", err)
+	}
+	if !rowExpired {
+		t.Fatalf("expected retained row to still exist but be expired")
+	}
+
+	sub := h.Connect(t, "ret-exp-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "ret/exp", 1)
+
+	if got := sub.TryRead(500 * time.Millisecond); got != nil && got.FixedHeader.Type == packets.Publish {
+		t.Fatalf("expired retained must not be replayed; got payload=%q", got.Payload)
+	}
+}
+
+// TestRetainedReplayDecrementsMEI: per [MQTT-3.3.2.3.3], a subscriber
+// joining N seconds after a retained PUBLISH with MessageExpiryInterval=M
+// receives M-N, not M. The replay path must rewrite the property,
+// mirroring deliver.go's deliverOneTracked logic.
+func TestRetainedReplayDecrementsMEI(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	pub := h.Connect(t, "ret-mei-pub")
+	defer pub.Close()
+
+	const initialMEI uint32 = 60
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0, Retain: true},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "ret/mei",
+		Payload:         []byte("rewrite-me"),
+	}
+	pk.Properties.MessageExpiryInterval = initialMEI
+	if err := mqttwire.Write(pub.Conn, pk); err != nil {
+		t.Fatalf("write publish: %v", err)
+	}
+
+	// Sleep ~2s so remaining MEI is materially below initial.
+	time.Sleep(2 * time.Second)
+
+	sub := h.Connect(t, "ret-mei-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "ret/mei", 0)
+
+	got := sub.Read(t, 2*time.Second)
+	if got.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected retained publish, got type=%d", got.FixedHeader.Type)
+	}
+	if got.Properties.MessageExpiryInterval == 0 {
+		t.Fatalf("expected MEI to be set, got 0")
+	}
+	if got.Properties.MessageExpiryInterval >= initialMEI {
+		t.Errorf("MEI not decremented: got %d, want < %d",
+			got.Properties.MessageExpiryInterval, initialMEI)
 	}
 }
 
