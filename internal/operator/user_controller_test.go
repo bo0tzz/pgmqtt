@@ -1905,3 +1905,86 @@ func TestReconcile_StatusUpdateErrorIsLogged(t *testing.T) {
 	}
 }
 
+// TestReconcile_ObservedGenerationSetOnReadyCondition verifies that the
+// Ready condition's ObservedGeneration field is pinned to
+// user.Generation after a reconcile. Without this, `kubectl wait
+// --for=condition=Ready` on a freshly-edited User CR sees stale Ready=
+// True from the previous generation and returns prematurely.
+func TestReconcile_ObservedGenerationSetOnReadyCondition(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gen",
+			Namespace:  "mqtt",
+			Generation: 7, // simulate a freshly-edited CR
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "gen"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "gen"}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	var ready *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == "Ready" {
+			ready = &got.Status.Conditions[i]
+			break
+		}
+	}
+	if ready == nil {
+		t.Fatalf("expected Ready condition, got conditions: %+v", got.Status.Conditions)
+	}
+	if ready.ObservedGeneration != got.Generation {
+		t.Errorf("ObservedGeneration: got %d, want %d (user.Generation)",
+			ready.ObservedGeneration, got.Generation)
+	}
+
+	// Error-branch coverage: when the reconcile fails (BYO secret missing),
+	// the Ready=False condition must also carry ObservedGeneration.
+	failUser := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gen-fail",
+			Namespace:  "mqtt",
+			Generation: 11,
+			Finalizers: []string{"pgmqtt.io/user"},
+		},
+		Spec: pgmqttv1alpha1.UserSpec{
+			PasswordSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "missing"},
+				Key:                  "password",
+			},
+		},
+	}
+	cli2 := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(failUser).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r.Client = cli2
+	_, _ = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "gen-fail"}})
+	var got2 pgmqttv1alpha1.User
+	if err := cli2.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "gen-fail"}, &got2); err != nil {
+		t.Fatalf("get user fail: %v", err)
+	}
+	for _, c := range got2.Status.Conditions {
+		if c.Type == "Ready" && c.Status == metav1.ConditionFalse {
+			if c.ObservedGeneration != got2.Generation {
+				t.Errorf("error-branch ObservedGeneration: got %d, want %d",
+					c.ObservedGeneration, got2.Generation)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected Ready=False on failed reconcile, got: %+v", got2.Status.Conditions)
+}
+

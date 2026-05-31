@@ -544,11 +544,18 @@ func logStatusUpdateError(logger logr.Logger, statusErr error, scope string, und
 }
 
 func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
+	// ObservedGeneration pins the condition to the user.Generation that
+	// the reconcile observed. Without it, `kubectl wait
+	// --for=condition=Ready` on a freshly-edited CR returns immediately
+	// against the previous reconcile's True — even though the new
+	// generation hasn't been reconciled yet. With it, the field flags
+	// the staleness and `--for=condition=Ready=true` works as expected.
 	cond := metav1.Condition{
 		Type:               "Ready",
 		LastTransitionTime: metav1.Now(),
 		Reason:             reason,
 		Message:            msg,
+		ObservedGeneration: user.Generation,
 	}
 	if ready {
 		cond.Status = metav1.ConditionTrue
@@ -557,7 +564,8 @@ func setReady(user *pgmqttv1alpha1.User, ready bool, reason, msg string) {
 	}
 	for i, c := range user.Status.Conditions {
 		if c.Type == "Ready" {
-			if c.Status == cond.Status && c.Reason == cond.Reason && c.Message == cond.Message {
+			if c.Status == cond.Status && c.Reason == cond.Reason &&
+				c.Message == cond.Message && c.ObservedGeneration == cond.ObservedGeneration {
 				return
 			}
 			user.Status.Conditions[i] = cond
