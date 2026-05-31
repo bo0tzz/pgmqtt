@@ -190,6 +190,13 @@ func (e *Engine) SetMetrics(m *metrics.Metrics) {
 	e.metrics = m
 }
 
+// Metrics returns the installed Metrics, or nil if SetMetrics was never
+// called. Test-only accessor: assertions on counter increments live in
+// internal/engine/*_test.go and need a handle to the registry.
+func (e *Engine) Metrics() *metrics.Metrics {
+	return e.metrics
+}
+
 // beginTxTimed wraps pool.BeginTx and observes pgmqtt_pgx_acquire_seconds.
 // The pgxpool BeginTx call internally does Acquire + "BEGIN" SQL — at
 // homelab latency the BEGIN is sub-ms, so the histogram closely tracks

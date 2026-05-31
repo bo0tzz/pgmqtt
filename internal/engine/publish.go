@@ -57,21 +57,41 @@ func (c *Conn) handlePublish(ctx context.Context, pk *packets.Packet) error {
 	// matching ACK handler is responsible for the decrement.
 	releaseInbound := false
 	if pk.FixedHeader.Qos > 0 && c.protocol == mqttwire.ProtocolMQTT5 {
-		current := c.inboundInflight.Add(1)
-		releaseInbound = true
-		if uint16(current) > c.eng.serverReceiveMaximum() {
-			_ = c.write(&packets.Packet{
-				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
-				ReasonCode:  0x93, // Receive Maximum exceeded
-			})
-			c.inboundInflight.Add(-1)
-			return fmt.Errorf("receive maximum exceeded: %d", current)
-		}
-		defer func() {
-			if releaseInbound {
-				c.inboundInflight.Add(-1)
+		// [MQTT-3.3.4-9]: a QoS-2 retransmit (DUP=1) of an already-
+		// claimed (client_id, packet_id) MUST NOT double-count against
+		// ReceiveMaximum — the original slot is still held against the
+		// in-flight QoS-2 message awaiting PUBREL. Probe inbound_qos2
+		// before the unconditional Add(1); if the dedup row exists,
+		// skip the increment and let publishCore return ErrQoS2Duplicate
+		// (which re-sends PUBREC without fanout).
+		skipInc := false
+		if pk.FixedHeader.Qos == 2 && pk.FixedHeader.Dup {
+			var exists bool
+			if err := c.eng.pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM inbound_qos2
+					 WHERE client_id=$1 AND packet_id=$2
+				)`, c.clientID, pk.PacketID).Scan(&exists); err == nil && exists {
+				skipInc = true
 			}
-		}()
+		}
+		if !skipInc {
+			current := c.inboundInflight.Add(1)
+			releaseInbound = true
+			if uint16(current) > c.eng.serverReceiveMaximum() {
+				_ = c.write(&packets.Packet{
+					FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+					ReasonCode:  0x93, // Receive Maximum exceeded
+				})
+				c.inboundInflight.Add(-1)
+				return fmt.Errorf("receive maximum exceeded: %d", current)
+			}
+			defer func() {
+				if releaseInbound {
+					c.inboundInflight.Add(-1)
+				}
+			}()
+		}
 	}
 
 	// v5 inbound TopicAlias validation. We advertise serverTopicAliasMaximum=0
@@ -352,6 +372,21 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 	e.metrics.ObservePublishStage("tx_commit", time.Since(startCommit))
 	res.BrokerIDs = brokers
 	res.OverflowClients = overflow
+	// Symmetric drop signal: count each over-cap subscriber as a dropped
+	// delivery with reason="overflow". The QoS-0 "row deleted after
+	// successful wire send" path already feeds DeliveriesDroppedTotal
+	// via expired/oversized/write_error; this is the QoS≥1 analog for
+	// the silent-skip-INSERT branch in mqtt_publish (slow-sub quota
+	// trip). Without this counter the "why is sub X missing messages"
+	// answer for over-cap drops requires log scraping. Each tripped
+	// subscriber is also DISCONNECTed with 0x97 (Quota Exceeded), so
+	// this counter trends with QuotaExceededTotal but at message
+	// granularity rather than per-trip.
+	if e.metrics != nil && len(overflow) > 0 {
+		for range overflow {
+			e.metrics.ObserveDeliveryDropped("overflow")
+		}
+	}
 	return res, nil
 }
 

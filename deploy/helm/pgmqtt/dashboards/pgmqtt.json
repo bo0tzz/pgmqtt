@@ -1057,7 +1057,7 @@
     {
       "type": "timeseries",
       "title": "Deliveries dropped by reason",
-      "description": "Delivery rows destroyed before a successful wire write. expired = MessageExpiryInterval elapsed; oversized = packet > client's MaximumPacketSize; write_error = socket write failed. All are MQTT-spec-legal silent drops; this surfaces the rate so 'why is sub X missing messages' has a first-look answer.",
+      "description": "Delivery rows destroyed before a successful wire write. expired = MessageExpiryInterval elapsed; oversized = packet > client's MaximumPacketSize; write_error = socket write failed; overflow = per-client deliveries queue at cap when QoS≥1 fanout ran (subscriber also DISCONNECTed with 0x97 Quota Exceeded). All are MQTT-spec-legal silent drops; this surfaces the rate so 'why is sub X missing messages' has a first-look answer.",
       "gridPos": {
         "h": 8,
         "w": 8,

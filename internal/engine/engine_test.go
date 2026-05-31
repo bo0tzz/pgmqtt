@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine/enginetest"
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
@@ -883,5 +885,310 @@ func TestConnectWithAuthenticationMethodRejected(t *testing.T) {
 	}
 	if resp.ReasonCode != 0x8C {
 		t.Fatalf("expected CONNACK 0x8C (bad auth method), got 0x%X", resp.ReasonCode)
+	}
+}
+
+// TestDeliverAndDrainRaceClaimsExactlyOnce is the regression guard for
+// BUG-A (v0.1.9 QoS-0 fix had a hole): for QoS-0, the post-write DELETE
+// left a window where a concurrent caller (drainSessionQueue on reconnect
+// vs. NOTIFY-driven Deliver) saw the same row in state=0 and both wrote
+// to the wire. The fix moves the claim to a DELETE-RETURNING BEFORE the
+// write so only one caller wins.
+//
+// We provoke the race directly: insert a single QoS-0 deliveries row for
+// a connected subscriber, then fire N parallel Deliver calls against the
+// same message id. With the fix, exactly one PUBLISH reaches the
+// subscriber and the row is gone. Without the fix, the subscriber sees
+// the message multiple times.
+func TestDeliverAndDrainRaceClaimsExactlyOnce(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	sub := h.Connect(t, "race-sub")
+	defer sub.Close()
+	sub.Subscribe(t, "race/topic", 0)
+
+	ctx := context.Background()
+	const N = 16
+
+	// Insert one message + one QoS-0 deliveries row directly so we can
+	// fire Deliver against a single known message id and assert the
+	// at-most-once invariant.
+	var msgID int64
+	if err := h.Pool.QueryRow(ctx, `
+		INSERT INTO messages(topic, payload, qos, retain) VALUES ('race/topic', $1, 0, false)
+		RETURNING id`, []byte("racing")).Scan(&msgID); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ($1, $2, 0, 0)
+	`, "race-sub", msgID); err != nil {
+		t.Fatalf("seed delivery: %v", err)
+	}
+
+	// Fire N concurrent Deliver calls. With the CAS-claim fix, exactly
+	// one wins the DELETE-RETURNING and writes; the rest see RowsAffected==0
+	// and skip.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = h.Engine.Deliver(ctx, msgID)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Count PUBLISHes received by the subscriber within a short window.
+	received := 0
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		pk := sub.TryRead(200 * time.Millisecond)
+		if pk == nil {
+			break
+		}
+		if pk.FixedHeader.Type == packets.Publish {
+			received++
+		}
+	}
+	if received != 1 {
+		t.Fatalf("expected exactly one PUBLISH (at-most-once QoS-0 with CAS-claim), got %d", received)
+	}
+
+	// And the row should be gone — the winning Deliver DELETE-RETURNINGed it.
+	var n int
+	if err := h.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM deliveries WHERE id IN (SELECT id FROM deliveries WHERE client_id=$1 AND message_id=$2)`,
+		"race-sub", msgID).Scan(&n); err != nil {
+		t.Fatalf("count deliveries: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("delivery row not deleted after winning claim: %d row(s)", n)
+	}
+}
+
+// TestPubackBogusPacketIDDoesNotReleaseSlot is the regression guard for
+// BUG-B: PUBACK / PUBCOMP for an unknown packet id used to call
+// returnInflight() unconditionally, freeing a slot that wasn't actually
+// held. A misbehaving v5 client could inflate the outbound flow-control
+// window past ReceiveMaximum. Fix: gate the release on RowsAffected > 0.
+//
+// We can't probe the internal channel from the test package; instead, we
+// fill the outbound window to capacity (one queued QoS-1 publish that
+// holds a slot), send a PUBACK with a bogus packet id, then send a real
+// PUBACK and assert the broker still rejects further sends until the
+// real PUBACK arrives — i.e. the bogus PUBACK didn't free anything.
+//
+// Implementation: set ReceiveMaximum=1 on CONNECT. Pub one QoS-1 message
+// to the subscriber. The subscriber gets one PUBLISH; without acking it,
+// publish a second QoS-1 to the same subscriber — should not be
+// delivered (slot held). Send bogus PUBACK; second publish should still
+// not be delivered (bug would deliver it because the bogus PUBACK
+// "freed" the slot).
+func TestPubackBogusPacketIDDoesNotReleaseSlot(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	sub := h.Connect(t, "puback-bogus-sub", func(p *packets.Packet) {
+		p.Properties.ReceiveMaximum = 1
+	})
+	defer sub.Close()
+	sub.Subscribe(t, "bogus/#", 1)
+
+	pub := h.Connect(t, "puback-bogus-pub")
+	defer pub.Close()
+
+	// First QoS-1 publish — should land on the subscriber and consume
+	// the single outbound slot. We deliberately do NOT PUBACK it.
+	pub.Publish(t, "bogus/x", []byte("first"), 1, false)
+	first, err := sub.NextRaw()
+	if err != nil {
+		t.Fatalf("read first PUBLISH: %v", err)
+	}
+	if first.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected first PUBLISH, got type=%d", first.FixedHeader.Type)
+	}
+
+	// Second QoS-1 publish — slot is held, so the broker must queue it
+	// and not deliver until PUBACK for the first arrives.
+	pub.Publish(t, "bogus/y", []byte("second"), 1, false)
+
+	// Send a bogus PUBACK (packet id = 0xBEEF, unknown). Pre-fix this
+	// would release the inflight slot and cause "second" to be delivered.
+	if err := mqttwire.Write(sub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Puback},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		PacketID:        0xBEEF,
+	}); err != nil {
+		t.Fatalf("write bogus PUBACK: %v", err)
+	}
+
+	// Give the broker time to (mis)react. The second publish should NOT
+	// have been delivered because the bogus PUBACK didn't actually free
+	// a slot. TryRead with a short timeout — if we read a PUBLISH here
+	// the fix has regressed.
+	if pk := sub.TryRead(500 * time.Millisecond); pk != nil && pk.FixedHeader.Type == packets.Publish {
+		t.Fatalf("bogus PUBACK released a slot it did not hold: second PUBLISH delivered prematurely")
+	}
+
+	// Sanity: real PUBACK for the first should free the slot and allow
+	// the second to flow. (This both proves the broker is still alive
+	// and that we measured the right thing.)
+	if err := mqttwire.Write(sub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Puback},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		PacketID:        first.PacketID,
+	}); err != nil {
+		t.Fatalf("write real PUBACK: %v", err)
+	}
+	second := sub.TryRead(2 * time.Second)
+	if second == nil || second.FixedHeader.Type != packets.Publish {
+		t.Fatalf("real PUBACK didn't free the slot; second PUBLISH never arrived")
+	}
+}
+
+// TestQoS2DupRetransmitDoesNotDoubleCountInbound is the regression guard
+// for BUG-C: a QoS-2 PUBLISH with DUP=1 used to unconditionally Add(1)
+// against the inbound flow-control counter. When the publisher's
+// in-flight count was already at ReceiveMaximum, the retransmit would
+// trip "Receive Maximum exceeded" and earn DISCONNECT 0x93 — even though
+// [MQTT-3.3.4-9] says dup retransmits MUST NOT double-count.
+//
+// We set serverReceiveMaximum=1, send one QoS-2 PUBLISH (slot held
+// through PUBREL/PUBCOMP), then retransmit the same PUBLISH with DUP=1.
+// Pre-fix the broker DISCONNECTs us. Post-fix it re-sends PUBREC.
+func TestQoS2DupRetransmitDoesNotDoubleCountInbound(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetReceiveMaxV5ForTest(1)
+
+	pub := h.Connect(t, "qos2-dup-pub")
+	defer pub.Close()
+
+	// First QoS-2 PUBLISH — broker increments inbound counter to 1
+	// (== ReceiveMaximum), inserts inbound_qos2 dedup row, replies PUBREC.
+	// We deliberately do NOT send PUBREL, so the slot stays held.
+	pid := pub.NextPacketID()
+	if err := mqttwire.Write(pub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 2},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "qos2dup/x",
+		Payload:         []byte("first"),
+		PacketID:        pid,
+	}); err != nil {
+		t.Fatalf("write first PUBLISH: %v", err)
+	}
+	rec, err := pub.NextRaw()
+	if err != nil {
+		t.Fatalf("read first PUBREC: %v", err)
+	}
+	if rec.FixedHeader.Type != packets.Pubrec {
+		t.Fatalf("expected PUBREC, got type=%d", rec.FixedHeader.Type)
+	}
+
+	// Retransmit with DUP=1, same packet id. Pre-fix the broker increments
+	// the inbound counter to 2 (> ReceiveMaximum=1) and DISCONNECTs us
+	// with 0x93. Post-fix the broker sees the dedup row, skips the
+	// increment, and publishCore returns ErrQoS2Duplicate so we get a
+	// repeated PUBREC.
+	if err := mqttwire.Write(pub.Conn, &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 2, Dup: true},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "qos2dup/x",
+		Payload:         []byte("first"),
+		PacketID:        pid,
+	}); err != nil {
+		t.Fatalf("write dup PUBLISH: %v", err)
+	}
+	pk, err := pub.NextRaw()
+	if err != nil {
+		t.Fatalf("read response to DUP=1: %v", err)
+	}
+	if pk.FixedHeader.Type == packets.Disconnect {
+		t.Fatalf("dup retransmit was double-counted: got DISCONNECT 0x%X", pk.ReasonCode)
+	}
+	if pk.FixedHeader.Type != packets.Pubrec {
+		t.Fatalf("expected PUBREC for dup, got type=%d", pk.FixedHeader.Type)
+	}
+}
+
+// TestQoS1OverflowEmitsMetric is the regression guard for OBS-1: the
+// QoS≥1 over-cap drop path (mqtt_publish skipped the INSERT because the
+// subscriber's deliveries queue is at MaxQueuedDeliveriesPerClient) used
+// to have no counter. Fix: publishCore Inc's pgmqtt_deliveries_dropped_total
+// with reason="overflow" for each over-cap subscriber.
+//
+// We seed the session + subscription + cap-filling deliveries directly via
+// SQL so no live conn is involved on the subscriber side — that avoids
+// the drain-loop racing the assertion and lets us measure the counter
+// deterministically.
+func TestQoS1OverflowEmitsMetric(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	h.Engine.SetMaxQueuedDeliveriesForTest(2)
+
+	ctx := context.Background()
+	const target = "overflow-sub"
+
+	// Seed a disconnected session + subscription so mqtt_publish has
+	// something to match. broker_id=NULL is fine — the overflow path
+	// fires regardless of which Pod "owns" the session.
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO sessions(client_id, connected, protocol_version, clean_start)
+		VALUES ($1, false, 5, false)
+	`, target); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := h.Pool.Exec(ctx, `
+		INSERT INTO subscriptions(client_id, topic_filter, qos)
+		VALUES ($1, 'ovf/#', 1)
+	`, target); err != nil {
+		t.Fatalf("seed subscription: %v", err)
+	}
+	// Fill the deliveries table to cap.
+	for i := 0; i < 2; i++ {
+		var msgID int64
+		if err := h.Pool.QueryRow(ctx, `
+			INSERT INTO messages(topic, payload, qos, retain) VALUES ('ovf/x', $1, 1, false)
+			RETURNING id`, []byte("seed")).Scan(&msgID); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+		if _, err := h.Pool.Exec(ctx, `
+			INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ($1, $2, 1, 0)
+		`, target, msgID); err != nil {
+			t.Fatalf("seed delivery: %v", err)
+		}
+	}
+
+	metricsBefore := testutil.ToFloat64(
+		h.Engine.Metrics().DeliveriesDroppedTotal.WithLabelValues("overflow"),
+	)
+
+	// Publish QoS-1 from a separate client. mqtt_publish sees existing
+	// 2 ≥ cap=2 for `target`, skips the insert, returns `target` in
+	// overflow_clients, and publishCore Inc's the metric.
+	pub := h.Connect(t, "overflow-pub")
+	defer pub.Close()
+	pub.Publish(t, "ovf/y", []byte("over-cap"), 1, false)
+
+	// Poll briefly — Inc runs synchronously inside publishCore before
+	// publish.go writes PUBACK, so the counter is already bumped by the
+	// time pub.Publish returns. The small sleep covers goroutine slack.
+	deadline := time.Now().Add(2 * time.Second)
+	var got float64
+	for time.Now().Before(deadline) {
+		got = testutil.ToFloat64(
+			h.Engine.Metrics().DeliveriesDroppedTotal.WithLabelValues("overflow"),
+		)
+		if got > metricsBefore {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got <= metricsBefore {
+		t.Fatalf("pgmqtt_deliveries_dropped_total{reason=overflow} did not increment: before=%v after=%v", metricsBefore, got)
 	}
 }

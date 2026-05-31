@@ -299,12 +299,18 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 
 	// Drain queued / inflight deliveries (state 0,1,2) for resumed sessions.
+	// Counter ordering matches the dead-broker-Inc fix shape: Inc the
+	// success counter only AFTER drainSessionQueue returns nil. A failed
+	// drain bumps a sibling _failures_total so we keep an attempt-rate
+	// signal even when the drain itself is wedged on PG.
 	if !c.cleanStart {
-		if c.eng.metrics != nil {
-			c.eng.metrics.DrainSessionQueueTotal.WithLabelValues("reconnect").Inc()
-		}
 		if err := c.drainSessionQueue(ctx); err != nil {
 			c.eng.logger.Warn("drain queue", "client", c.clientID, "err", err)
+			if c.eng.metrics != nil {
+				c.eng.metrics.DrainSessionQueueFailuresTotal.WithLabelValues("reconnect").Inc()
+			}
+		} else if c.eng.metrics != nil {
+			c.eng.metrics.DrainSessionQueueTotal.WithLabelValues("reconnect").Inc()
 		}
 	}
 

@@ -18,6 +18,7 @@ import (
 	"github.com/bo0tzz/pgmqtt/internal/config"
 	"github.com/bo0tzz/pgmqtt/internal/db/dbtest"
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/metrics"
 	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
 
@@ -90,6 +91,11 @@ func startBroker(t *testing.T, pool *pgxpool.Pool, url string, customise PodSetu
 	brokerID := uuid.New()
 	eng.SetBrokerID(brokerID)
 	eng.SetNotifier(engine.NewInProcessNotifier(eng))
+	// Tests that don't care about metrics get a no-op-ish registry; tests
+	// that assert on counters read via eng.Metrics(). Each harness gets
+	// its own registry (metrics.New makes one) so parallel tests don't
+	// clash on global-registry collisions.
+	eng.SetMetrics(metrics.New())
 
 	var cleanup func()
 	if customise != nil {
