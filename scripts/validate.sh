@@ -31,6 +31,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# `go install` deposits binaries in $GOPATH/bin which isn't always on PATH.
+# Without this, t1_govulncheck's auto-install succeeds but the next line
+# can't find the binary it just installed.
+GOBIN="$(go env GOBIN)"
+[ -n "$GOBIN" ] || GOBIN="$(go env GOPATH)/bin"
+case ":$PATH:" in *":$GOBIN:"*) ;; *) export PATH="$GOBIN:$PATH" ;; esac
+
 TIER="${1:-}"
 shift || true
 
