@@ -161,6 +161,14 @@ type Metrics struct {
 	// fanout) can be distinguished without a metric rename.
 	DrainSessionQueueTotal *prometheus.CounterVec
 
+	// DrainSessionQueueFailuresTotal counts drainSessionQueue invocations
+	// that returned an error before completing. Companion to
+	// DrainSessionQueueTotal — the success counter Inc lives strictly
+	// after the drain returns nil so dashboards aren't lied to about
+	// successful drains. A growing _failures_total with flat _total is
+	// the "PG-wedged on resume" shape.
+	DrainSessionQueueFailuresTotal *prometheus.CounterVec
+
 	// DeliveriesDroppedTotal counts delivery rows that were destroyed
 	// before a successful wire write reached the subscriber. The MQTT
 	// spec allows silent loss in each of these cases but the broker
@@ -356,10 +364,21 @@ func New() *Metrics {
 		}, []string{"reason"}),
 		DrainSessionQueueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_drain_session_queue_total",
-			Help: "drainSessionQueue invocations on this Pod, labelled by reason. " +
-				"Reasons: reconnect (CONNECT with cleanStart=false; resume queued/inflight " +
-				"deliveries for the returning session). " +
-				"Bounded by the reconnect rate; sustained spikes here indicate flapping clients.",
+			Help: "drainSessionQueue invocations that completed without error, " +
+				"labelled by reason. Reasons: reconnect (CONNECT with " +
+				"cleanStart=false; resume queued/inflight deliveries for the " +
+				"returning session). Bounded by the reconnect rate; sustained " +
+				"spikes here indicate flapping clients. Inc'd strictly AFTER " +
+				"the drain returns nil — see pgmqtt_drain_session_queue_failures_total " +
+				"for the error-path counter.",
+		}, []string{"reason"}),
+		DrainSessionQueueFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgmqtt_drain_session_queue_failures_total",
+			Help: "drainSessionQueue invocations that returned an error " +
+				"(typically PG unreachable during resume). Labelled by the " +
+				"same reasons as pgmqtt_drain_session_queue_total. " +
+				"Growing _failures_total with flat _total is the 'PG-wedged on " +
+				"resume' shape.",
 		}, []string{"reason"}),
 		DeliveriesDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_deliveries_dropped_total",
@@ -405,6 +424,7 @@ func New() *Metrics {
 	// Pre-create label series at zero so /metrics surfaces them before any
 	// traffic — cold-start visibility for dashboards and alerts.
 	m.DrainSessionQueueTotal.WithLabelValues("reconnect")
+	m.DrainSessionQueueFailuresTotal.WithLabelValues("reconnect")
 	m.DeliveriesDroppedTotal.WithLabelValues("expired")
 	m.DeliveriesDroppedTotal.WithLabelValues("oversized")
 	m.DeliveriesDroppedTotal.WithLabelValues("write_error")
@@ -440,6 +460,7 @@ func New() *Metrics {
 		m.ConnectionsCapacityRatio,
 		m.ListenerRestartsTotal,
 		m.DrainSessionQueueTotal,
+		m.DrainSessionQueueFailuresTotal,
 		m.DeliveriesDroppedTotal,
 		m.PublishFanoutSubscribers,
 		m.EndToEndPublishToDeliverSeconds,
