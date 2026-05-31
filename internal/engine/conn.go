@@ -723,14 +723,26 @@ func (c *Conn) handleDisconnect(ctx context.Context, cause error) {
 	if c.willTopic != "" {
 		switch c.protocol {
 		case mqttwire.ProtocolMQTT5:
-			delay := c.willDelay
-			if expiry := c.sessionExpiry; expiry != nil && (delay == nil || *expiry < *delay) {
-				delay = expiry
+			// [MQTT-3.1.2.11.2]: when SessionExpiryInterval is absent, the
+			// spec default is 0. delay := min(WillDelay, SessionExpiry).
+			// Treating nil sessionExpiry as "no clamp" let a will fire
+			// after its session had already ended; treat absent (nil) the
+			// same as present-and-zero so the clamp always applies.
+			var sessionExpiry uint32
+			if c.sessionExpiry != nil {
+				sessionExpiry = *c.sessionExpiry
 			}
-			if delay == nil || *delay == 0 {
+			var delay uint32
+			if c.willDelay != nil {
+				delay = *c.willDelay
+			}
+			if sessionExpiry < delay {
+				delay = sessionExpiry
+			}
+			if delay == 0 {
 				willFireImmediate = true
 			} else {
-				t := time.Now().Add(time.Duration(*delay) * time.Second)
+				t := time.Now().Add(time.Duration(delay) * time.Second)
 				willFireAt = &t
 			}
 		default:

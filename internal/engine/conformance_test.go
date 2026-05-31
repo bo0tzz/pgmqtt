@@ -126,6 +126,43 @@ func TestConnectMaxPacketSizeZeroRejected(t *testing.T) {
 	}
 }
 
+// TestWillDelayClampedWhenSessionExpiryAbsent: per [MQTT-3.1.2.11.2],
+// when SessionExpiryInterval is absent the spec default is 0.
+// WillDelayInterval MUST be clamped to min(WillDelay, SessionExpiry) —
+// so without SessionExpiry the effective delay is 0 and the will fires
+// immediately. Previously the broker only clamped when sessionExpiry
+// != nil, letting a 60s WillDelay fire well after the session had
+// ended.
+func TestWillDelayClampedWhenSessionExpiryAbsent(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	observer := h.Connect(t, "obs-clamp")
+	defer observer.Close()
+	observer.Subscribe(t, "lwt/clamp", 1)
+
+	withWill := func(p *packets.Packet) {
+		p.Connect.WillFlag = true
+		p.Connect.WillTopic = "lwt/clamp"
+		p.Connect.WillPayload = []byte("clamped-to-zero")
+		p.Connect.WillQos = 1
+		// 60s WillDelay, but NO SessionExpiryInterval (spec default 0).
+		// Expected: clamp to 0, will fires immediately on ungraceful
+		// disconnect.
+		p.Connect.WillProperties.WillDelayInterval = 60
+	}
+	willer := h.Connect(t, "willer-clamp", withWill)
+	willer.Kill() // ungraceful
+
+	pk := observer.Read(t, 2*time.Second)
+	if pk.FixedHeader.Type != packets.Publish {
+		t.Fatalf("expected immediate will publish, got type=%d", pk.FixedHeader.Type)
+	}
+	if string(pk.Payload) != "clamped-to-zero" {
+		t.Errorf("payload = %q", pk.Payload)
+	}
+}
+
 // writeConnectWithMPS encodes a CONNECT with MaximumPacketSize=1 (so
 // mochi's encoder emits the property), then patches the 4-byte value in
 // place. Used to construct a "MaximumPacketSize present, value 0"
