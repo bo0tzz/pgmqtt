@@ -33,6 +33,16 @@ type UserStatus struct {
 	// successfully into the database. Used to skip re-hashing on no-op.
 	// +optional
 	ObservedSecretHash string `json:"observedSecretHash,omitempty"`
+
+	// ObservedUsername is the MQTT username (spec.username, or
+	// metadata.name when unset) most recently reconciled into the
+	// `users` table. Reconcile reads this on each pass; if it differs
+	// from the currently-derived username, the row keyed by the old
+	// name is deleted before the upsert. Without this field, editing
+	// spec.username from "old" → "new" would orphan the "old" row in
+	// the table — its credentials would still authenticate.
+	// +optional
+	ObservedUsername string `json:"observedUsername,omitempty"`
 }
 
 // +kubebuilder:object:root=true

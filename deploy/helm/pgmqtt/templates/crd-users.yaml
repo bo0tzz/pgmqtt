@@ -116,4 +116,14 @@ spec:
                     - name
                 observedSecretHash:
                   type: string
+                observedUsername:
+                  description: |
+                    MQTT username most recently reconciled into the
+                    broker's `users` table. The reconciler compares
+                    this to the currently-derived username (spec.username
+                    or metadata.name) and deletes the old row when they
+                    diverge — preventing orphan rows on spec.username
+                    rename.
+                  type: string
+                  maxLength: 128
 {{- end }}

@@ -1375,6 +1375,7 @@ func TestRehashOnCostBump(t *testing.T) {
 		},
 		Status: pgmqttv1alpha1.UserStatus{
 			ObservedSecretHash:   observedHash,
+			ObservedUsername:     username,
 			CredentialsSecretRef: &corev1.LocalObjectReference{Name: username + "-mqtt-credentials"},
 		},
 	}
@@ -1463,6 +1464,128 @@ func TestRehashCostBumpHonoredAtNoOpReconcile(t *testing.T) {
 	}
 	if got := operator.UserRehashTotalForTest("rotation") - beforeRot; got != 0 {
 		t.Errorf("rotation incremented on no-op reconcile: delta=%v", got)
+	}
+}
+
+// TestReconcile_SpecUsernameRenameCleansOldRow exercises the rename
+// path: an operator edits spec.username from "alpha" to "beta" on a
+// User CR that's already reconciled. The reconciler must delete the
+// "alpha" row from the users table — otherwise the orphan still
+// authenticates and the "alpha" slot stays occupied even though the
+// User CR no longer claims it.
+//
+// Without the fix (status.observedUsername tracking + pre-upsert
+// DELETE), the second reconcile would only INSERT ... ON CONFLICT for
+// "beta" and the "alpha" row would persist indefinitely. The deletion
+// hook runs only on User CR deletion and only against the CURRENT
+// spec.username, so without status tracking the rename is invisible to
+// the cleanup path.
+func TestReconcile_SpecUsernameRenameCleansOldRow(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	scheme := newScheme(t)
+	user := &pgmqttv1alpha1.User{
+		ObjectMeta: metav1.ObjectMeta{Name: "rename", Namespace: "mqtt"},
+		Spec: pgmqttv1alpha1.UserSpec{
+			Username: "alpha",
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
+	r := &operator.UserReconciler{
+		Client: cli, Scheme: scheme, Pool: pool,
+		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		ServiceHost: "pgmqtt", ServicePort: 1883, WSPort: 8083,
+	}
+	// First two reconciles: settle finalizer + initial provision of "alpha".
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rename"}}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	// Sanity: the "alpha" row exists, status.observedUsername == "alpha".
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE username='alpha'`).Scan(&n); err != nil {
+		t.Fatalf("pre-rename query alpha: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 alpha row before rename, got %d", n)
+	}
+	var pre pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "rename"}, &pre); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if pre.Status.ObservedUsername != "alpha" {
+		t.Fatalf("expected status.observedUsername=alpha, got %q", pre.Status.ObservedUsername)
+	}
+
+	// Edit spec.username "alpha" -> "beta".
+	pre.Spec.Username = "beta"
+	if err := cli.Update(context.Background(), &pre); err != nil {
+		t.Fatalf("update spec: %v", err)
+	}
+
+	// Reconcile after the rename.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rename"}}); err != nil {
+		t.Fatalf("reconcile post-rename: %v", err)
+	}
+
+	// Post-condition 1: only one row, and it's "beta".
+	var rows []string
+	pgRows, err := pool.Query(context.Background(),
+		`SELECT username FROM users ORDER BY username`)
+	if err != nil {
+		t.Fatalf("query post-rename: %v", err)
+	}
+	for pgRows.Next() {
+		var u string
+		if err := pgRows.Scan(&u); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		rows = append(rows, u)
+	}
+	pgRows.Close()
+	if len(rows) != 1 || rows[0] != "beta" {
+		t.Errorf("expected exactly [beta] in users, got %v", rows)
+	}
+
+	// Post-condition 2: status.observedUsername advanced to "beta".
+	var post pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "rename"}, &post); err != nil {
+		t.Fatalf("get user post-rename: %v", err)
+	}
+	if post.Status.ObservedUsername != "beta" {
+		t.Errorf("expected status.observedUsername=beta after rename, got %q", post.Status.ObservedUsername)
+	}
+
+	// Post-condition 3: the "beta" hash bcrypt-verifies the Secret's
+	// password (i.e. the rename didn't desync Secret and DB).
+	var sec corev1.Secret
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "rename-mqtt-credentials"}, &sec); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	var hash string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT password_hash FROM users WHERE username='beta'`).Scan(&hash); err != nil {
+		t.Fatalf("query beta hash: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), sec.Data["password"]); err != nil {
+		t.Errorf("Secret password does not verify DB hash after rename: %v", err)
+	}
+
+	// Post-condition 4: re-running reconcile is a no-op on DB rows
+	// (idempotency: the rename-cleanup branch must not delete "beta"
+	// on the next pass since observedUsername now equals username).
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "rename"}}); err != nil {
+		t.Fatalf("reconcile post-rename (idempotency): %v", err)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE username='beta'`).Scan(&n); err != nil {
+		t.Fatalf("idempotency query: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 beta row after no-op reconcile, got %d", n)
 	}
 }
 
