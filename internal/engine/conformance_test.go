@@ -328,6 +328,43 @@ func TestDisconnectInvalidSEIncreaseSends82(t *testing.T) {
 	}
 }
 
+// TestPublishWithSubscriptionIdentifierRejected: [MQTT-3.3.4-6] forbids
+// clients from including SubscriptionIdentifier in PUBLISH. The server
+// MUST disconnect with reason 0x82 (Protocol Error) instead of
+// persisting and forwarding the client-supplied SubID.
+func TestPublishWithSubscriptionIdentifierRejected(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+
+	c := h.Connect(t, "pub-with-subid")
+	defer c.Close()
+
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		TopicName:       "pub/subid",
+		Payload:         []byte("nope"),
+	}
+	pk.Properties.SubscriptionIdentifier = []int{42}
+	if err := mqttwire.Write(c.Conn, pk); err != nil {
+		t.Fatalf("write publish: %v", err)
+	}
+
+	if err := c.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	got, err := c.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT 0x82, got read err: %v", err)
+	}
+	if got.FixedHeader.Type != packets.Disconnect {
+		t.Fatalf("expected DISCONNECT, got type=%d", got.FixedHeader.Type)
+	}
+	if got.ReasonCode != 0x82 {
+		t.Errorf("expected reason 0x82, got 0x%X", got.ReasonCode)
+	}
+}
+
 // writeConnectWithMPS encodes a CONNECT with MaximumPacketSize=1 (so
 // mochi's encoder emits the property), then patches the 4-byte value in
 // place. Used to construct a "MaximumPacketSize present, value 0"
