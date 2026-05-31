@@ -56,8 +56,14 @@ type TakeoverNotifier interface {
 // specific broker UUID — the Pod that currently owns the slow client. The
 // receiving Pod writes DISCONNECT 0x97 to that client and tears down the
 // socket.
+//
+// sessionToken pins which Conn over there is the intended target — the
+// receiver MUST only disconnect a Conn whose locally-stored sessionToken
+// matches. Without that guard, a delayed quota notify (emitted just
+// before the client reconnected to a different pod) can race the
+// reconnect and kill the healthy new owner.
 type QuotaNotifier interface {
-	NotifyQuota(ctx context.Context, brokerID uuid.UUID, clientID string) error
+	NotifyQuota(ctx context.Context, brokerID uuid.UUID, clientID string, sessionToken uuid.UUID) error
 }
 
 // Engine is the per-Pod broker.
@@ -687,4 +693,6 @@ func (noopTakeover) NotifyTakeover(_ context.Context, _ uuid.UUID, _ string, _ u
 
 type noopQuota struct{}
 
-func (noopQuota) NotifyQuota(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+func (noopQuota) NotifyQuota(_ context.Context, _ uuid.UUID, _ string, _ uuid.UUID) error {
+	return nil
+}

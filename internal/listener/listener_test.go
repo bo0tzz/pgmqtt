@@ -506,6 +506,77 @@ func TestSamePodTakeoverSuppressesWillFire(t *testing.T) {
 	}
 }
 
+// TestStaleQuotaNotifyDoesNotKillFreshConn exercises BUG-3: a quota-
+// kick NOTIFY whose session_token doesn't match the local Conn's
+// current token (because the slow client moved/rotated since) MUST NOT
+// disconnect the healthy new owner. Mirrors the takeover-token-aware
+// behaviour for the quota-exceeded fanout path.
+func TestStaleQuotaNotifyDoesNotKillFreshConn(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	pod := mh.Pods[0]
+	l, err := listener.Start(context.Background(), mh.URL, pod.Engine, newPodLogger())
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	t.Cleanup(l.Stop)
+	pod.Engine.SetBrokerID(l.BrokerID())
+	pod.Engine.SetQuotaNotifier(listener.NewQuotaNotifier(mh.Pool))
+	pod.BrokerID = l.BrokerID()
+
+	const clientID = "quota-stale-victim"
+
+	tc := pod.Connect(t, clientID)
+	defer tc.Close()
+	conn, ok := pod.Engine.ConnFor(clientID)
+	if !ok {
+		t.Fatalf("conn not registered")
+	}
+	freshToken := conn.SessionToken()
+
+	// Emit a stale quota notify whose token is random — the receiver
+	// must ignore it.
+	staleToken := uuid.New()
+	if staleToken == freshToken {
+		staleToken = uuid.New()
+	}
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_quota_"+l.BrokerID().String(),
+		staleToken.String()+clientID); err != nil {
+		t.Fatalf("emit stale quota notify: %v", err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := tc.NextRaw(); err == nil {
+		t.Fatalf("fresh conn was unexpectedly closed by a stale quota notify")
+	}
+
+	// Sanity-check: a matching-token quota notify DOES close it.
+	// v5 emits DISCONNECT 0x97 before shutting down — the client reads
+	// that packet (no error), then the socket closes (next read errors).
+	if _, err := mh.Pool.Exec(context.Background(),
+		`SELECT pg_notify($1, $2)`,
+		"pgmqtt_quota_"+l.BrokerID().String(),
+		freshToken.String()+clientID); err != nil {
+		t.Fatalf("emit matching quota notify: %v", err)
+	}
+	if err := tc.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	pk, err := tc.NextRaw()
+	if err != nil {
+		t.Fatalf("expected DISCONNECT 0x97, got read err: %v", err)
+	}
+	if pk.FixedHeader.Type != packets.Disconnect || pk.ReasonCode != 0x97 {
+		t.Fatalf("expected DISCONNECT 0x97, got type=%d reason=0x%X",
+			pk.FixedHeader.Type, pk.ReasonCode)
+	}
+}
+
 func TestTakeoverClosesPriorPodSocket(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 2, nil)
