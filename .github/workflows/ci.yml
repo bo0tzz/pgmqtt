@@ -73,6 +73,41 @@ jobs:
           helm template deploy/helm/pgmqtt --set database.url='postgres://x/y' > /tmp/rendered.yaml
           test -s /tmp/rendered.yaml
 
+  conformance:
+    name: paho v3+v5 (single broker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@v5
+        with:
+          version: latest
+      - name: install paho deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install paho-mqtt
+      - name: clone paho.mqtt.testing
+        run: git clone --depth 1 https://github.com/eclipse/paho.mqtt.testing /tmp/paho
+      - name: tier2 validate
+        run: bash scripts/validate.sh tier2 --paho /tmp/paho
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-${{ github.run_id }}
+          path: |
+            /tmp/pgmqttd-validate.log
+            coverage.out
+            coverage.txt
+          if-no-files-found: warn
+          retention-days: 14
+
   docker:
     name: docker
     runs-on: ubuntu-latest
