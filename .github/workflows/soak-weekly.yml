@@ -67,16 +67,27 @@ jobs:
             --set database.url='postgres://pgmqtt:pgmqtt@postgres.mqtt.svc:5432/pgmqtt?sslmode=disable'
           kubectl -n mqtt rollout status deployment/pgmqtt --timeout=180s
 
-      - name: in-cluster soak (60s × 1000 msg/s × QoS 1)
+      - name: in-cluster soak (60s × 500 msg/s × QoS 1)
         # The script builds + side-loads the pgmqtt-soak image, runs the
         # Pod, follows logs, and exits non-zero on lost/dups for QoS≥1.
         # This is the bug-class the kubectl port-forward path mis-reported.
+        #
+        # Rate was 1000 msg/s; matches the change that landed in
+        # scripts/validate.sh's t3_soak_smoke. 1000 msg/s × 3 pubs ×
+        # 3 subs at QoS-1 = 9000 outbound deliveries/s, which sits at
+        # the broker's capacity edge on a GitHub Actions / kind runner
+        # and produces ~30% false-fail rate at the 95% delivery
+        # threshold. The variance is in throughput, not correctness
+        # (0 lost / 0 dups across the variance window). At 500 msg/s
+        # the broker has headroom; the smoke is deterministic; the
+        # full publish → cross-broker NOTIFY → deliver → PUBACK chain
+        # is still exercised end-to-end across 9 client streams.
         run: |
           bash scripts/soak-incluster.sh \
             --cluster pgmqtt-soak \
             --namespace mqtt \
             --duration 60s \
-            --rate 1000 \
+            --rate 500 \
             --pubs 3 --subs 3 \
             --inflight 25 \
             --qos 1
