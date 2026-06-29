@@ -163,23 +163,55 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: latest
-      - name: install postgres in cluster
+      - name: install cloudnative-pg operator
         run: |
+          CNPG_VERSION=1.29.1
+          kubectl apply --server-side -f "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v${CNPG_VERSION}/cnpg-${CNPG_VERSION}.yaml"
+          kubectl -n cnpg-system rollout status deployment/cnpg-controller-manager --timeout=180s
+      - name: provision CNPG cluster
+        run: |
+          # Backs the smoke with CNPG (matches production-style deploys) so
+          # the chart's default database.existingSecretKey="uri" is
+          # exercised against a real CNPG <cluster>-app Secret. A regression
+          # in that default — or in CNPG's Secret schema — would surface
+          # here as the broker failing to start. See issue #1.
           kubectl create namespace mqtt
-          kubectl -n mqtt apply -f .github/ci/postgres.yaml
-          kubectl -n mqtt rollout status statefulset/postgres --timeout=180s
+          kubectl apply -f .github/ci/cnpg-cluster.yaml
+          # CNPG sets .status.phase asynchronously after the StatefulSet
+          # rolls out; rollout status doesn't cover the bootstrap-initdb
+          # step. Poll the Cluster CR.
+          for _ in $(seq 1 60); do
+            phase=$(kubectl -n mqtt get cluster pgmqtt-pg -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            echo "cluster phase: ${phase:-<unset>}"
+            if [ "$phase" = "Cluster in healthy state" ]; then
+              break
+            fi
+            sleep 5
+          done
+          test "$(kubectl -n mqtt get cluster pgmqtt-pg -o jsonpath='{.status.phase}')" = "Cluster in healthy state"
+          kubectl -n mqtt get secret pgmqtt-pg-app -o jsonpath='{.data.uri}' >/dev/null
       - name: build image into kind
         run: |
           docker build -t pgmqtt:ci .
           kind load docker-image pgmqtt:ci --name pgmqtt-smoke
       - name: helm install
         run: |
+          # No --set database.existingSecretKey override — relies on the
+          # chart's default ("uri"), which is what CNPG's <cluster>-app
+          # Secret actually provides. This is the regression guard for
+          # issue #1.
           helm install pgmqtt deploy/helm/pgmqtt \
             --namespace mqtt \
             --set image.repository=pgmqtt \
             --set image.tag=ci \
             --set image.pullPolicy=IfNotPresent \
-            --set database.url='postgres://pgmqtt:pgmqtt@postgres.mqtt.svc:5432/pgmqtt?sslmode=disable'
+            --set database.existingSecret=pgmqtt-pg-app
           kubectl -n mqtt rollout status deployment/pgmqtt --timeout=180s
       - name: apply User and exercise round-trip
         run: bash .github/ci/smoke-in-cluster.sh
+      - name: dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n mqtt get pods
+          kubectl -n mqtt logs -l app.kubernetes.io/name=pgmqtt --tail=200 || true
+          kubectl -n mqtt describe cluster pgmqtt-pg || true
