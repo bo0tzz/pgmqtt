@@ -195,11 +195,51 @@ func main() {
 	close(pubDone)
 
 	<-pubDone
-	// Drain time — wait for any inflight messages to land. Long enough to
-	// cover a chaos restart cycle (broker death + restart + session resume
-	// + queued-delivery drain). 30s is well-above the slowest observed
-	// recovery path under kind-cluster chaos.
-	time.Sleep(30 * time.Second)
+	// Drain phase. Previously: time.Sleep(30s). That coupled the verdict
+	// to wall-clock — a slow environment (CI runner, busy laptop, kind on
+	// a shared host) couldn't drain steady-state backlog in 30s and the
+	// rig would FAIL despite the broker having no actual loss/dups. The
+	// 95% threshold sometimes caught the real wedge regression it was
+	// added for, sometimes caught environment-driven throughput shortfall.
+	//
+	// Replaced with quiescence detection: poll the aggregate `received`
+	// counter at 1s cadence; once it stops growing for `drainQuiescence`
+	// consecutive seconds, broker has delivered everything it's going to.
+	// The verdict (received vs published) then reflects broker correctness,
+	// not "broker-vs-the-clock". Hard cap at `drainMaxWait` so a wedged
+	// broker can't hang the rig indefinitely — at the cap we still
+	// emit a verdict, which fails strictly because received << expected.
+	const (
+		drainPollInterval = 1 * time.Second
+		drainQuiescence   = 10 * time.Second
+		drainMaxWait      = 5 * time.Minute
+	)
+	drainStart := time.Now()
+	var lastReceived int64
+	unchangedFor := time.Duration(0)
+	for {
+		time.Sleep(drainPollInterval)
+		var curReceived int64
+		for _, s := range subStatsList {
+			curReceived += s.received.Load()
+		}
+		if curReceived != lastReceived {
+			lastReceived = curReceived
+			unchangedFor = 0
+			continue
+		}
+		unchangedFor += drainPollInterval
+		if unchangedFor >= drainQuiescence {
+			log.Printf("drain: quiescent at received=%d (drain took %s)",
+				curReceived, time.Since(drainStart).Round(time.Second))
+			break
+		}
+		if time.Since(drainStart) >= drainMaxWait {
+			log.Printf("drain: hit max wait %s with received=%d (broker still has work — verdict will fail)",
+				drainMaxWait, curReceived)
+			break
+		}
+	}
 	cancel()
 	subWG.Wait()
 
