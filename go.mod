@@ -10,7 +10,7 @@ require (
 	// rewind the resolved version for k8s deps too. Re-pin to a tag once
 	// the gorilla/websocket project cuts v1.5.4 (or later).
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
