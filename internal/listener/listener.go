@@ -231,14 +231,29 @@ func (l *Listener) run(ctx context.Context) {
 				osExit(1)
 				return
 			}
-			// Reconnect succeeded: peer Pods' `pg_notify` fan-outs for
-			// our local subscribers landed on a deaf channel during the
-			// reconnect window. The delivery rows they wrote sit at
-			// state=0 with no kick. Wake every local Conn's drain loop
-			// so QoS-1 subscribers that don't publish/ack frequently
-			// don't have their queued rows sit indefinitely. Best
-			// effort: kicks coalesce, drainOnce iterates the queue.
+			// Reconnect succeeded. Two things to do, in this order:
+			//
+			// 1) AttestOwnedSessions: rewrite the truth into `sessions`
+			//    for every Conn we still hold in memory. While we were
+			//    disconnected from PG, a peer broker may have run
+			//    find_dead_brokers / handleDeadBroker against our
+			//    broker_id (the advisory lock is auto-released when our
+			//    PG session dies — see 2026-06-29 incident). If it did,
+			//    our clients' session rows now lie about reality. The
+			//    attest UPDATE restores broker_id + connected + last_seen
+			//    for every (client_id, session_token) we own, gated by
+			//    session_token so we don't stomp legitimate takeovers.
+			//    Must precede KickAllDrains because the publish-side
+			//    NOTIFY routing depends on the row's broker_id pointing
+			//    at us.
+			//
+			// 2) KickAllDrains: peer Pods' `pg_notify` fan-outs during
+			//    our reconnect window landed on a deaf channel. Their
+			//    delivery rows sit at state=0 with no drain kick. Wake
+			//    every local Conn's drain loop. Kicks coalesce;
+			//    drainOnce iterates the queue.
 			if l.eng != nil {
+				l.eng.AttestOwnedSessions(ctx)
 				l.eng.KickAllDrains()
 			}
 			continue

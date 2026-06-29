@@ -630,6 +630,60 @@ func (e *Engine) KickAllDrains() {
 	}
 }
 
+// AttestOwnedSessions rewrites the truth back into `sessions` for every
+// Conn this broker currently holds in memory. Called by the listener
+// immediately after a successful reconnect.
+//
+// Background: when CNPG primary failover (or any event that kills every
+// broker's listener PG session simultaneously) happens, all brokers
+// briefly hold no broker-UUID advisory lock. The first to reconnect
+// runs find_dead_brokers, sees every peer's lock available, and reaps
+// them — marking their sessions connected=false, broker_id=NULL. The
+// other brokers' clients' TCP sockets stay alive (TCP layer wasn't
+// disrupted), but the DB now says they're disconnected. The 2026-06-29
+// incident report has the full chain.
+//
+// The fix in 0018_mqtt_publish_drop_connected_filter removed the
+// load-bearing dependency on `connected` from the publish routing path,
+// so a stale connected=false no longer drops messages on the floor. This
+// function is the companion that restores `broker_id` so NOTIFY fan-out
+// continues to route to us.
+//
+// session_token guard: if a Conn for the same client_id has already
+// taken over from us (via the peer-broker takeover NOTIFY path), the
+// session row's token will have rotated away from our captured value
+// and our UPDATE is a no-op. Only sessions whose token still matches
+// what we hold in memory are reclaimed — exactly the semantics we want.
+func (e *Engine) AttestOwnedSessions(ctx context.Context) {
+	e.connsMu.RLock()
+	clientIDs := make([]string, 0, len(e.conns))
+	tokens := make([]uuid.UUID, 0, len(e.conns))
+	for _, c := range e.conns {
+		clientIDs = append(clientIDs, c.clientID)
+		tokens = append(tokens, c.sessionToken)
+	}
+	e.connsMu.RUnlock()
+	if len(clientIDs) == 0 {
+		return
+	}
+	self := e.BrokerID()
+	ct, err := e.pool.Exec(ctx, `
+		UPDATE sessions SET broker_id=$1, connected=true, last_seen=now()
+		  FROM unnest($2::text[], $3::uuid[]) AS attest(client_id, session_token)
+		 WHERE sessions.client_id = attest.client_id
+		   AND sessions.session_token = attest.session_token
+	`, self, clientIDs, tokens)
+	if err != nil {
+		e.logger.Warn("attest owned sessions", "err", err, "n", len(clientIDs))
+		return
+	}
+	if e.logger.Enabled(ctx, slog.LevelDebug) {
+		e.logger.Debug("attest owned sessions",
+			"reclaimed", ct.RowsAffected(),
+			"of", len(clientIDs))
+	}
+}
+
 func isClosedNetErr(err error) bool {
 	if err == nil {
 		return false
