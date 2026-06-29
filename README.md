@@ -26,7 +26,7 @@ You need Postgres reachable from your cluster. Any Postgres ≥ 14.
 ```bash
 kubectl create namespace mqtt
 kubectl -n mqtt create secret generic pgmqtt-db \
-    --from-literal=url='postgres://pgmqtt:secret@postgres.default.svc:5432/pgmqtt?sslmode=disable'
+    --from-literal=uri='postgres://pgmqtt:secret@postgres.default.svc:5432/pgmqtt?sslmode=disable'
 
 helm install pgmqtt deploy/helm/pgmqtt \
     --namespace mqtt \

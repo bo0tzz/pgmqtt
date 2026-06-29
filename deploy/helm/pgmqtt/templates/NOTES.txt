@@ -37,7 +37,10 @@ Create an MQTT user (the broker reads from Postgres via the operator):
 ⚠  database.url AND database.existingSecret are both empty.
    The broker won't start. Set one of:
      --set database.url='postgres://USER:PASS@HOST/DB'
-     --set database.existingSecret=<name-of-secret-with-url-key>
+     --set database.existingSecret=<name-of-secret-with-uri-key>
+   The default key is "uri" (matches CNPG's <cluster>-app Secret);
+   override database.existingSecretKey if your Secret uses a different
+   key name.
 {{- end }}
 
 {{- if and .Values.serviceMonitor.enabled (not .Values.serviceMonitor.labels) }}

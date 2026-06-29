@@ -15,11 +15,13 @@ image:
   pullPolicy: IfNotPresent
 
 ## Postgres connection. Either set existingSecret to a Secret containing a
-## "url" key (e.g. one provisioned by CloudNativePG) or set the URL directly.
+## "uri" key (the default key CloudNativePG provisions on its <cluster>-app
+## Secret) or set the URL directly. Override existingSecretKey if your Secret
+## uses a different key name (e.g. "url" for hand-rolled secrets).
 database:
   url: ""
   existingSecret: ""
-  existingSecretKey: "url"
+  existingSecretKey: "uri"
   ## Per-statement timeout (ms) applied to every connection from the
   ## broker's pgxpool. Bounds wedged Postgres so publisher dispatch
   ## can't hang past keepalive. 0 disables (PG default).
