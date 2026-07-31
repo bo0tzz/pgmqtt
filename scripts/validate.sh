@@ -100,8 +100,10 @@ t1_test_race()   { go test ./... -count=1 -race -timeout 10m; }
 # (download + scan); subsequent runs are ~5s.
 #
 # This catches stdlib CVEs that landed since the Go toolchain was bumped
-# (typical fix: bump the `go` directive in go.mod to the patch version
-# noted in the govulncheck output, e.g. 1.26.2 -> 1.26.3).
+# (typical fix: bump the `toolchain` directive in go.mod to the patch version
+# noted in the govulncheck output, e.g. go1.26.4 -> go1.26.5). Bumping the
+# `go` directive does nothing here: it sets the minimum language version,
+# and CI's setup-go reads `toolchain` in preference to it.
 t1_govulncheck() {
     if ! command -v govulncheck >/dev/null 2>&1; then
         go install golang.org/x/vuln/cmd/govulncheck@latest
