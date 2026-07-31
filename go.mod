@@ -26,7 +26,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.1
 )
 
-require github.com/go-logr/logr v1.4.3
+require github.com/go-logr/logr v1.4.4
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
