@@ -31,9 +31,10 @@ What each tier closes that the prior tier misses:
 
 In CI:
 
-- `ci.yml` — covers tier1's surface on every PR (vet, govulncheck, test,
-  test-race, helm lint, kind-based smoke). Already green is your gate to
-  merge.
+- `ci.yml` — covers tier1's surface on every PR (vet, test, test-race,
+  helm lint, kind-based smoke). Already green is your gate to merge.
+  Dependency scanning lives in its own `govulncheck (deps)` job so an
+  upstream advisory doesn't read as a test failure; it still gates merge.
 - `conformance-nightly.yml` — runs tier2 daily at 03:00 UTC. Doesn't gate
   PRs; informational regression detector.
 - `soak-weekly.yml` — runs an in-cluster soak (and tier3 paho multi-broker,
