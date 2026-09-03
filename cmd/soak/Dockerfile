@@ -4,7 +4,7 @@
 # so it hits the broker Service VIP (and thus gets real round-robin
 # distribution across replicas), rather than the single-Pod
 # `kubectl port-forward svc/...` shortcut.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
