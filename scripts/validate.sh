@@ -13,6 +13,11 @@
 #           go vet + make test-race + helm lint + helm template (default
 #           values + a couple of overrides).
 #
+# --vulncheck adds a govulncheck phase to any tier. Off by default because
+# it fails on advisories published against unchanged code (often stdlib,
+# fixable only by a toolchain bump), which is a different signal from
+# "did my change break something". CI runs it as its own job.
+#
 #   tier2   slow — before commit. ~5–10 min.
 #           tier1 + make coverage + Paho v3 + Paho v5 single-broker.
 #           Requires --paho /path/to/paho.mqtt.testing.
@@ -25,6 +30,7 @@
 #   scripts/validate.sh tier1
 #   scripts/validate.sh tier2 --paho /tmp/paho-testing
 #   scripts/validate.sh tier3 --paho /tmp/paho-testing
+#   scripts/validate.sh tier1 --vulncheck
 
 set -euo pipefail
 
@@ -32,23 +38,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # `go install` deposits binaries in $GOPATH/bin which isn't always on PATH.
-# Without this, t1_govulncheck's auto-install succeeds but the next line
+# Without this, govulncheck_phase's auto-install succeeds but the next line
 # can't find the binary it just installed.
 GOBIN="$(go env GOBIN)"
 [ -n "$GOBIN" ] || GOBIN="$(go env GOPATH)/bin"
 case ":$PATH:" in *":$GOBIN:"*) ;; *) export PATH="$GOBIN:$PATH" ;; esac
 
 TIER="${1:-}"
+case "$TIER" in -h|--help) sed -n '2,/^set -e/{/^set -e/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 shift || true
 
 PAHO=""
 KEEP_CLUSTER=""
+VULNCHECK=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)
-            sed -n '2,30p' "$0"; exit 0 ;;
+            sed -n '2,/^set -e/{/^set -e/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --paho) PAHO="$2"; shift 2 ;;
         --keep-cluster) KEEP_CLUSTER=1; shift ;;
+        --vulncheck) VULNCHECK=1; shift ;;
         *) echo "validate.sh: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -65,7 +74,7 @@ case "$TIER" in
             exit 2
         fi
         ;;
-    "")  echo "usage: $0 tier1|tier2|tier3 [--paho PATH] [--keep-cluster]" >&2; exit 2 ;;
+    "")  echo "usage: $0 tier1|tier2|tier3 [--paho PATH] [--keep-cluster] [--vulncheck]" >&2; exit 2 ;;
     *)   echo "validate.sh: unknown tier: $TIER" >&2; exit 2 ;;
 esac
 
@@ -93,18 +102,19 @@ OVERALL_START=$(date +%s)
 t1_vet()         { go vet ./...; }
 t1_test_race()   { go test ./... -count=1 -race -timeout 10m; }
 
-# govulncheck — matches the CI step. Installs `@latest` on first run
-# (cached in $GOPATH/bin afterwards). Pinned to @latest deliberately:
-# a vulnerability scanner is *more* useful the newer it is, because each
-# release ships a larger known-vuln database. Local first-run is ~15s
-# (download + scan); subsequent runs are ~5s.
+# govulncheck — matches the CI `govulncheck (deps)` job. Opt-in via
+# --vulncheck rather than part of tier1: the scan's result changes as new
+# advisories are published, not as the repo changes, so a red run here
+# usually means "bump a dep or the toolchain", not "your change is wrong".
+# Installs `@latest` on first run (cached in $GOPATH/bin afterwards);
+# pinned to @latest deliberately since a newer scanner has a larger
+# known-vuln database. Local first-run is ~15s; subsequent runs ~5s.
 #
-# This catches stdlib CVEs that landed since the Go toolchain was bumped
-# (typical fix: bump the `toolchain` directive in go.mod to the patch version
-# noted in the govulncheck output, e.g. go1.26.4 -> go1.26.5). Bumping the
-# `go` directive does nothing here: it sets the minimum language version,
-# and CI's setup-go reads `toolchain` in preference to it.
-t1_govulncheck() {
+# For stdlib CVEs the fix is bumping the `toolchain` directive in go.mod to
+# the patch version noted in the output (e.g. go1.26.4 -> go1.26.5). Bumping
+# the `go` directive does nothing here: it sets the minimum language
+# version, and CI's setup-go reads `toolchain` in preference to it.
+govulncheck_phase() {
     if ! command -v govulncheck >/dev/null 2>&1; then
         go install golang.org/x/vuln/cmd/govulncheck@latest
     fi
@@ -143,7 +153,6 @@ t1_helm_template() {
 
 run_tier1() {
     phase "go vet"           t1_vet
-    phase "govulncheck"      t1_govulncheck
     phase "make test-race"   t1_test_race
     phase "helm lint"        t1_helm_lint
     phase "helm template"    t1_helm_template
@@ -309,6 +318,8 @@ run_tier3() {
     phase "tier3 cluster teardown" t3_multi_broker_teardown
     trap - EXIT
 }
+
+[ -z "$VULNCHECK" ] || phase "govulncheck" govulncheck_phase
 
 case "$TIER" in
     tier1) run_tier1 ;;

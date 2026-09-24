@@ -52,7 +52,7 @@ validate:
 		echo "make validate TIER=$(TIER) requires PAHO=/path/to/paho.mqtt.testing" >&2; \
 		exit 2; \
 	fi
-	@bash scripts/validate.sh $(TIER) $(if $(PAHO),--paho $(PAHO))
+	@bash scripts/validate.sh $(TIER) $(if $(PAHO),--paho $(PAHO)) $(if $(VULNCHECK),--vulncheck)
 
 clean:
 	rm -f $(BINARY) coverage.out coverage.txt

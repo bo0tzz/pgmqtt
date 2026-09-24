@@ -35,6 +35,8 @@ In CI:
   helm lint, kind-based smoke). Already green is your gate to merge.
   Dependency scanning lives in its own `govulncheck (deps)` job so an
   upstream advisory doesn't read as a test failure; it still gates merge.
+  For the same reason `validate.sh` doesn't run govulncheck in any tier;
+  pass `--vulncheck` (or `make validate ... VULNCHECK=1`) to add it.
 - `conformance-nightly.yml` — runs tier2 daily at 03:00 UTC. Doesn't gate
   PRs; informational regression detector.
 - `soak-weekly.yml` — runs an in-cluster soak (and tier3 paho multi-broker,
