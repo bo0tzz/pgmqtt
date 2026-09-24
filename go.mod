@@ -2,7 +2,7 @@ module github.com/bo0tzz/pgmqtt
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.27.1
 
 require (
 	github.com/google/uuid v1.6.0
