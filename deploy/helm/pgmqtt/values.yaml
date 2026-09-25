@@ -212,7 +212,7 @@ ui:
     # (amd64 + arm64), ~53 MB, exposes port 80, pure static (no backend).
     # Pinned for reproducibility; bump as new stable tags ship.
     repository: emqx/mqttx-web
-    tag: v1.13.0
+    tag: v1.13.1
     pullPolicy: IfNotPresent
   containerPort: 80
   service:
