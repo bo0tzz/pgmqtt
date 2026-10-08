@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 # Builds a tiny image carrying just the cmd/soak binary. Used by
 # scripts/soak.sh to run the traffic generator from inside a kind cluster
 # so it hits the broker Service VIP (and thus gets real round-robin
