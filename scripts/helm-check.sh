@@ -70,6 +70,7 @@ renders() {
         --set metrics.enabled=true \
         --set serviceMonitor.enabled=true \
         --set grafana.dashboard.enabled=true \
+        --set grafana.dashboard.instanceSelector.matchLabels.foo=bar \
         --set networkPolicy.enabled=true \
         --set autoscaling.enabled=true \
         --set podDisruptionBudget.enabled=true

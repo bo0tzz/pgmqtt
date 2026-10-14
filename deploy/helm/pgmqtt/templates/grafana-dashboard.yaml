@@ -10,8 +10,24 @@ metadata:
 spec:
   resyncPeriod: {{ .Values.grafana.dashboard.resyncPeriod | quote }}
   allowCrossNamespaceImport: {{ .Values.grafana.dashboard.allowCrossNamespaceImport }}
+  {{- /* Helm deep-merges values maps, so a default `dashboards: grafana`
+       matchLabel would stick alongside any label the user sets (#39). The
+       default lives here instead and applies only when the selector is
+       empty. Null-valued labels are dropped so the pre-fix workaround of
+       `matchLabels.dashboards=null` keeps rendering a valid selector. */}}
+  {{- $sel := .Values.grafana.dashboard.instanceSelector | default dict }}
+  {{- $labels := dict }}
+  {{- range $k, $v := $sel.matchLabels | default dict }}
+  {{- if not (kindIs "invalid" $v) }}{{ $_ := set $labels $k $v }}{{ end }}
+  {{- end }}
+  {{- $sel = merge (dict) (omit $sel "matchLabels") (ternary (dict "matchLabels" $labels) (dict) (gt (len $labels) 0)) }}
   instanceSelector:
-    {{- toYaml .Values.grafana.dashboard.instanceSelector | nindent 4 }}
+    {{- if $sel }}
+    {{- toYaml $sel | nindent 4 }}
+    {{- else }}
+    matchLabels:
+      dashboards: grafana
+    {{- end }}
   {{- with .Values.grafana.dashboard.folder }}
   folder: {{ . | quote }}
   {{- end }}

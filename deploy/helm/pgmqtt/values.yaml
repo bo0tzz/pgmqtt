@@ -131,9 +131,10 @@ metrics:
 grafana:
   dashboard:
     enabled: false
-    instanceSelector:
-      matchLabels:
-        dashboards: grafana
+    ## Selector for the target Grafana instance(s). Empty selects
+    ## `matchLabels: {dashboards: grafana}`; anything set here replaces
+    ## that default wholesale rather than merging with it.
+    instanceSelector: {}
     folder: ""
     resyncPeriod: 5m
     allowCrossNamespaceImport: false
