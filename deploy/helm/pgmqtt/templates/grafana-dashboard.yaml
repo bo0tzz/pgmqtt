@@ -6,6 +6,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
 spec:
   resyncPeriod: {{ .Values.grafana.dashboard.resyncPeriod | quote }}
   allowCrossNamespaceImport: {{ .Values.grafana.dashboard.allowCrossNamespaceImport }}

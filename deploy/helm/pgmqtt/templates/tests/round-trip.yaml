@@ -13,6 +13,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
   annotations:
     "helm.sh/hook": test
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
