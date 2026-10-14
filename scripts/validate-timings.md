@@ -20,7 +20,7 @@ Phases:
 | `go vet`          |  ~2s  | `go vet ./...`                                         |
 | `make test-race`  |  ~5s  | `go test ./... -count=1 -race -timeout 10m` (test-light packages — full unit suite is in tier2) |
 | `helm lint`       |  <1s  | `helm lint deploy/helm/pgmqtt`                         |
-| `helm template`   |  ~2s  | three render variants: defaults, multi-replica + UI, external secret + bcrypt-cost override |
+| `helm template`   |  ~3s  | four render variants (defaults, multi-replica + UI, external secret + bcrypt-cost override, every optional resource on), each strict-parsed with `kustomize build` |
 
 The `go test -race` time is misleading: most of pgmqtt's heavy tests are
 gated on `testcontainers` and only run when `PGMQTT_TEST_DATABASE_URL` is
@@ -30,7 +30,7 @@ Coverage of the test-DB path lives in tier2's `make coverage` phase.
 **Bug classes caught here that nothing else does:**
 - Type errors / missing-import / compile fails (fast feedback).
 - Static `go vet` issues (mostly printf-vet and copy-by-value-of-Mutex).
-- Helm chart structural issues (`helm lint` + `helm template`) — typoed
+- Helm chart structural issues (`helm lint` + `helm template` + strict parse) — typoed
   values keys, indentation drift, render-time-only Sprig errors. The
   recent strict int-parsing fix (`maxPacketSize=1` silently accepted)
   was caught at `helm template` time.

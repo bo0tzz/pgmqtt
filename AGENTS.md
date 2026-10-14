@@ -18,9 +18,10 @@ Short version:
 
 What each tier closes that the prior tier misses:
 
-- **tier1** — compile / vet / race-light unit tests / chart lint+template.
-  Catches static bugs, helm rendering issues (typoed values keys, scientific-
-  notation in int fields), small-package data races.
+- **tier1** — compile / vet / race-light unit tests / chart lint+template+
+  strict parse. Catches static bugs, helm rendering issues (typoed values
+  keys, scientific-notation in int fields, duplicate label keys that helm
+  emits but Flux/kustomize reject), small-package data races.
 - **tier2** — full unit suite against a testcontainer Postgres + paho v3+v5
   conformance against a single broker. Catches SQL path regressions and
   MQTT protocol shape bugs (reason codes, retain, will-delay, takeover

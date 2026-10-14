@@ -80,11 +80,10 @@ jobs:
       - uses: azure/setup-helm@v5
         with:
           version: latest
-      - name: lint
-        run: |
-          helm lint deploy/helm/pgmqtt --set database.url='postgres://x/y'
-          helm template deploy/helm/pgmqtt --set database.url='postgres://x/y' > /tmp/rendered.yaml
-          test -s /tmp/rendered.yaml
+      - name: lint + render + strict parse
+        # kustomize ships on ubuntu-latest; it strict-parses each render
+        # the way Flux's post-renderer does (issue #38).
+        run: bash scripts/helm-check.sh
 
   conformance:
     name: paho v3+v5 (single broker)

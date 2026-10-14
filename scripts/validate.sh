@@ -121,35 +121,11 @@ govulncheck_phase() {
     govulncheck ./...
 }
 
-t1_helm_lint() {
-    helm lint deploy/helm/pgmqtt --set database.url='postgres://x/y'
-}
-
-# Render the chart with a few representative value sets so a typo in
-# values.yaml or a misuse of a value in a template fails here, not in
-# someone's `helm install`.
-t1_helm_template() {
-    helm template deploy/helm/pgmqtt \
-        --set database.url='postgres://x/y' \
-        > /tmp/pgmqtt-render-default.yaml
-    test -s /tmp/pgmqtt-render-default.yaml
-
-    # 3 replicas + UI on + tests off (operator-style install).
-    helm template deploy/helm/pgmqtt \
-        --set database.url='postgres://x/y' \
-        --set replicaCount=3 \
-        --set ui.enabled=true \
-        --set tests.enabled=false \
-        > /tmp/pgmqtt-render-multi.yaml
-    test -s /tmp/pgmqtt-render-multi.yaml
-
-    # External secret + bcrypt cost override (homelab-style install).
-    helm template deploy/helm/pgmqtt \
-        --set database.existingSecret=pgmqtt-db \
-        --set operator.bcryptCost=4 \
-        > /tmp/pgmqtt-render-secret.yaml
-    test -s /tmp/pgmqtt-render-secret.yaml
-}
+# Chart lint + multi-variant render + strict YAML parse via kustomize.
+# Shared with the CI helm-lint job (scripts/helm-check.sh) so the value
+# sets exercised locally and in CI can't drift apart.
+t1_helm_lint()     { bash scripts/helm-check.sh lint; }
+t1_helm_template() { bash scripts/helm-check.sh render; }
 
 run_tier1() {
     phase "go vet"           t1_vet
