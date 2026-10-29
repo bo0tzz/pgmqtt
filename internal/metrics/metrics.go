@@ -286,9 +286,11 @@ func New() *Metrics {
 		}, []string{"reason"}),
 		ConnectDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_connect_dropped_total",
-			Help: "CONNECTs dropped pre-CONNACK by the per-IP limiter, " +
-				"labelled by reason (rate_limit, penalty_box). " +
-				"bcrypt-CPU DoS mitigation.",
+			Help: "CONNECTs dropped without a CONNACK, labelled by reason: " +
+				"rate_limit / penalty_box (per-IP limiter, bcrypt-CPU DoS " +
+				"mitigation) or db_error (Postgres unreachable mid-CONNECT; " +
+				"socket closed so the client retries instead of treating a " +
+				"CONNACK reject as final).",
 		}, []string{"reason"}),
 		SubscribesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgmqtt_subscribes_total",

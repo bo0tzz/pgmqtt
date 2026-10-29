@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -119,6 +120,9 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	password := string(pk.Connect.Password)
 	if username != "" || !c.eng.cfg.AllowAnonymous {
 		if err := Authenticate(ctx, c.eng.pool, username, password); err != nil {
+			if !errors.Is(err, ErrAuthFailed) {
+				return c.dropConnectOnInfraError("authenticate", err)
+			}
 			// Tick the per-IP auth-failure bucket so a stream of
 			// bad-credential CONNECTs from a single source IP
 			// eventually trips the penalty box (subsequent CONNECTs
@@ -207,8 +211,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	// Take ownership in a single transaction.
 	prevBroker, prevToken, newSession, err := c.takeOwnership(ctx, pk)
 	if err != nil {
-		_ = c.writeConnackReject(pv, cackUnspecified)
-		return err
+		return c.dropConnectOnInfraError("take ownership", err)
 	}
 	c.eng.logger.Debug("takeover", "client", c.clientID,
 		"prev_broker", prevBroker, "new_broker", c.eng.BrokerID(),
@@ -242,15 +245,15 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	// will_fire_at active after a successful clean reconnect.
 	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return c.dropConnectOnInfraError("session cleanup", err)
 	}
 	defer tx.Rollback(ctx)
 	if c.cleanStart {
 		if _, err := tx.Exec(ctx, `DELETE FROM subscriptions WHERE client_id=$1`, c.clientID); err != nil {
-			return err
+			return c.dropConnectOnInfraError("session cleanup", err)
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM deliveries WHERE client_id=$1`, c.clientID); err != nil {
-			return err
+			return c.dropConnectOnInfraError("session cleanup", err)
 		}
 		// inbound_qos2 has FK ON DELETE CASCADE on (client_id) → sessions, but
 		// takeOwnership above re-uses the existing sessions row instead of
@@ -261,16 +264,16 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		// fan out). Drop the stale tombstones to make cleanStart actually
 		// clean.
 		if _, err := tx.Exec(ctx, `DELETE FROM inbound_qos2 WHERE client_id=$1`, c.clientID); err != nil {
-			return err
+			return c.dropConnectOnInfraError("session cleanup", err)
 		}
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE sessions SET will_fire_at=NULL, session_expires_at=NULL WHERE client_id=$1`,
 		c.clientID); err != nil {
-		return err
+		return c.dropConnectOnInfraError("session cleanup", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return c.dropConnectOnInfraError("session cleanup", err)
 	}
 
 	sessionPresent := !c.cleanStart && !newSession
@@ -341,6 +344,40 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		c.runDrainLoop(ctx)
 	}()
 	return nil
+}
+
+// errConnectInfra marks a CONNECT that failed on broker-side infrastructure
+// (Postgres unreachable, pool closed, query timeout, engine shutting down)
+// rather than on anything the client sent.
+var errConnectInfra = errors.New("connect dropped on infrastructure error")
+
+// dropConnectOnInfraError handles a CONNECT that failed for reasons that
+// are ours, not the client's. We close the socket WITHOUT a CONNACK:
+//
+//   - A CONNACK reject is a verdict on the client's request, and every
+//     reject code is treated as final by common client libraries. MQTT.js
+//     (zigbee2mqtt, Home Assistant add-ons, Node-RED) sets
+//     reconnectSuppressed on ANY non-zero CONNACK reason code — 0x88
+//     Server unavailable included — and never retries unless the app
+//     opted into reconnectOnConnackError, which zigbee2mqtt doesn't
+//     (#43). A bare socket close is the one outcome every client's
+//     normal reconnect/backoff path handles.
+//   - Nothing is recorded against the client's IP: a DB blip during a
+//     reconnect storm must not land a NAT'd fleet in the penalty box
+//     for 60 s after Postgres is back.
+//   - Counted under connect_dropped_total{reason="db_error"} rather than
+//     auth_failures_total, so an outage doesn't read as credential
+//     stuffing on the dashboard.
+//
+// Both MQTT 3.1.1 [MQTT-3.1.4-1] and 5.0 [MQTT-3.1.4-6] allow the server
+// to close the Network Connection without sending a CONNACK.
+func (c *Conn) dropConnectOnInfraError(stage string, err error) error {
+	if c.eng.metrics != nil {
+		c.eng.metrics.ConnectDroppedTotal.WithLabelValues("db_error").Inc()
+	}
+	c.eng.logger.Warn("connect dropped on database error; closing without CONNACK so the client retries",
+		"client", c.clientID, "remote", c.nc.RemoteAddr(), "stage", stage, "err", err)
+	return fmt.Errorf("%w: %s: %v", errConnectInfra, stage, err)
 }
 
 func (c *Conn) writeConnackReject(pv byte, reason byte) error {

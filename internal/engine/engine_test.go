@@ -1192,3 +1192,72 @@ func TestQoS1OverflowEmitsMetric(t *testing.T) {
 		t.Fatalf("pgmqtt_deliveries_dropped_total{reason=overflow} did not increment: before=%v after=%v", metricsBefore, got)
 	}
 }
+
+// TestConnectDBErrorClosesWithoutConnack is the regression guard for #43.
+// When Postgres is unreachable mid-CONNECT (CNPG switchover, pool
+// closed), the broker used to reply CONNACK 0x86 "Bad username or
+// password" and tick the per-IP auth-failure bucket. MQTT.js treats ANY
+// refused CONNACK as final (reconnectSuppressed), so zigbee2mqtt stayed
+// disconnected until restarted. The fix closes the socket without a
+// CONNACK — the one outcome every client retries from — and counts the
+// drop under connect_dropped_total{reason="db_error"} instead.
+func TestConnectDBErrorClosesWithoutConnack(t *testing.T) {
+	t.Parallel()
+	h := enginetest.NewHarness(t)
+	// Simulate the database going away: a closed pool makes every query
+	// fail with a non-credential error, the same shape a switchover
+	// produces ("failed to connect ... no route to host").
+	h.Pool.Close()
+
+	m := h.Engine.Metrics()
+	badBefore := testutil.ToFloat64(m.AuthFailuresTotal.WithLabelValues("bad_credentials"))
+	otherBefore := testutil.ToFloat64(m.AuthFailuresTotal.WithLabelValues("other"))
+	dbBefore := testutil.ToFloat64(m.ConnectDroppedTotal.WithLabelValues("db_error"))
+
+	c, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte("MQTT"),
+			Clean:            true,
+			Keepalive:        60,
+			ClientIdentifier: "db-error-client",
+			Username:         []byte("test"),
+			UsernameFlag:     true,
+			Password:         []byte("test"),
+			PasswordFlag:     true,
+		},
+	}
+	if err := mqttwire.Write(c, pk); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	r := mqttwire.NewReader(c)
+	r.ProtocolVersion = mqttwire.ProtocolMQTT5
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	resp, err := r.Read()
+	if err == nil {
+		t.Fatalf("expected socket close without CONNACK, got packet type %d reason 0x%02X",
+			resp.FixedHeader.Type, resp.ReasonCode)
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("broker held the socket open instead of closing it")
+	}
+
+	if got := testutil.ToFloat64(m.AuthFailuresTotal.WithLabelValues("bad_credentials")); got != badBefore {
+		t.Fatalf("bad_credentials counter moved on a DB error: %v -> %v", badBefore, got)
+	}
+	if got := testutil.ToFloat64(m.AuthFailuresTotal.WithLabelValues("other")); got != otherBefore {
+		t.Fatalf("auth_failures_total{other} moved on a DB error: %v -> %v", otherBefore, got)
+	}
+	if got := testutil.ToFloat64(m.ConnectDroppedTotal.WithLabelValues("db_error")); got != dbBefore+1 {
+		t.Fatalf("connect_dropped_total{db_error}: want %v, got %v", dbBefore+1, got)
+	}
+}

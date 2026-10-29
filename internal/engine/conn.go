@@ -179,7 +179,11 @@ func (c *Conn) run(ctx context.Context) {
 		return
 	}
 	if err := c.handleConnect(ctx, &pk); err != nil {
-		c.eng.logger.Info("connect rejected", "err", err)
+		// Infra drops are already Warn-logged with stage + remote by
+		// dropConnectOnInfraError; don't double-log them as rejections.
+		if !errors.Is(err, errConnectInfra) {
+			c.eng.logger.Info("connect rejected", "err", err)
+		}
 		return
 	}
 
