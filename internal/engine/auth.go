@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,16 +15,36 @@ import (
 // indistinguishable response is intentional.
 var ErrAuthFailed = errors.New("authentication failed")
 
-// dummyHash is a precomputed bcrypt hash of a constant string at our
-// default cost. It's compared against (every time the SELECT returns no
-// rows) purely so the no-rows branch and the bad-password branch take
-// indistinguishable wall-clock time. The constant was generated once at
-// build time to avoid a one-off ~75 ms startup penalty per process.
-//
-// CWE-208 mitigation: without this guard, "user doesn't exist" and
-// "wrong password" would have measurably different wall-clock times
-// (one bcrypt vs zero), revealing username existence.
-var dummyHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+// dummyHashTail is the salt and digest part of a bcrypt hash, without the
+// "$2a$<cost>$" prefix. CompareHashAndPassword takes the cost from the
+// prefix and runs the whole key schedule before it compares digests, so
+// putting any cost in front of this tail yields a comparison that takes as
+// long as a real one at that cost. That avoids generating a hash at startup,
+// which at a high configured cost takes seconds.
+const dummyHashTail = "N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+
+// dummyHash is compared against whenever the SELECT returns no rows, so
+// that "user doesn't exist" and "wrong password" take the same wall-clock
+// time and usernames can't be enumerated by timing (CWE-208). That only
+// holds while its cost equals the cost of the stored hashes, which the
+// operator writes at PGMQTT_BCRYPT_COST: see SetAuthBcryptCost.
+var dummyHash atomic.Pointer[[]byte]
+
+func init() {
+	SetAuthBcryptCost(bcrypt.DefaultCost)
+}
+
+// SetAuthBcryptCost sets the cost of the comparison Authenticate runs for
+// an unknown username. Call it with the cost the operator hashes passwords
+// at, before serving connections. A cost bcrypt would reject falls back to
+// bcrypt.DefaultCost.
+func SetAuthBcryptCost(cost int) {
+	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		cost = bcrypt.DefaultCost
+	}
+	h := []byte(fmt.Sprintf("$2a$%02d$%s", cost, dummyHashTail))
+	dummyHash.Store(&h)
+}
 
 // Authenticate verifies username/password against the users table.
 // Empty username allows anonymous access only if the env opts in (not yet wired);
@@ -35,15 +57,17 @@ func Authenticate(ctx context.Context, pool *pgxpool.Pool, username, password st
 	err := pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, username).Scan(&hash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Run a full bcrypt comparison against a dummy hash so the
-			// no-rows path takes the same wall-clock time as the
-			// wrong-password path. Discard the result.
-			_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+			_ = bcrypt.CompareHashAndPassword(*dummyHash.Load(), []byte(password))
 			return ErrAuthFailed
 		}
 		return err
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
+	matched := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+	// A row whose hash verifies the empty password is an account without a
+	// credential. The operator refuses to create one; this refuses to honour
+	// one that got into the table some other way. Checked after the
+	// comparison so the reply takes as long as any other failure.
+	if !matched || password == "" {
 		return ErrAuthFailed
 	}
 	return nil

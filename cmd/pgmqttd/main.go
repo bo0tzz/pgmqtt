@@ -137,6 +137,11 @@ func main() {
 	}
 	go jt.Run(ctx)
 
+	// The operator below hashes passwords at cfg.BcryptCost. The engine's
+	// comparison for an unknown username has to cost the same, or usernames
+	// can be told apart by response time.
+	engine.SetAuthBcryptCost(cfg.BcryptCost)
+
 	// Operator uses controller-runtime's K8s Lease leader election.
 	// Multiple Pods call operator.Run concurrently; exactly one wins
 	// reconciliation responsibility at a time. Loss/handoff is handled
