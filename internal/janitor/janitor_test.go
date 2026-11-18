@@ -698,3 +698,38 @@ func TestJanitorRefreshStateGauges(t *testing.T) {
 		}
 	}
 }
+
+// TestJanitorJobsRunOnEveryDueTickDespiteJitter: a ticker does not fire
+// exactly a period apart. A one-second job used to be skipped whenever a
+// tick came a little under a second after its last run, so it ran about
+// 40 times a minute instead of 60.
+func TestJanitorJobsRunOnEveryDueTickDespiteJitter(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	mtx := metrics.New()
+	jt := janitor.New(mh.Pool, mh.Pods[0].Engine, warnLogger())
+	jt.SetMetrics(mtx)
+
+	base := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	var now time.Time
+	jt.SetNowForTest(func() time.Time { return now })
+	offsets := []time.Duration{0, 990, 1985, 2990, 3980, 4995, 5990}
+	for _, ms := range offsets {
+		now = base.Add(ms * time.Millisecond)
+		if err := jt.Tick(context.Background()); err != nil {
+			t.Fatalf("tick: %v", err)
+		}
+	}
+
+	h, err := mtx.JanitorTickSeconds.GetMetricWithLabelValues(janitor.JobFireDueWills)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pb dto.Metric
+	if err := h.(prometheus.Metric).Write(&pb); err != nil {
+		t.Fatal(err)
+	}
+	if got := pb.GetHistogram().GetSampleCount(); got != uint64(len(offsets)) {
+		t.Errorf("fire_due_wills ran on %d of %d ticks about a second apart", got, len(offsets))
+	}
+}
