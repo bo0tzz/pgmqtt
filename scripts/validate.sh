@@ -97,9 +97,16 @@ phase() {
     local name="$1"; shift
     echo
     echo "==> [$TIER] $name"
-    local start end rc=0
+    local start end rc
     start=$(date +%s)
-    "$@" || rc=$?
+    # Not `"$@" || rc=$?`: bash ignores errexit inside a function called
+    # from an && / || list, so a command failing mid-phase was masked by
+    # whatever ran after it (a failed coverage run by `go tool cover`).
+    # A subshell outside any list keeps errexit in force.
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    set -e
     end=$(date +%s)
     PHASES+=("$((end - start))s  $name  rc=$rc")
     if [ $rc -ne 0 ]; then
@@ -157,13 +164,22 @@ t2_coverage() {
 
 # Boot a single-broker pgmqttd (TCP only) against an ephemeral postgres
 # container, run the Paho v3+v5 conformance wrapper, capture results.
-T2_PG_PORT=55435
-T2_BROKER_PORT=11885
+# Ports, container and scratch files are per run, so that worktrees can
+# run tier2 at the same time without sharing a broker.
 T2_PG_NAME="pgmqtt-validate-pg-$$"
+T2_BIN="/tmp/pgmqttd-validate-$$"
+T2_LOG="/tmp/pgmqttd-validate-$$.log"
+T2_PID="/tmp/pgmqttd-validate-$$.pid"
+T2_PG_PORT=""
+T2_BROKER_PORT=""
+
+free_port() {
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
 t2_paho_setup() {
-    docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
     docker run --rm -d --name "$T2_PG_NAME" \
-        -p "$T2_PG_PORT:5432" \
+        -p "127.0.0.1:$T2_PG_PORT:5432" \
         -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt -e POSTGRES_DB=pgmqtt \
         postgres:18-alpine \
         -c shared_preload_libraries=pg_stat_statements >/dev/null
@@ -172,26 +188,29 @@ t2_paho_setup() {
         if docker exec "$T2_PG_NAME" pg_isready -U pgmqtt >/dev/null 2>&1; then break; fi
         sleep 1
     done
-    go build -o /tmp/pgmqttd-validate ./cmd/pgmqttd
-    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@localhost:$T2_PG_PORT/pgmqtt?sslmode=disable" \
+    go build -o "$T2_BIN" ./cmd/pgmqttd
+    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@127.0.0.1:$T2_PG_PORT/pgmqtt?sslmode=disable" \
     PGMQTT_TCP_ADDR="127.0.0.1:$T2_BROKER_PORT" \
     PGMQTT_WS_ADDR= \
     PGMQTT_METRICS_ADDR= \
     PGMQTT_ALLOW_ANONYMOUS=true \
-        /tmp/pgmqttd-validate >/tmp/pgmqttd-validate.log 2>&1 &
-    echo $! >/tmp/pgmqttd-validate.pid
+        "$T2_BIN" >"$T2_LOG" 2>&1 &
+    echo $! >"$T2_PID"
     # Wait for the broker to start listening.
     for _ in $(seq 1 30); do
-        if (echo > /dev/tcp/127.0.0.1/$T2_BROKER_PORT) 2>/dev/null; then break; fi
+        if (echo > "/dev/tcp/127.0.0.1/$T2_BROKER_PORT") 2>/dev/null; then return 0; fi
         sleep 1
     done
+    echo "validate.sh: broker is not listening on 127.0.0.1:$T2_BROKER_PORT; see $T2_LOG" >&2
+    return 1
 }
 
 t2_paho_teardown() {
-    if [ -f /tmp/pgmqttd-validate.pid ]; then
-        kill "$(cat /tmp/pgmqttd-validate.pid)" 2>/dev/null || true
-        rm -f /tmp/pgmqttd-validate.pid
+    if [ -f "$T2_PID" ]; then
+        kill "$(cat "$T2_PID")" 2>/dev/null || true
+        rm -f "$T2_PID"
     fi
+    rm -f "$T2_BIN"
     docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
 }
 
@@ -207,11 +226,15 @@ t2_paho_run() {
 run_tier2() {
     run_tier1
     phase "make coverage"    t2_coverage
-    phase "paho setup"       t2_paho_setup
+    T2_PG_PORT="$(free_port)"
+    T2_BROKER_PORT="$(free_port)"
     trap t2_paho_teardown EXIT
+    phase "paho setup"       t2_paho_setup
     phase "paho v3+v5"       t2_paho_run
     phase "paho teardown"    t2_paho_teardown
     trap - EXIT
+    # Kept until here so a failed run leaves the broker log behind.
+    rm -f "$T2_LOG"
 }
 
 # ---------- tier3 phases ----------

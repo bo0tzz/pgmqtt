@@ -114,7 +114,7 @@ jobs:
         with:
           name: conformance-${{ github.run_id }}
           path: |
-            /tmp/pgmqttd-validate.log
+            /tmp/pgmqttd-validate-*.log
             coverage.out
             coverage.txt
           if-no-files-found: warn
