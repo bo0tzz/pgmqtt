@@ -28,10 +28,12 @@ Create an MQTT user (the broker reads from Postgres via the operator):
 {{- if not .Values.networkPolicy.enabled }}
 
 ⚠  NetworkPolicy is OFF.
-   The chart's ClusterRole grants the broker SA read access to Secrets
-   cluster-wide (so the operator can resolve passwordSecretRef across
-   namespaces). With no NetworkPolicy, an RCE on the broker pod would
-   expose every Secret in the cluster.
+   The chart's ClusterRole lets the broker ServiceAccount read, create
+   and overwrite Secrets in every namespace (the operator writes each
+   User's credentials Secret next to the User and reads its
+   passwordSecretRef). Code execution in a broker pod gets the same
+   access. A NetworkPolicy does not take that access away; it limits
+   what else such a pod can reach and where it can send what it reads.
 
    For homelab/production: enable networkPolicy with `egress.postgres`
    pinned to your CNPG/postgres-operator selector before exposing the
