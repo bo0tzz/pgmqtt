@@ -419,10 +419,10 @@ runtimeClassName: ""
 automountServiceAccountToken: true
 
 ## Liveness/readiness probes. The default thresholds are conservative for
-## normal startup; production operators
-## frequently bump failureThreshold / timeoutSeconds when their Postgres is
-## occasionally slow (managed PG vacuums, PITR replays, etc.) so a brief
-## stall doesn't restart the broker mid-stream.
+## normal startup; production operators frequently bump failureThreshold /
+## timeoutSeconds when their Postgres is occasionally slow (managed PG
+## vacuums, PITR replays, etc.) so a brief stall doesn't restart the broker
+## mid-stream.
 probes:
   enabled: true
   ## Probe mode. true = httpGet against /healthz/{live,ready} on the
