@@ -167,3 +167,58 @@ func TestSessionsHasNoNextPacketIDColumn(t *testing.T) {
 		t.Error("mqtt_next_packet_id() should have been dropped by migration 0009")
 	}
 }
+
+// TestMigrateIgnoresPoolStatementTimeout holds the migration advisory lock
+// from a second session for longer than the pool's statement_timeout, the
+// way a peer pod running a slow migration would.
+func TestMigrateIgnoresPoolStatementTimeout(t *testing.T) {
+	t.Parallel()
+	url := dbtest.FreshURL(t)
+	ctx := context.Background()
+
+	holder, err := db.Open(ctx, url, db.Options{})
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	defer holder.Close()
+	hc, err := holder.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	defer hc.Release()
+	if _, err := hc.Exec(ctx, `SELECT pg_advisory_lock($1)`, db.MigrateLockKeyForTest); err != nil {
+		t.Fatalf("take lock: %v", err)
+	}
+
+	pool, err := db.Open(ctx, url, db.Options{StatementTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer pool.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Migrate(ctx, pool) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Migrate returned while the lock was held elsewhere: %v", err)
+	case <-time.After(time.Second):
+	}
+	if _, err := hc.Exec(ctx, `SELECT pg_advisory_unlock($1)`, db.MigrateLockKeyForTest); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Migrate did not finish after the lock was released")
+	}
+
+	// The pool's own connections must still carry the timeout.
+	_, err = pool.Exec(ctx, `SELECT pg_sleep(2)`)
+	if err == nil || !strings.Contains(err.Error(), "57014") {
+		t.Fatalf("pool statement_timeout no longer applies after Migrate: %v", err)
+	}
+}
