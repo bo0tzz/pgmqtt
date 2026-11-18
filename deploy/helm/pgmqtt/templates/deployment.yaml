@@ -1,3 +1,6 @@
+{{- if not (or .Values.listeners.tcp.enabled .Values.listeners.ws.enabled) }}
+{{- fail "listeners.tcp.enabled and listeners.ws.enabled are both false: pgmqttd exits at startup without a listener" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -170,7 +173,7 @@ spec:
             httpGet:
               path: /healthz/live
               port: metrics
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            initialDelaySeconds: {{ int .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
@@ -179,7 +182,7 @@ spec:
             httpGet:
               path: /healthz/ready
               port: metrics
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            initialDelaySeconds: {{ int .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
@@ -188,7 +191,7 @@ spec:
           livenessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            initialDelaySeconds: {{ int .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
@@ -196,7 +199,7 @@ spec:
           readinessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            initialDelaySeconds: {{ int .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}

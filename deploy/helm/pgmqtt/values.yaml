@@ -1,5 +1,12 @@
 # Default values for pgmqtt.
 
+## nameOverride replaces the chart name in the app.kubernetes.io/name label
+## and in the default resource name (<release>-<name>, or just <release>
+## when the release name already contains it). fullnameOverride replaces
+## the resource name outright.
+nameOverride: ""
+fullnameOverride: ""
+
 ## Number of pgmqttd Pods. Each Pod is fully stateless w.r.t. local state;
 ## scale freely. Ignored when autoscaling.enabled=true: the Deployment is
 ## then rendered without `replicas` so an upgrade does not undo the HPA.
@@ -60,7 +67,7 @@ extraEnvFrom: []
 logging:
   format: text
 
-## TCP / WS listener configuration.
+## TCP / WS listener configuration. At least one listener must be enabled.
 listeners:
   tcp:
     enabled: true
@@ -476,6 +483,7 @@ janitor:
 ##   receiveMaximum: cap on un-ACKed inbound QoS>0 PUBLISHes per conn.
 ##   keepaliveMaxSec: server cap on the negotiated keepalive interval; v5
 ##                    clients are notified via the ServerKeepAlive property.
+##                    Must be at least 1: the broker refuses to start on 0.
 ##
 ## TopicAliasMaximum is intentionally not exposed: the broker does not
 ## maintain an inbound topic-alias map, so we hardcode the advertised
@@ -518,4 +526,5 @@ limits:
   ## value. 0 disables the post-CONNECT cap (codec falls back to 256 MiB,
   ## the protocol's variable-byte-integer max). Default 16 MiB suits
   ## typical IoT/telemetry payloads with headroom for v5 properties.
+  ## Maximum 268435455; the broker refuses to start on anything larger.
   maxPacketSize: 16777216

@@ -145,6 +145,32 @@ renders() {
     lacks hpa-floor-1 '  replicas:'
     has hpa-floor-1 'minAvailable: 0'
 
+    # Values the binary refuses at startup must not get past the chart.
+    refuses keepalive-zero 'keepaliveMaxSec' \
+        --set database.url='postgres://x/y' \
+        --set v5.keepaliveMaxSec=0
+    refuses packet-size-over-max 'maxPacketSize' \
+        --set database.url='postgres://x/y' \
+        --set limits.maxPacketSize=268435456
+    refuses no-listeners 'are both false' \
+        --set database.url='postgres://x/y' \
+        --set listeners.tcp.enabled=false \
+        --set listeners.ws.enabled=false
+
+    # Keys the helpers read (and `global`, which Helm hands to subcharts)
+    # must pass the schema; an explicit 0 must not turn into the default.
+    render overrides \
+        --set database.url='postgres://x/y' \
+        --set nameOverride=broker \
+        --set fullnameOverride=mqtt \
+        --set global.anything=x \
+        --set probes.liveness.initialDelaySeconds=0 \
+        --set probes.readiness.initialDelaySeconds=0
+    has overrides 'app.kubernetes.io/name: broker'
+    has overrides 'name: mqtt-leader-election'
+    lacks overrides 'initialDelaySeconds: 5'
+    lacks overrides 'initialDelaySeconds: 2'
+
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \
         --set database.url='postgres://x/y' \
