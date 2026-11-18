@@ -46,6 +46,14 @@ func NewHarness(t *testing.T) *Harness {
 // KeepAliveMultiplier) for a single test.
 func NewHarnessWith(t *testing.T, customise PodSetup) *Harness {
 	t.Helper()
+	return NewHarnessConfig(t, nil, customise)
+}
+
+// NewHarnessConfig is NewHarnessWith plus a hook that edits the broker's
+// config before the engine is built, for settings that are only read at
+// construction or Serve (a WebSocket listener, for one).
+func NewHarnessConfig(t *testing.T, configure func(*config.Config), customise PodSetup) *Harness {
+	t.Helper()
 	url := dbtest.FreshURL(t)
 	pool, err := pgxpoolOpen(t, url)
 	if err != nil {
@@ -53,7 +61,7 @@ func NewHarnessWith(t *testing.T, customise PodSetup) *Harness {
 	}
 	seedUser(t, pool, "test", "test")
 
-	eng, brokerID, addr, cancel, done := startBroker(t, pool, url, customise)
+	eng, brokerID, addr, cancel, done := startBrokerConfig(t, pool, url, configure, customise)
 	h := &Harness{
 		T:         t,
 		Pool:      pool,
@@ -75,10 +83,20 @@ func startBroker(t *testing.T, pool *pgxpool.Pool, url string, customise PodSetu
 	*engine.Engine, uuid.UUID, string, context.CancelFunc, chan struct{},
 ) {
 	t.Helper()
+	return startBrokerConfig(t, pool, url, nil, customise)
+}
+
+func startBrokerConfig(t *testing.T, pool *pgxpool.Pool, url string, configure func(*config.Config), customise PodSetup) (
+	*engine.Engine, uuid.UUID, string, context.CancelFunc, chan struct{},
+) {
+	t.Helper()
 	cfg := &config.Config{
 		DatabaseURL: url,
 		TCPAddr:     "127.0.0.1:0",
 		WSAddr:      "",
+	}
+	if configure != nil {
+		configure(cfg)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if testing.Verbose() {
