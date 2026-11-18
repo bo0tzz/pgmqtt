@@ -649,6 +649,11 @@ func (e *Engine) KickAllDrains() {
 // function is the companion that restores `broker_id` so NOTIFY fan-out
 // continues to route to us.
 //
+// Since 2026-11 the janitor no longer reaps on a free lock alone (see
+// janitor.DeadBrokerGrace), so a reconnecting broker should find its rows
+// untouched. This is a backstop for the ownership columns only: it does
+// not restore will_* and must not be relied on to undo a reap.
+//
 // session_token guard: if a Conn for the same client_id has already
 // taken over from us (via the peer-broker takeover NOTIFY path), the
 // session row's token will have rotated away from our captured value

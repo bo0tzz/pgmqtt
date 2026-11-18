@@ -1,5 +1,7 @@
 package listener
 
+import "time"
+
 // Test-only hooks bridging unexported package state to the external
 // listener_test package. Production callers never see these.
 
@@ -29,3 +31,11 @@ const ReconnectInitialBackoffForTest = reconnectInitialBackoff
 
 // ReconnectMaxAttemptsForTest exposes reconnectMaxAttempts for tests.
 const ReconnectMaxAttemptsForTest = reconnectMaxAttempts
+
+// SetReconnectDeadlineForTest shortens the lock-reacquire deadline. Call
+// before Start and restore after Stop: the listener goroutine reads it.
+func SetReconnectDeadlineForTest(d time.Duration) (restore func()) {
+	prev := reconnectDeadline
+	reconnectDeadline = d
+	return func() { reconnectDeadline = prev }
+}

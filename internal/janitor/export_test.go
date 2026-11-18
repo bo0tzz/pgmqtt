@@ -17,7 +17,7 @@ func (j *Janitor) FireDueWillsForTest(ctx context.Context) error {
 // Returns (claimed, err) — claimed is true iff this caller won the
 // per-broker advisory lock and performed the takeover.
 func (j *Janitor) HandleDeadBrokerForTest(ctx context.Context, brokerID uuid.UUID) (bool, error) {
-	return j.handleDeadBroker(ctx, brokerID)
+	return j.handleDeadBroker(ctx, brokerID, j.nowFn())
 }
 
 // SetNowForTest substitutes a fake clock function for the per-job

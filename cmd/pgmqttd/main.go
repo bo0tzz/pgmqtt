@@ -131,6 +131,7 @@ func main() {
 	// needed. See janitor package doc for the full safety analysis.
 	jt := janitor.New(pool, eng, logger)
 	jt.SetMetrics(mtx)
+	jt.SetLockEpoch(lst.LockEpoch)
 	if cfg.JanitorInterval > 0 {
 		jt.SetInterval(cfg.JanitorInterval)
 	}

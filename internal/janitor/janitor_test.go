@@ -59,6 +59,7 @@ func TestJanitorFiresWillFromDeadBroker(t *testing.T) {
 	}
 
 	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetDeadBrokerGrace(0) // the seeded broker is already known dead
 	if err := jt.Tick(context.Background()); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
@@ -118,6 +119,7 @@ func TestJanitorWillDelayRespectedAcrossDeadBroker(t *testing.T) {
 	}
 
 	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetDeadBrokerGrace(0) // the seeded broker is already known dead
 	if err := jt.Tick(context.Background()); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
@@ -458,6 +460,7 @@ func TestJanitorConcurrentHandleDeadBrokerLockExclusive(t *testing.T) {
 
 	mtx := metrics.New()
 	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
+	jt.SetDeadBrokerGrace(0) // the seeded broker is already known dead
 	jt.SetMetrics(mtx)
 
 	const n = 4

@@ -2,8 +2,9 @@
 // sweep. Every Pod runs an independent Tick loop. The work is concurrency-
 // safe by construction:
 //
-//   - findDeadBrokerCandidates + handleDeadBroker uses pg_try_advisory_lock
-//     per broker_id, so only one Pod claims any given dead broker at a time.
+//   - reapBroker takes pg_try_advisory_lock per broker_id, so only one Pod
+//     claims any given dead broker at a time.
+//     A free lock alone is not proof of death — see DeadBrokerGrace.
 //   - fireDueWills uses SELECT … FOR UPDATE SKIP LOCKED so concurrent Pods
 //     don't double-fire the same will.
 //   - expireSessions uses SELECT … FOR UPDATE; the row locks serialise
@@ -27,7 +28,7 @@
 //	fire_due_wills          1s   Paho test_will_delay asserts within 1s
 //	expire_sessions         5s   SessionExpiryInterval is minutes-hours
 //	expire_retained         5s   MessageExpiryInterval is seconds-grade
-//	find_dead_brokers       5s   broker keepalive is 30s anyway
+//	find_dead_brokers       5s   a dead broker is reaped after DeadBrokerGrace
 //	handle_dead_broker      —    fired in the same tick as find_dead_brokers
 //	refresh_deliveries_gauge 10s sub-minute observability gauge
 //	refresh_state_gauges    10s  sub-minute observability gauge
@@ -56,6 +57,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,8 +65,35 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/bo0tzz/pgmqtt/internal/engine"
+	"github.com/bo0tzz/pgmqtt/internal/listener"
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
 )
+
+// DeadBrokerGrace is how long a broker's advisory lock must stay free,
+// on every check, before the janitor treats that broker as dead.
+//
+// A free lock means "this broker's listener session is gone", which is
+// also what a perfectly healthy broker looks like for a few seconds after
+// Postgres restarts or fails over: every listener session dies at once,
+// and whichever broker's pool reconnects first sees every lock free,
+// its own included. Reaping on that evidence fires the wills of clients
+// that are still connected (2026-06-29, 2026-11-17).
+//
+// The other half of the contract is listener.LockReacquireDeadline: a
+// broker that cannot get its lock back inside that deadline exits. So a
+// lock that has been free for longer than the deadline belongs to a
+// broker that is no longer serving anyone. The margin on top covers the
+// gap between Postgres releasing the lock and the owner noticing.
+//
+// "Free for the whole grace" is sampled, not watched, so on its own it
+// could be fooled by Postgres bouncing more than once: free at one
+// sample, re-held and lost again before the next. The janitor therefore
+// only counts time during which its own broker's lock was held without
+// interruption (see ownLockUnbroken). Anything that wipes every lock
+// wipes ours too, and that restarts every clock.
+const DeadBrokerGrace = listener.LockReacquireDeadline + 10*time.Second
+
+const brokerLockPrefix = "pgmqtt:broker:"
 
 // Job names used as the per-job metric label and as the key for
 // SetJobIntervals. Keep in sync with the table in the package doc.
@@ -131,6 +160,20 @@ type Janitor struct {
 	// against pathological clients that send PUBLISH but never PUBREL.
 	inboundQoS2Grace time.Duration
 
+	// deadBrokerGrace: see DeadBrokerGrace. suspects maps a broker whose
+	// lock was found free to the time it was first found free; an entry
+	// is dropped the moment the lock is seen held again, so the grace
+	// always measures one unbroken stretch.
+	deadBrokerGrace time.Duration
+	suspectsMu      sync.Mutex
+	suspects        map[uuid.UUID]time.Time
+
+	// lockEpoch reports the listener's count of lock losses; suspectsEpoch
+	// is its value when the current suspects were recorded. nil (tests
+	// without a listener) reads as a constant.
+	lockEpoch     func() uint64
+	suspectsEpoch uint64
+
 	metrics *metrics.Metrics
 }
 
@@ -156,6 +199,8 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 		nowFn:            time.Now,
 		orphanGrace:      10 * time.Minute,
 		inboundQoS2Grace: 1 * time.Hour,
+		deadBrokerGrace:  DeadBrokerGrace,
+		suspects:         make(map[uuid.UUID]time.Time),
 	}
 }
 
@@ -172,7 +217,7 @@ func (j *Janitor) beginTxTimed(ctx context.Context, opts pgx.TxOptions) (pgx.Tx,
 }
 
 // acquireTimed wraps pool.Acquire and observes pgmqtt_pgx_acquire_seconds.
-// handleDeadBroker holds a dedicated conn for the lock+unlock pair so it
+// reapBroker holds a dedicated conn for the lock+unlock pair so it
 // can't go through BeginTx; this is the one Acquire site in the broker.
 func (j *Janitor) acquireTimed(ctx context.Context) (*pgxpool.Conn, error) {
 	start := time.Now()
@@ -196,6 +241,14 @@ func (j *Janitor) SetOrphanGrace(d time.Duration) { j.orphanGrace = d }
 
 // SetInboundQoS2Grace overrides the inbound_qos2 grace period.
 func (j *Janitor) SetInboundQoS2Grace(d time.Duration) { j.inboundQoS2Grace = d }
+
+// SetDeadBrokerGrace overrides DeadBrokerGrace. For tests: any value at or
+// below listener.LockReacquireDeadline lets a live broker be reaped.
+func (j *Janitor) SetDeadBrokerGrace(d time.Duration) { j.deadBrokerGrace = d }
+
+// SetLockEpoch installs the listener's LockEpoch, which lets the janitor
+// tell that this broker's lock was lost and re-taken between two ticks.
+func (j *Janitor) SetLockEpoch(f func() uint64) { j.lockEpoch = f }
 
 // SetMetrics installs a Metrics instance for janitor counters. Optional.
 func (j *Janitor) SetMetrics(m *metrics.Metrics) { j.metrics = m }
@@ -283,11 +336,12 @@ func (j *Janitor) Tick(ctx context.Context) error {
 			return err
 		}
 		j.markRun(JobFindDeadBrokers, now)
+		j.forgetSuspectsExcept(candidates)
 		for _, id := range candidates {
 			var claimed bool
 			if err := j.timed(JobHandleDeadBroker, func() error {
 				var err error
-				claimed, err = j.handleDeadBroker(ctx, id)
+				claimed, err = j.handleDeadBroker(ctx, id, now)
 				return err
 			}); err != nil {
 				j.logger.Warn("dead broker handling", "broker", id, "err", err)
@@ -682,10 +736,14 @@ func (j *Janitor) sweepInboundQoS2(ctx context.Context) error {
 }
 
 // findDeadBrokerCandidates returns every distinct broker_id currently
-// referenced in sessions. The caller filters to actually-dead ones via
-// pg_try_advisory_lock on a single acquired conn (so lock+unlock land on
-// the same Postgres session).
+// referenced in sessions, this broker's own included. handleDeadBroker
+// filters to the actually-dead ones. Returns nothing while this broker's
+// own lock is not held: see ownLockUnbroken.
 func (j *Janitor) findDeadBrokerCandidates(ctx context.Context) ([]uuid.UUID, error) {
+	held, err := j.ownLockUnbroken(ctx)
+	if err != nil || !held {
+		return nil, err
+	}
 	rows, err := j.pool.Query(ctx,
 		`SELECT DISTINCT broker_id FROM sessions WHERE broker_id IS NOT NULL`)
 	if err != nil {
@@ -703,23 +761,122 @@ func (j *Janitor) findDeadBrokerCandidates(ctx context.Context) ([]uuid.UUID, er
 	return candidates, rows.Err()
 }
 
-// handleDeadBroker tries to claim a per-broker advisory lock and, if
-// successful, fires wills + clears ownership for sessions owned by that
-// broker. Lock acquisition + work + unlock all run on a single acquired
-// conn so the unlock lands on the same Postgres session that holds the
-// lock — going through pool.Exec for both lets pgxpool route them to
-// different conns and the unlock becomes a no-op.
+// ownLockUnbroken reports whether this broker's own advisory lock is held
+// right now, and drops every suspect if it is not, or if it was lost and
+// re-taken since they were recorded.
+//
+// Our lock lives on the same Postgres as every peer's. A restart,
+// failover or crash recovery releases all of them together, so while ours
+// is missing a peer's free lock says nothing about that peer, and a clock
+// that started before ours was lost may span a moment when the peer held
+// its lock again. Only time observed under one unbroken hold of our own
+// lock counts towards a peer's grace.
+//
+// The lock is checked in Postgres rather than by asking the listener,
+// because the pool can be back and probing before the listener goroutine
+// has noticed its session died. The epoch is read after that check: a new
+// listener session cannot exist without the epoch having moved first.
+func (j *Janitor) ownLockUnbroken(ctx context.Context) (bool, error) {
+	free, err := j.brokerLockFree(ctx, j.eng.BrokerID())
+	if err != nil {
+		return false, err
+	}
+	held := !free
+
+	var epoch uint64
+	if j.lockEpoch != nil {
+		epoch = j.lockEpoch()
+	}
+	j.suspectsMu.Lock()
+	dropped := 0
+	if !held || epoch != j.suspectsEpoch {
+		dropped = len(j.suspects)
+		clear(j.suspects)
+		j.suspectsEpoch = epoch
+	}
+	j.suspectsMu.Unlock()
+	if dropped > 0 {
+		j.logger.Info("own broker lock was interrupted; restarting dead-broker clocks",
+			"suspects", dropped, "held_now", held)
+	}
+	return held, nil
+}
+
+// brokerLockFree reports whether nobody holds brokerID's advisory lock.
+//
+// The probe is a shared, transaction-scoped try-lock in one statement.
+// Postgres drops it when the statement ends, so a probe can never leave
+// a live broker's lock stranded on a pooled connection; and being shared,
+// janitors probing the same broker don't read each other as the owner.
+// It still conflicts with the owner's exclusive lock, which is the point.
+func (j *Janitor) brokerLockFree(ctx context.Context, brokerID uuid.UUID) (bool, error) {
+	var free bool
+	err := j.pool.QueryRow(ctx,
+		`SELECT pg_try_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		brokerLockPrefix+brokerID.String()).Scan(&free)
+	return free, err
+}
+
+// releaseBrokerLock gives back a lock taken with pg_try_advisory_lock on
+// conn. If the unlock cannot be confirmed the connection is closed, which
+// releases the lock with the session: a lock left behind on a pooled
+// connection would keep its real owner from ever taking it back.
+func releaseBrokerLock(ctx context.Context, conn *pgxpool.Conn, lockKey string) {
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	var released bool
+	err := conn.QueryRow(uctx,
+		`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey).Scan(&released)
+	if err != nil || !released {
+		_ = conn.Conn().Close(uctx)
+	}
+}
+
+// handleDeadBroker decides whether brokerID is dead and, if so, reaps it.
+// A broker is dead when its advisory lock has been free on every check
+// for j.deadBrokerGrace (see DeadBrokerGrace); until then a free lock
+// only starts or continues the clock.
 //
 // Returns true if we claimed the broker (caller increments the metric);
-// false if another pod beat us to it.
-func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (claimed bool, err error) {
+// false if it is alive, still inside its grace, or another pod beat us
+// to it.
+func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID, now time.Time) (claimed bool, err error) {
+	// This process is running, so its broker is not dead, whatever the
+	// lock says.
+	if brokerID == j.eng.BrokerID() {
+		return false, nil
+	}
+	free, err := j.brokerLockFree(ctx, brokerID)
+	if err != nil {
+		return false, err
+	}
+	if !free {
+		j.clearSuspect(brokerID)
+		return false, nil
+	}
+	freeFor := j.lockFreeFor(brokerID, now)
+	if freeFor < j.deadBrokerGrace {
+		return false, nil
+	}
+	return j.reapBroker(ctx, brokerID, freeFor)
+}
+
+// reapBroker claims brokerID's advisory lock and, if it gets it, fires
+// wills + clears ownership for the sessions that broker owned. The lock
+// is what keeps two janitors from reaping the same broker at once.
+//
+// Lock acquisition + work + unlock all run on a single acquired conn so
+// the unlock lands on the same Postgres session that holds the lock —
+// going through pool.Exec for both lets pgxpool route them to different
+// conns and the unlock becomes a no-op.
+func (j *Janitor) reapBroker(ctx context.Context, brokerID uuid.UUID, freeFor time.Duration) (claimed bool, err error) {
 	conn, err := j.acquireTimed(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer conn.Release()
 
-	lockKey := "pgmqtt:broker:" + brokerID.String()
+	lockKey := brokerLockPrefix + brokerID.String()
 	var got bool
 	if err := conn.QueryRow(ctx,
 		`SELECT pg_try_advisory_lock(hashtextextended($1, 0))`, lockKey).Scan(&got); err != nil {
@@ -728,10 +885,8 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 	if !got {
 		return false, nil
 	}
-	defer func() {
-		_, _ = conn.Exec(ctx,
-			`SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey)
-	}()
+	defer releaseBrokerLock(ctx, conn, lockKey)
+	j.logger.Warn("reaping dead broker", "broker", brokerID, "lock_free_for", freeFor)
 
 	rows, err := conn.Query(ctx, `
 		SELECT client_id, will_topic, will_payload, will_qos, will_retain,
@@ -821,6 +976,54 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (cla
 		return true, err
 	}
 	return ct.RowsAffected() > 0, nil
+}
+
+// lockFreeFor records that brokerID's lock was found free at now and
+// returns how long it has been continuously free as far as this janitor
+// has seen.
+func (j *Janitor) lockFreeFor(brokerID uuid.UUID, now time.Time) time.Duration {
+	j.suspectsMu.Lock()
+	since, ok := j.suspects[brokerID]
+	if !ok {
+		since = now
+		j.suspects[brokerID] = now
+	}
+	j.suspectsMu.Unlock()
+	if !ok && j.deadBrokerGrace > 0 {
+		j.logger.Info("broker lock is free; will reap if it stays free",
+			"broker", brokerID, "grace", j.deadBrokerGrace)
+	}
+	return now.Sub(since)
+}
+
+// clearSuspect records that brokerID's lock was found held.
+func (j *Janitor) clearSuspect(brokerID uuid.UUID) {
+	j.suspectsMu.Lock()
+	_, ok := j.suspects[brokerID]
+	delete(j.suspects, brokerID)
+	j.suspectsMu.Unlock()
+	if ok {
+		j.logger.Info("broker lock is held again; no longer a reap candidate", "broker", brokerID)
+	}
+}
+
+// forgetSuspectsExcept drops suspects that no longer own any session
+// (reaped by a peer, or every client moved elsewhere).
+func (j *Janitor) forgetSuspectsExcept(candidates []uuid.UUID) {
+	j.suspectsMu.Lock()
+	defer j.suspectsMu.Unlock()
+	if len(j.suspects) == 0 {
+		return
+	}
+	keep := make(map[uuid.UUID]struct{}, len(candidates))
+	for _, id := range candidates {
+		keep[id] = struct{}{}
+	}
+	for id := range j.suspects {
+		if _, ok := keep[id]; !ok {
+			delete(j.suspects, id)
+		}
+	}
 }
 
 // sweepOrphanMessages deletes messages with no referencing deliveries that are

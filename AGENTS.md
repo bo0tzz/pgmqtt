@@ -138,6 +138,30 @@ Two practices that actually help:
   you have access; the rule of thumb is: if you can't articulate the bug
   class your last commit catches, you didn't actually validate.)
 
+### A free broker lock is not proof the broker is dead
+
+Each broker holds a `pg_advisory_lock` on its LISTEN connection, and the
+janitor reaps brokers whose lock is free. But a Postgres restart,
+failover or crash recovery drops every listener session at once, so for
+a few seconds every lock is free while every broker is alive. Reaping
+on that evidence fired retained wills ("offline") for clients that were
+still connected and wiped their will columns. It happened twice: a peer
+reaped its neighbours (2026-06-29), and a broker whose pool reconnected
+before its listener reaped itself (2026-11-17).
+
+The rules now, in `internal/janitor` and `internal/listener`:
+
+- A broker without its lock for `listener.LockReacquireDeadline` exits.
+- The janitor reaps a peer only after its lock has been free on every
+  check for `janitor.DeadBrokerGrace` (the deadline plus a margin).
+- It counts that time only while its own lock was held without
+  interruption, never judges anyone while its own lock is missing, and
+  never judges itself.
+
+Don't shorten the grace below the deadline, and don't "repair" a reap
+after the fact instead of preventing it: a will that was published
+can't be recalled.
+
 ### Janitor tick interval changes break paho
 
 `PGMQTT_JANITOR_INTERVAL_MS` controls how often the janitor sweeps. The

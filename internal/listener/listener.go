@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,18 +42,29 @@ const (
 	// Reconnect backoff. On a non-EOF NOTIFY wait error we tear down the
 	// dedicated conn (which auto-releases the advisory lock) and try to
 	// re-acquire LISTEN + lock. First attempt fires immediately — only a
-	// FAILED attempt sleeps, with backoff doubling 1→2→4→8→16 s. The
-	// loop gives up after reconnectMaxAttempts and the Pod exits so
-	// kubelet replaces it (advisory lock + LISTEN registration are
-	// per-conn so the new Pod gets a clean state). Firing the first
-	// attempt immediately closes the dead-broker-reap race: during the
-	// reconnect window our advisory lock is unheld, so a peer Pod's
-	// janitor that grabs it would treat us as a dead broker and kick
-	// every owning client.
+	// FAILED attempt sleeps, with backoff doubling 1→2→4→8 s. The loop
+	// gives up after reconnectMaxAttempts or LockReacquireDeadline,
+	// whichever comes first, and the Pod exits so kubelet replaces it
+	// (advisory lock + LISTEN registration are per-conn so the new Pod
+	// gets a clean state).
 	reconnectInitialBackoff = 1 * time.Second
 	reconnectMaxBackoff     = 16 * time.Second
 	reconnectMaxAttempts    = 5
+
+	// LockReacquireDeadline is the longest a running broker may go
+	// without holding its advisory lock. It is one half of the liveness
+	// contract with the janitor: a broker that loses its lock either
+	// holds it again within this deadline or exits, and peers only reap
+	// a broker whose lock they have seen free for longer than this
+	// (janitor.DeadBrokerGrace). Together those mean a broker that is
+	// still serving clients is never reaped, however long Postgres takes
+	// to come back and whichever broker reconnects first.
+	LockReacquireDeadline = 20 * time.Second
 )
+
+// reconnectDeadline is LockReacquireDeadline, as a var so tests can
+// shorten it.
+var reconnectDeadline = LockReacquireDeadline
 
 // osExit is a package-level indirection over os.Exit so tests can replace
 // it without actually killing the test process. Production callers see the
@@ -72,7 +84,14 @@ type Listener struct {
 	conn      *pgx.Conn
 	url       string
 	mtx       *metrics.Metrics
+	lockEpoch atomic.Uint64
 }
+
+// LockEpoch counts how many times this listener has lost its advisory
+// lock. It moves when the loss is noticed, before any reconnect attempt,
+// so two reads returning the same value while the lock is held mean it
+// was held throughout.
+func (l *Listener) LockEpoch() uint64 { return l.lockEpoch.Load() }
 
 // loadURL returns the current connect URL under l.mu. The URL is
 // effectively immutable in production; the lock exists only so
@@ -233,19 +252,14 @@ func (l *Listener) run(ctx context.Context) {
 			}
 			// Reconnect succeeded. Two things to do, in this order:
 			//
-			// 1) AttestOwnedSessions: rewrite the truth into `sessions`
-			//    for every Conn we still hold in memory. While we were
-			//    disconnected from PG, a peer broker may have run
-			//    find_dead_brokers / handleDeadBroker against our
-			//    broker_id (the advisory lock is auto-released when our
-			//    PG session dies — see 2026-06-29 incident). If it did,
-			//    our clients' session rows now lie about reality. The
-			//    attest UPDATE restores broker_id + connected + last_seen
-			//    for every (client_id, session_token) we own, gated by
-			//    session_token so we don't stomp legitimate takeovers.
-			//    Must precede KickAllDrains because the publish-side
-			//    NOTIFY routing depends on the row's broker_id pointing
-			//    at us.
+			// 1) AttestOwnedSessions: re-assert broker_id + connected for
+			//    every Conn we still hold in memory, gated by
+			//    session_token so a legitimate takeover isn't stomped.
+			//    Peers do not reap a broker inside LockReacquireDeadline
+			//    (janitor.DeadBrokerGrace), so the rows should be as we
+			//    left them; this stays as a backstop because publish-side
+			//    NOTIFY routing depends on broker_id pointing at us. Must
+			//    precede KickAllDrains for the same reason.
 			//
 			// 2) KickAllDrains: peer Pods' `pg_notify` fan-outs during
 			//    our reconnect window landed on a deaf channel. Their
@@ -265,10 +279,17 @@ func (l *Listener) run(ctx context.Context) {
 // reconnect tears down the current conn and tries to bring up a fresh one
 // (re-acquiring the broker advisory lock + LISTEN registrations). Returns
 // true if a new conn is in place. The per-broker UUID is preserved across
-// reconnect — the previous conn's death released the advisory lock so the
-// new conn's pg_advisory_lock attempt either succeeds (clean reacquire) or
-// blocks until any peer racing a takeover finishes.
+// reconnect.
+//
+// The whole call is bounded by reconnectDeadline, counted from the moment
+// the loss was noticed: a dial that hangs (blackholed SYN, a server that
+// accepts but never answers) is cut off there rather than leaving this
+// broker serving clients without its lock indefinitely.
 func (l *Listener) reconnect(ctx context.Context) bool {
+	l.lockEpoch.Add(1)
+	dctx, cancel := context.WithTimeout(ctx, reconnectDeadline)
+	defer cancel()
+
 	// Tear down the dead conn so the advisory lock + listen registrations
 	// are released cleanly.
 	l.mu.Lock()
@@ -276,27 +297,22 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 	l.conn = nil
 	l.mu.Unlock()
 	if old != nil {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = old.Close(closeCtx)
-		cancel()
+		closeCancel()
 	}
 
-	// Reconnect strategy: fire the first attempt IMMEDIATELY, only sleep
-	// after a FAILED attempt. The old code's leading 1 s sleep gave peer
-	// Pods' janitor.findDeadBrokerCandidates + handleDeadBroker enough
-	// time to grab our (now-unheld) per-broker advisory lock and reap
-	// every session whose broker_id = us — the broker is alive, just
-	// reconnecting, but every owning client gets kicked. Trying once
-	// fast closes that window for the common CNPG primary-failover case
-	// where Postgres comes back in <100ms.
+	// Fire the first attempt immediately and only sleep after a failed
+	// one: for the common case where Postgres is back within
+	// milliseconds, the lock is re-held before anything else notices.
 	backoff := reconnectInitialBackoff
 	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
-		// Bail before the dial on ctx cancellation so Stop() during
+		// Bail before the dial on cancellation so Stop() during
 		// reconnect returns promptly.
-		if ctx.Err() != nil {
+		if dctx.Err() != nil {
 			return false
 		}
-		newConn, err := dialAndRegister(ctx, l.loadURL(), l.uuid)
+		newConn, err := dialAndRegister(dctx, l.loadURL(), l.uuid)
 		if err == nil {
 			l.mu.Lock()
 			l.conn = newConn
@@ -309,9 +325,8 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 		if attempt == reconnectMaxAttempts {
 			break
 		}
-		// Back off before the next attempt (and respect ctx).
 		select {
-		case <-ctx.Done():
+		case <-dctx.Done():
 			return false
 		case <-time.After(backoff):
 		}
@@ -445,7 +460,21 @@ func mergeParams(base, extra map[string]string) map[string]string {
 	return out
 }
 
+// keepalivedDialer uses the same keepalive schedule on the client end as
+// dialAndRegister asks the server for. With a plain KeepAlive the client
+// keeps Go's default probe interval and count (15 s × 9), so on a silent
+// partition Postgres would drop the session (and the lock) after ~25 s
+// while this end took over two minutes to notice — a window where the
+// broker serves clients believing it still holds a lock it lost long ago.
 func keepalivedDialer(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 10 * time.Second}
+	d := net.Dialer{
+		Timeout: 5 * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     tcpKeepaliveIdle * time.Second,
+			Interval: tcpKeepaliveInterval * time.Second,
+			Count:    tcpKeepaliveCount,
+		},
+	}
 	return d.DialContext(ctx, network, addr)
 }
