@@ -1217,7 +1217,7 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 //
 // The fix re-orders Reconcile so each manager runs Secret CreateOrUpdate
 // FIRST (with a MutateFn that preserves any pre-existing data["password"]
-// rather than always overwriting), then re-Gets the merged Secret to read
+// rather than always overwriting), then takes from the stored Secret
 // the password that won the K8s API race, and finally bcrypts THAT before
 // writing PG. The post-condition is the system invariant:
 //
@@ -1230,7 +1230,7 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 // observed Secret version to force R_A through the non-short-circuit path.
 // R_A's next Reconcile must:
 //   - preserve the peer-set password (NOT overwrite with a fresh random),
-//   - re-Get to observe that password,
+//   - read that password back from the API server,
 //   - bcrypt THAT password into PG.
 //
 // The assertion checks the invariant holds after each reconcile, which
@@ -1288,7 +1288,7 @@ func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
 
 	// R_A reconciles after the peer-write. With the fix's MutateFn
 	// preserving existing passwords, the peer's value must persist;
-	// without the re-Get-then-bcrypt ordering, the DB hash could lag
+	// without the Secret-then-bcrypt ordering, the DB hash could lag
 	// behind. The post-condition is the invariant.
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
 		t.Fatalf("reconcile post-peer-write: %v", err)

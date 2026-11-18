@@ -93,14 +93,23 @@ type UserReconciler struct {
 // whose spec.PasswordSecretRef.Name matches the Secret. Non-matching
 // Secret events return an empty slice, keeping the cost of cluster-
 // wide Secret churn bounded to a single namespaced List per event.
+//
+// Both Secret watches are metadata-only. A BYO Secret can be any Secret
+// in a watched namespace, so the watch cannot be narrowed by label or
+// owner; what can be avoided is holding their contents. The handlers
+// need a Secret's name, namespace and owner references, nothing more,
+// and Reconcile reads the Secret it cares about from the API server
+// (the manager's client does not cache Secrets). Without OnlyMetadata
+// here the cache would hold every Secret in the cluster in full.
 func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("pgmqtt-user").
 		For(&pgmqttv1alpha1.User{}).
-		Owns(&corev1.Secret{}, builder.MatchEveryOwner).
+		Owns(&corev1.Secret{}, builder.MatchEveryOwner, builder.OnlyMetadata).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.usersForSecret),
+			builder.OnlyMetadata,
 		).
 		Complete(r)
 }
@@ -117,9 +126,12 @@ func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // return for empty UserList keeps non-pgmqtt Secret churn essentially
 // free. Returning nil for non-matching events is required — handler
 // machinery treats a nil/empty slice as "do not enqueue".
-func (r *UserReconciler) usersForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
+func (r *UserReconciler) usersForSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	// The watch delivers metadata-only objects; a full Secret is accepted
+	// too so the function does not depend on how it was wired.
+	switch secret.(type) {
+	case *metav1.PartialObjectMetadata, *corev1.Secret:
+	default:
 		return nil
 	}
 	var users pgmqttv1alpha1.UserList
@@ -173,7 +185,7 @@ func (r *UserReconciler) usersForSecret(ctx context.Context, obj client.Object) 
 // Reordering the Secret reconcile to come first, *and* having the MutateFn
 // preserve any existing data["password"] rather than always overwriting it,
 // makes the password-that-wins the K8s API race the single source of truth.
-// Both managers then re-Get the merged Secret and feed THAT password into
+// Both managers then feed the password the API server actually stored into
 // bcrypt before writing PG, so the DB hash always matches the cleartext
 // stored in the Secret regardless of which manager wrote last.
 //
@@ -558,8 +570,8 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 // K8s API write race inside CreateOrUpdate, NOT by which manager generated
 // the candidate first. Concretely: the MutateFn preserves any existing
 // data["password"] rather than overwriting it, so the FIRST manager to
-// successfully Create the Secret seeds the password value; subsequent
-// peers re-Get the merged Secret to read whatever password landed. This
+// successfully Create the Secret seeds the password value; a peer whose
+// Create or Update loses retries and reads whatever password landed. This
 // closes the lease-handoff divergence between Secret-cleartext and
 // PG-bcrypt-hash described on the Reconcile docstring.
 func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmqttv1alpha1.User, username string) (*corev1.Secret, string, error) {
@@ -665,25 +677,20 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 	}
 	r.Logger.Debug("credentials secret reconciled", "op", op, "name", name)
 
-	// Re-Get after the merge so we observe the password that "won" the
-	// CreateOrUpdate race. Without this, a concurrent peer manager could
-	// have written a different password between our MutateFn run and our
-	// caller's bcrypt+PG write — leading to Secret/DB divergence.
-	var resolved corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: name}, &resolved); err != nil {
-		return nil, "", statusErr{
-			error:   fmt.Errorf("re-get secret %s/%s: %w", user.Namespace, name, err),
-			message: fmt.Sprintf("secret %q: %s", name, apiErrorSummary(err)),
-		}
-	}
-	pw, ok := resolved.Data["password"]
-	if !ok || len(pw) == 0 {
+	// desired now holds what the API server stored, so its password is the
+	// one that won any race with a peer manager: a Create that lost returns
+	// AlreadyExists and an Update carries the resourceVersion it read, so
+	// neither can succeed over a peer's write. This relies on the Secret
+	// having been read from the API server and not from a cache, which the
+	// manager's client guarantees for Secrets.
+	pw := desired.Data["password"]
+	if len(pw) == 0 {
 		return nil, "", statusErr{
 			error:   fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name),
 			message: fmt.Sprintf("secret %q has no password after being written", name),
 		}
 	}
-	return &resolved, string(pw), nil
+	return desired, string(pw), nil
 }
 
 // advertise writes the port and URI keys of one endpoint into a generated

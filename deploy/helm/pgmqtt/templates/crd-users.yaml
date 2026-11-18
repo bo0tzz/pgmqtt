@@ -7,8 +7,9 @@ metadata:
     # Templated CRDs apply on `helm upgrade`. Helm v3's crds/ directory
     # was install-only; templating them gives operators control via the
     # `crds.install` value but loses Helm's "create before render" guard.
-    # In practice the broker doesn't reference the CRD until the elected
-    # reconciler's first reconcile, so render-order isn't a problem here.
+    # The broker tolerates the CRD arriving after it starts (here, or
+    # applied separately with crds.install=false): until the API server
+    # serves users.pgmqtt.io it checks every 30s and runs no reconciler.
     "helm.sh/resource-policy": keep
 spec:
   group: pgmqtt.io
