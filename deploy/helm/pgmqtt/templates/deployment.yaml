@@ -27,7 +27,7 @@ spec:
       labels:
         {{- include "pgmqtt.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: broker
-        {{- with .Values.podLabels }}
+        {{- with omit (.Values.podLabels | default dict) "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.podAnnotations }}
@@ -250,6 +250,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- if .Values.podAntiAffinity.enabled }}
+        {{- if hasKey (.Values.affinity | default dict) "podAntiAffinity" }}
+        {{- fail "podAntiAffinity.enabled=true cannot be combined with affinity.podAntiAffinity: write the whole anti-affinity rule under affinity, or remove it from there" }}
+        {{- end }}
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: {{ .Values.podAntiAffinity.weight }}

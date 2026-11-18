@@ -186,6 +186,34 @@ renders() {
     lacks tcp-only '"8083"'
     has tcp-only '"1883"'
 
+    # Keys the chart sets itself, repeated in podLabels or
+    # serviceMonitor.labels, used to render as duplicate mapping keys.
+    render label-collisions \
+        --set database.url='postgres://x/y' \
+        --set-string 'podLabels.app\.kubernetes\.io/name=other' \
+        --set-string 'podLabels.app\.kubernetes\.io/component=other' \
+        --set-string 'podLabels.team=home' \
+        --set serviceMonitor.enabled=true \
+        --set-string 'serviceMonitor.labels.app\.kubernetes\.io/name=other' \
+        --set-string 'serviceMonitor.labels.release=prometheus'
+    has label-collisions 'team: home'
+    has label-collisions '"release": "prometheus"'
+    lacks label-collisions 'other'
+
+    # The convenience anti-affinity plus other affinity kinds is fine; plus
+    # a hand-written podAntiAffinity it would be a duplicate key.
+    render anti-affinity \
+        --set database.url='postgres://x/y' \
+        --set podAntiAffinity.enabled=true \
+        --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=zone' \
+        --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists'
+    has anti-affinity 'nodeAffinity:'
+    has anti-affinity 'podAntiAffinity:'
+    refuses anti-affinity-twice 'cannot be combined with affinity.podAntiAffinity' \
+        --set database.url='postgres://x/y' \
+        --set podAntiAffinity.enabled=true \
+        --set 'affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey=zone'
+
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \
         --set database.url='postgres://x/y' \

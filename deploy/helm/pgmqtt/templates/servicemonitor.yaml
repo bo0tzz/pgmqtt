@@ -7,8 +7,11 @@ metadata:
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
     app.kubernetes.io/component: broker
-    {{- with .Values.serviceMonitor.labels }}
-    {{- toYaml . | nindent 4 }}
+    {{- $chartLabels := set (include "pgmqtt.labels" . | fromYaml) "app.kubernetes.io/component" "" }}
+    {{- range $k, $v := .Values.serviceMonitor.labels }}
+    {{- if not (hasKey $chartLabels $k) }}
+    {{ $k | quote }}: {{ $v | quote }}
+    {{- end }}
     {{- end }}
 spec:
   selector:

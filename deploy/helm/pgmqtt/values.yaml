@@ -302,6 +302,8 @@ resources:
 podAnnotations: {}
 ## Extra labels applied to every broker Pod (in addition to chart selector
 ## labels). Selector labels are NOT extended by this — keep selector stability.
+## The selector's own keys (app.kubernetes.io/name, /instance, /component)
+## are ignored here.
 podLabels: {}
 podSecurityContext:
   runAsNonRoot: true
@@ -328,6 +330,7 @@ imagePullSecrets: []
 ##
 ## For a hard rule (requiredDuringSchedulingIgnoredDuringExecution) or any
 ## other non-trivial topology shape, leave this off and use `affinity` below.
+## Enabling it together with `affinity.podAntiAffinity` fails the render.
 podAntiAffinity:
   enabled: false
   ## Weight applied to the preferred rule. Higher values bias the scheduler
