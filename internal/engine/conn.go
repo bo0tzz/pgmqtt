@@ -92,14 +92,12 @@ type Conn struct {
 
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool
-	// takenOver is set by the listener's takeover dispatch immediately
-	// before calling Shutdown on a stale Conn. finish reads it
-	// to suppress will fire/schedule: a session-takeover-driven server-
-	// side shutdown is NOT abnormal termination, so per MQTT-3.1.2.5
-	// the Will Message must not be published. Without this, a client
-	// that just successfully roamed to a new pod would have its previous
-	// pod's stale conn fire the will (and with willRetain=true, stamp
-	// "offline" on top of the device's new live presence).
+	// takenOver is set when this Conn is closed because a newer
+	// connection took its session over. finish skips its work then, but
+	// that is a shortcut: a takeover always rotates the session token
+	// before the old Conn is closed, so endSession would find no row to
+	// end anyway. The token is what keeps the will from being published
+	// for a client that moved rather than went away.
 	takenOver         atomic.Bool
 	closed            chan struct{}
 	once              sync.Once
@@ -761,6 +759,8 @@ func (c *Conn) gracefulClose() { c.Disconnect(0x8B) }
 // same client must not touch the row, which is the new connection's now,
 // and its will is not published: the client did not go away, it moved
 // (a deliberate reading of MQTT-3.1.2.5 for retained "offline" wills).
+// endSession's token check enforces the second case; takenOver just
+// saves it the round trip.
 func (c *Conn) finish(cause error) {
 	if c.sessionToken == uuid.Nil || c.takenOver.Load() {
 		return
