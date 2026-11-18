@@ -970,8 +970,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Janitor errors by job",
-      "description": "Non-zero = a PG-side problem on a specific janitor sub-job. Cross-reference with broker logs.",
+      "title": "Janitor errors by task",
+      "description": "Non-zero = a PG-side problem on a specific janitor task. Cross-reference with broker logs.",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -984,9 +984,9 @@
       },
       "targets": [
         {
-          "expr": "sum by (job)(rate(pgmqtt_janitor_errors_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))",
+          "expr": "sum by (task)(rate(pgmqtt_janitor_errors_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))",
           "refId": "A",
-          "legendFormat": "{{job}}"
+          "legendFormat": "{{task}}"
         }
       ],
       "fieldConfig": {
@@ -1011,8 +1011,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Janitor swept rows/sec by job",
-      "description": "Rate of rows the janitor actually acted on per sweep job. Pair with state gauges (Sessions / Messages / Deliveries inflight) to see whether sweep is keeping up with inflow — when the gauge climbs while sweep stays flat, that's the bloat shape the v0.1.15 cliff exposed.",
+      "title": "Janitor swept rows/sec by task",
+      "description": "Rate of rows the janitor actually acted on per sweep task. Pair with state gauges (Sessions / Messages / Deliveries inflight) to see whether sweep is keeping up with inflow — when the gauge climbs while sweep stays flat, that's the bloat shape the v0.1.15 cliff exposed.",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -1025,9 +1025,9 @@
       },
       "targets": [
         {
-          "expr": "sum by (job)(rate(pgmqtt_janitor_swept_rows_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+          "expr": "sum by (task)(rate(pgmqtt_janitor_swept_rows_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
           "refId": "A",
-          "legendFormat": "{{job}}"
+          "legendFormat": "{{task}}"
         }
       ],
       "fieldConfig": {

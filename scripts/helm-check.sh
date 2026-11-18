@@ -259,6 +259,9 @@ renders() {
     # The helm test Pod must not match the broker selectors (Service, PDB,
     # NetworkPolicy).
     has everything 'app.kubernetes.io/component: test'
+    # Prometheus renames a metric's own `job` label to `exported_job`, so
+    # a dashboard query grouping by it sees one series.
+    lacks everything 'by (job)'
 
     render netpol-pinned \
         --set database.url='postgres://x/y' \
