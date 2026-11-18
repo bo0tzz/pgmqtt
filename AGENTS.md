@@ -227,17 +227,15 @@ same session. With a 5 s tick both tests fail on every run (6 of 6 on
 Keep the default at 1 s. Operators who want longer intervals set the
 env explicitly.
 
-What enforces this is `test_session_expiry`. It is a hard test, so a
-longer default turns tier 2 and the CI conformance job red.
-`test_will_delay` is on the known-flaky list and only prints a warning,
-for the reason given in the next section.
+Both are hard tests, so a longer default turns tier 2 and the CI
+conformance job red.
 
 ### Paho conformance: the known-flaky list
 
 `scripts/paho-conformance.py` runs the upstream Eclipse Paho test suite.
 A test on its `--known-flaky` list that fails prints `FAIL(known-flaky)`
 and does not change the exit code; any other failure does, and adds a
-`hard fails:` line. The default list has five tests:
+`hard fails:` line. The default list has four tests:
 
 - `test_subscribe_failure` (in both the v3.1.1 and the v5 suite) and
   `test_shared_subscriptions` need ACLs and shared subscriptions, which
@@ -246,16 +244,12 @@ and does not change the exit code; any other failure does, and adds a
   wrong client's SUBACK and then publish, so the publish races their
   own subscribe. They fail in most single-broker runs and usually pass
   in the multi-broker run.
-- `test_will_delay` passes in most runs but not all. It accepts a will
-  up to 2 s late. The janitor's 1 s jobs do not run every second: a job
-  is skipped whenever a tick starts slightly less than 1 s after that
-  job's last run, so `fire_due_wills` runs every 1–2 s (41 times in
-  60 s, measured) and a will can be just over 2 s late. Measured on
-  2026-11-18 against one broker, the test's first check came in late
-  in 9 of 200 tries started at random points in the tick; it passed in
-  all 21 CI runs sampled since October and in both multi-broker runs
-  that day. Once those jobs run on every tick, take this test off the
-  list, so that it guards the tick interval as well.
+
+`test_will_delay` was on the list until 0.3.0. It accepts a will up to
+2 s late, and the janitor's 1 s jobs used to skip a tick whenever one
+started slightly under a second after their last run, so a will could
+be just over 2 s late (9 of 200 tries, 2026-11-18). Job gating now
+allows half a tick of slack, and the test is hard again.
 
 So the normal summary lines are `v311: 9/10 passing (+1 known-flaky)`
 and, for v5, anything from `23/27 passing (+4 known-flaky)` (typical
