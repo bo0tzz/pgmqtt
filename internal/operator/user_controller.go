@@ -222,21 +222,19 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
 	if renamed {
 		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
-			before := user.DeepCopy()
-			setReady(&user, false, "DBError", scrubReason(err))
-			logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-				"rename-cleanup DBError", err)
-			return ctrl.Result{}, err
+			return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 		}
 	}
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
-		before := user.DeepCopy()
-		setReady(&user, false, "SecretError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-			"resolveCredentialSecret SecretError", err)
-		return ctrl.Result{}, err
+		return r.fail(ctx, &user, reasonSecretError, secretErrorMessage(err), err)
+	}
+	// Both Secret paths refuse an empty password themselves; this is the one
+	// place every path passes through before a row is written.
+	if password == "" {
+		err := fmt.Errorf("secret %s/%s holds an empty password", user.Namespace, secret.Name)
+		return r.fail(ctx, &user, reasonSecretError, fmt.Sprintf("secret %q holds an empty password", secret.Name), err)
 	}
 
 	cost := r.BcryptCost
@@ -274,7 +272,7 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// password at the new cost.
 		storedCost, err := r.storedBcryptCost(ctx, username)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
+			return r.fail(ctx, &user, reasonDBError, scrubReason(err), fmt.Errorf("read stored cost: %w", err))
 		}
 		if storedCost >= cost {
 			before := user.DeepCopy()
@@ -288,18 +286,14 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("bcrypt: %w", err)
+		return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
 	}
 
 	if _, err := r.Pool.Exec(ctx, `
 		INSERT INTO users(username, password_hash) VALUES($1, $2)
 		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
 	`, username, string(bcryptHash)); err != nil {
-		before := user.DeepCopy()
-		setReady(&user, false, "DBError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-			"users upsert DBError", err)
-		return ctrl.Result{}, err
+		return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 	}
 	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
@@ -351,7 +345,9 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 		username = user.Name
 	}
 	if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, username); err != nil {
-		return ctrl.Result{}, err
+		// Without this the object just sits in Terminating with nothing
+		// on it to say why.
+		return r.fail(ctx, user, reasonDBError, scrubReason(err), err)
 	}
 	// Finalizer-removal via Patch (MergeFrom) — same lease-handoff
 	// rationale as finalizer-add above. Spec is untouched.
@@ -377,7 +373,10 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		ref := user.Spec.PasswordSecretRef
 		var sec corev1.Secret
 		if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: ref.Name}, &sec); err != nil {
-			return nil, "", fmt.Errorf("get secret %s/%s: %w", user.Namespace, ref.Name, err)
+			return nil, "", statusErr{
+				error:   fmt.Errorf("get secret %s/%s: %w", user.Namespace, ref.Name, err),
+				message: fmt.Sprintf("secret %q: %s", ref.Name, apiErrorSummary(err)),
+			}
 		}
 		key := ref.Key
 		if key == "" {
@@ -385,7 +384,18 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		}
 		password, ok := sec.Data[key]
 		if !ok {
-			return nil, "", fmt.Errorf("secret %s/%s missing key %s", user.Namespace, ref.Name, key)
+			return nil, "", statusErr{
+				error:   fmt.Errorf("secret %s/%s missing key %s", user.Namespace, ref.Name, key),
+				message: fmt.Sprintf("secret %q has no key %q", ref.Name, key),
+			}
+		}
+		// An empty value would become an account anyone can use by knowing
+		// only its username.
+		if len(password) == 0 {
+			return nil, "", statusErr{
+				error:   fmt.Errorf("secret %s/%s key %s is empty", user.Namespace, ref.Name, key),
+				message: fmt.Sprintf("secret %q key %q is empty; a password is required", ref.Name, key),
+			}
 		}
 		return &sec, string(password), nil
 	}
@@ -467,7 +477,10 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		return controllerutil.SetControllerReference(user, desired, r.Scheme)
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", statusErr{
+			error:   fmt.Errorf("reconcile secret %s/%s: %w", user.Namespace, name, err),
+			message: fmt.Sprintf("secret %q: %s", name, apiErrorSummary(err)),
+		}
 	}
 	r.Logger.Debug("credentials secret reconciled", "op", op, "name", name)
 
@@ -477,11 +490,17 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 	// caller's bcrypt+PG write — leading to Secret/DB divergence.
 	var resolved corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: name}, &resolved); err != nil {
-		return nil, "", fmt.Errorf("re-get secret %s/%s: %w", user.Namespace, name, err)
+		return nil, "", statusErr{
+			error:   fmt.Errorf("re-get secret %s/%s: %w", user.Namespace, name, err),
+			message: fmt.Sprintf("secret %q: %s", name, apiErrorSummary(err)),
+		}
 	}
 	pw, ok := resolved.Data["password"]
 	if !ok || len(pw) == 0 {
-		return nil, "", fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name)
+		return nil, "", statusErr{
+			error:   fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name),
+			message: fmt.Sprintf("secret %q has no password after being written", name),
+		}
 	}
 	return &resolved, string(pw), nil
 }
@@ -498,6 +517,73 @@ func generatePassword() (string, error) {
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// Reasons set on the Ready condition when a reconcile fails.
+const (
+	reasonDBError     = "DBError"
+	reasonSecretError = "SecretError"
+	reasonHashError   = "HashError"
+)
+
+// fail records a failed reconcile on the Ready condition and returns err so
+// controller-runtime retries. msg ends up in the User's status, which is
+// readable by anyone who can read the User: it must not carry raw error
+// text from Postgres or Secret contents.
+func (r *UserReconciler) fail(ctx context.Context, user *pgmqttv1alpha1.User, reason, msg string, err error) (ctrl.Result, error) {
+	before := user.DeepCopy()
+	setReady(user, false, reason, msg)
+	logStatusUpdateError(log.FromContext(ctx).WithName("pgmqtt-user"),
+		r.Status().Patch(ctx, user, client.MergeFrom(before)), reason, err)
+	return ctrl.Result{}, err
+}
+
+// statusErr carries, next to an error, the sentence to show for it in the
+// User's status. The sentence is assembled from object names and a coarse
+// classification, so unlike the error text it is safe to publish.
+type statusErr struct {
+	error
+	message string
+}
+
+func (e statusErr) Unwrap() error { return e.error }
+
+func secretErrorMessage(err error) string {
+	var se statusErr
+	if errors.As(err, &se) {
+		return se.message
+	}
+	return scrubReason(err)
+}
+
+// apiErrorSummary names the class of a Kubernetes API error without
+// repeating the server's message.
+func apiErrorSummary(err error) string {
+	var owned *controllerutil.AlreadyOwnedError
+	switch {
+	case apierrors.IsNotFound(err):
+		return "not found"
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
+		return "access denied"
+	case apierrors.IsConflict(err), apierrors.IsAlreadyExists(err):
+		return "changed concurrently, retrying"
+	case apierrors.IsInvalid(err):
+		return "rejected by the API server as invalid"
+	case apierrors.IsTooManyRequests(err), apierrors.IsServerTimeout(err),
+		apierrors.IsTimeout(err), apierrors.IsServiceUnavailable(err):
+		return "API server unavailable, retrying"
+	case errors.As(err, &owned):
+		return "already controlled by another object"
+	default:
+		return scrubReason(err)
+	}
+}
+
+func hashErrorMessage(err error, cost int) string {
+	if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		return "password is longer than 72 bytes, the most bcrypt accepts"
+	}
+	return fmt.Sprintf("could not hash the password at bcrypt cost %d", cost)
 }
 
 // scrubReason produces a User-CR-Status-safe summary of an error. We
