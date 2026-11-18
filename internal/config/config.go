@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,10 +25,29 @@ type Config struct {
 	// AllowAnonymous accepts CONNECT without username/password. Off by default.
 	AllowAnonymous bool
 
-	// Operator wire-details for auto-generated User Secrets.
+	// Operator wire-details for auto-generated User Secrets. A port of 0
+	// means "this listener is disabled": the operator leaves that port and
+	// its URI out of the Secrets instead of advertising a closed port.
 	ServiceHost string
 	ServicePort int
 	WSPort      int
+
+	// TLSHost names an endpoint that terminates TLS in front of the broker
+	// (the broker itself does not). When set, generated Secrets also carry
+	// tls-host, plus tls-port / mqtts-uri for TLSPort and wss-port /
+	// wss-uri for WSSPort. As above, a port of 0 leaves its keys out.
+	TLSHost string
+	TLSPort int
+	WSSPort int
+
+	// LeaderElectionID is the name of the operator's Lease. Releases that
+	// share a namespace need different IDs; with the same one only a single
+	// release's operator ever reconciles.
+	LeaderElectionID string
+
+	// WatchNamespaces limits the operator to User objects, and the Secrets
+	// next to them, in the listed namespaces. Empty means all namespaces.
+	WatchNamespaces []string
 
 	// V5 server policy. All advertised to clients in CONNACK; the v5 codec
 	// + per-conn handlers enforce the values during the session.
@@ -144,7 +164,13 @@ func FromEnv() (*Config, error) {
 		ServiceHost:    os.Getenv("PGMQTT_SERVICE_HOST"),
 		ServicePort:    getenvInt("PGMQTT_SERVICE_PORT", 1883),
 		WSPort:         getenvInt("PGMQTT_SERVICE_WS_PORT", 8083),
+		TLSHost:        os.Getenv("PGMQTT_TLS_HOST"),
+		TLSPort:        getenvInt("PGMQTT_TLS_PORT", 8883),
+		WSSPort:        getenvInt("PGMQTT_WSS_PORT", 0),
 		AllowAnonymous: os.Getenv("PGMQTT_ALLOW_ANONYMOUS") == "true",
+
+		LeaderElectionID: getenvDefaultEmpty("PGMQTT_LEADER_ELECTION_ID", DefaultLeaderElectionID),
+		WatchNamespaces:  splitTrimmed(os.Getenv("PGMQTT_WATCH_NAMESPACES"), ","),
 
 		V5ReceiveMaximum:             uint16(getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)),
 		V5KeepaliveMax:               time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
@@ -191,8 +217,41 @@ func FromEnv() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("PGMQTT_LOG_FORMAT must be \"text\" or \"json\", got %q", c.LogFormat)
 	}
+	for _, p := range []struct {
+		key string
+		val int
+	}{
+		{"PGMQTT_SERVICE_PORT", c.ServicePort},
+		{"PGMQTT_SERVICE_WS_PORT", c.WSPort},
+		{"PGMQTT_TLS_PORT", c.TLSPort},
+		{"PGMQTT_WSS_PORT", c.WSSPort},
+	} {
+		if p.val < 0 || p.val > 65535 {
+			return nil, fmt.Errorf("%s must be in [0, 65535] (0 = not advertised), got %d", p.key, p.val)
+		}
+	}
+	// The ID becomes a Lease name and the namespaces are used in API paths;
+	// a value the API server rejects would otherwise only show up as a
+	// retry loop in the operator's logs.
+	if len(c.LeaderElectionID) > 253 || !dnsSubdomainRE.MatchString(c.LeaderElectionID) {
+		return nil, fmt.Errorf("PGMQTT_LEADER_ELECTION_ID must be a DNS subdomain name, got %q", c.LeaderElectionID)
+	}
+	for _, ns := range c.WatchNamespaces {
+		if len(ns) > 63 || !dnsLabelRE.MatchString(ns) {
+			return nil, fmt.Errorf("PGMQTT_WATCH_NAMESPACES: %q is not a valid namespace name", ns)
+		}
+	}
 	return c, nil
 }
+
+// DefaultLeaderElectionID is the Lease name the operator used before it was
+// configurable.
+const DefaultLeaderElectionID = "pgmqtt-operator"
+
+var (
+	dnsLabelRE     = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	dnsSubdomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+)
 
 // getenv returns the env value if set (including empty string) — only
 // substitutes the default when the variable is unset. Empty string means "I

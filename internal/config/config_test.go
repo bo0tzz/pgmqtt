@@ -62,6 +62,72 @@ func TestFromEnvBcryptOutOfRange(t *testing.T) {
 	}
 }
 
+func TestFromEnvOperatorDefaults(t *testing.T) {
+	t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+	c, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.ServicePort != 1883 || c.WSPort != 8083 {
+		t.Errorf("service ports: got %d/%d want 1883/8083", c.ServicePort, c.WSPort)
+	}
+	if c.TLSHost != "" || c.TLSPort != 8883 || c.WSSPort != 0 {
+		t.Errorf("TLS defaults: got host=%q port=%d wss=%d", c.TLSHost, c.TLSPort, c.WSSPort)
+	}
+	if c.LeaderElectionID != "pgmqtt-operator" {
+		t.Errorf("LeaderElectionID default: got %q want the pre-existing hard-coded value", c.LeaderElectionID)
+	}
+	if c.WatchNamespaces != nil {
+		t.Errorf("WatchNamespaces default: got %v want nil (all namespaces)", c.WatchNamespaces)
+	}
+}
+
+func TestFromEnvOperatorOverrides(t *testing.T) {
+	t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+	t.Setenv("PGMQTT_SERVICE_PORT", "0")
+	t.Setenv("PGMQTT_SERVICE_WS_PORT", "0")
+	t.Setenv("PGMQTT_TLS_HOST", "mqtt.example.com")
+	t.Setenv("PGMQTT_TLS_PORT", "8884")
+	t.Setenv("PGMQTT_WSS_PORT", "443")
+	t.Setenv("PGMQTT_LEADER_ELECTION_ID", "release-a-pgmqtt")
+	t.Setenv("PGMQTT_WATCH_NAMESPACES", "mqtt, apps ,")
+	c, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.ServicePort != 0 || c.WSPort != 0 {
+		t.Errorf("a port of 0 must survive as 0 (listener disabled), got %d/%d", c.ServicePort, c.WSPort)
+	}
+	if c.TLSHost != "mqtt.example.com" || c.TLSPort != 8884 || c.WSSPort != 443 {
+		t.Errorf("TLS: got host=%q port=%d wss=%d", c.TLSHost, c.TLSPort, c.WSSPort)
+	}
+	if c.LeaderElectionID != "release-a-pgmqtt" {
+		t.Errorf("LeaderElectionID: got %q", c.LeaderElectionID)
+	}
+	if len(c.WatchNamespaces) != 2 || c.WatchNamespaces[0] != "mqtt" || c.WatchNamespaces[1] != "apps" {
+		t.Errorf("WatchNamespaces: got %v want [mqtt apps]", c.WatchNamespaces)
+	}
+}
+
+func TestFromEnvOperatorRejectsInvalid(t *testing.T) {
+	for key, val := range map[string]string{
+		"PGMQTT_SERVICE_PORT":       "-1",
+		"PGMQTT_SERVICE_WS_PORT":    "65536",
+		"PGMQTT_TLS_PORT":           "70000",
+		"PGMQTT_WSS_PORT":           "-5",
+		"PGMQTT_LEADER_ELECTION_ID": "Not_A_Lease_Name",
+		"PGMQTT_WATCH_NAMESPACES":   "mqtt,Bad/Namespace",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv("PGMQTT_DATABASE_URL", "postgres://x")
+			t.Setenv(key, val)
+			if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("%s=%q: got %v, want an error naming the variable", key, val, err)
+			}
+		})
+	}
+}
+
 // TestFromEnvLogFormat covers the slog-handler selector. Unset / empty must
 // default to "text"; "text" and "json" are the only accepted values; any
 // other string is rejected with an error so misconfigured aggregators fail
