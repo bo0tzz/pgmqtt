@@ -70,6 +70,9 @@ func main() {
 		slog.SetDefault(logger)
 	}
 
+	exitCode := 0
+	defer exitAfterDeferred(&exitCode)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -143,20 +146,19 @@ func main() {
 	engine.SetAuthBcryptCost(cfg.BcryptCost)
 
 	// Operator uses controller-runtime's K8s Lease leader election.
-	// Multiple Pods call operator.Run concurrently; exactly one wins
-	// reconciliation responsibility at a time. Loss/handoff is handled
-	// inside controller-runtime; on loss the manager exits and a peer
-	// Pod's manager takes over (no Pod restart needed).
+	// Multiple Pods call operator.Run concurrently; exactly one reconciles
+	// at a time. operator.Run keeps a manager running for as long as ctx
+	// lives: when one stops (lost lease, API server unreachable, a panic
+	// while starting it) it starts another with backoff, and it waits for
+	// the User CRD if that is not installed yet. None of that restarts the
+	// Pod, which is also serving MQTT clients.
 	//
-	// Panic handling differs from the other background goroutines:
-	// recoverPanic() logs and returns, leaving the broker running. For
-	// the operator that's catastrophic — controller-runtime would be
-	// dead, no User reconciles would land, and BYO Secret rotations
-	// would silently skip. Operators wouldn't get paged because the
-	// broker keeps serving traffic. Instead, fatalRecoverOperator
-	// cancels the root context (giving the engine/janitor/listener a
-	// chance to drain cleanly via their ctx-aware loops) and signals
-	// main() to exit non-zero so K8s restarts the pod and re-elects.
+	// fatalRecoverOperator is for a panic that escapes operator.Run
+	// itself. Recovering and carrying on would leave the broker serving
+	// with no reconciler and nothing to show for it, so it cancels the
+	// root context (engine/janitor/listener drain via their ctx-aware
+	// loops) and main exits non-zero once Serve returns, for K8s to
+	// restart the Pod.
 	go func() {
 		defer fatalRecoverOperator(logger, cancel)
 		opts := operator.Options{
@@ -168,6 +170,8 @@ func main() {
 			WSSPort:                 cfg.WSSPort,
 			BcryptCost:              cfg.BcryptCost,
 			LeaderElectionNamespace: cfg.PodNamespace,
+			LeaderElectionID:        cfg.LeaderElectionID,
+			WatchNamespaces:         cfg.WatchNamespaces,
 		}
 		if err := operator.Run(ctx, pool, logger, opts); err != nil {
 			logger.Error("operator", "err", err)
@@ -181,12 +185,23 @@ func main() {
 	}
 	// If the operator goroutine panicked, fatalRecoverOperator set this
 	// flag and cancelled the root context (which brought Serve out
-	// cleanly). Exit non-zero so K8s restarts the pod and re-elects.
+	// cleanly). Returning runs the deferred lst.Stop and pool.Close; the
+	// exit code is applied by exitAfterDeferred, which runs after them.
 	if operatorPanicked.Load() {
 		logger.Error("exiting after operator panic")
-		operatorExit(1)
+		exitCode = 1
+		return
 	}
 	logger.Info("shutdown complete")
+}
+
+// exitAfterDeferred is deferred at the top of main, so it runs after every
+// other deferred call there, and exits with *code if it is non-zero. Calling
+// os.Exit where the decision is made would skip those deferred calls.
+func exitAfterDeferred(code *int) {
+	if *code != 0 {
+		operatorExit(*code)
+	}
 }
 
 // recoverPanic recovers from a panic in a long-lived background goroutine,
@@ -225,10 +240,8 @@ var operatorExit = os.Exit
 //  3. Sets operatorPanicked so main() knows to exit non-zero after
 //     Serve returns.
 //
-// The brief shutdown delay before exit is intentional: we want
-// pool.Close + lst.Stop to run via main()'s deferred cleanup; an
-// immediate os.Exit here would skip them. Defer-stacked cleanup runs
-// only when main() returns.
+// It does not exit itself: an os.Exit here would skip pool.Close and
+// lst.Stop, which only run when main returns (see exitAfterDeferred).
 func fatalRecoverOperator(logger *slog.Logger, cancel context.CancelFunc) {
 	r := recover()
 	if r == nil {
