@@ -9,22 +9,31 @@
 #
 # Tiers (additive — tier3 implies tier2 implies tier1):
 #
-#   tier1   fast — after every change. ~1–2 min on a developer laptop.
-#           go vet + make test-race + helm lint + helm template (default
-#           values + a couple of overrides).
+#   tier1   after every change. Needs Docker: `go test -race` runs the
+#           whole suite, and most of it talks to a Postgres testcontainer.
+#           go vet + go test -race + helm lint + helm template (four value
+#           sets, each strict-parsed with kustomize).
+#
+#   tier2   before commit.
+#           tier1 + a coverage run + Paho v3 + Paho v5 against one broker.
+#           Requires --paho /path/to/paho.mqtt.testing.
+#           CI runs this as the `conformance` job on every PR and push.
+#
+#   tier3   before tag.
+#           tier2 + a 3-replica kind cluster: multi-broker Paho, helm
+#           test, and two soak smokes (QoS 1, 60s × 1000 msg/s; QoS 0,
+#           120s × 100 msg/s).
+#           CI runs this weekly (soak-weekly.yml).
+#
+# Measured wall-clock per tier is in scripts/validate-timings.md.
 #
 # --vulncheck adds a govulncheck phase to any tier. Off by default because
 # it fails on advisories published against unchanged code (often stdlib,
 # fixable only by a toolchain bump), which is a different signal from
 # "did my change break something". CI runs it as its own job.
 #
-#   tier2   slow — before commit. ~5–10 min.
-#           tier1 + make coverage + Paho v3 + Paho v5 single-broker.
-#           Requires --paho /path/to/paho.mqtt.testing.
-#
-#   tier3   full — before tag / nightly CI.
-#           tier2 + multi-broker Paho via kind + helm test in kind +
-#           soak smoke (60s × 1000 msg/s).
+# --keep-cluster leaves the tier3 kind cluster running when the script
+# exits, pass or fail, so it can be inspected.
 #
 # Usage:
 #   scripts/validate.sh tier1
@@ -216,6 +225,7 @@ run_tier2() {
 # parallel sessions don't collide.
 T3_CLUSTER="pgmqtt-validate-tier3-$$"
 T3_NS="mqtt"
+T3_TEST_USER="smoketest"
 
 t3_multi_broker_setup() {
     docker build --quiet -t pgmqtt:tier3 . >/dev/null
@@ -235,6 +245,8 @@ t3_multi_broker_setup() {
         --set 'limits.maxConnectsPerIPPerSec=0' \
         --set 'limits.maxAuthFailuresPerIPPerMin=0' \
         --set operator.bcryptCost=4 \
+        --set tests.enabled=true \
+        --set "tests.credentialsSecret=$T3_TEST_USER-mqtt-credentials" \
         --set "database.url=postgres://pgmqtt:pgmqtt@postgres.$T3_NS.svc:5432/pgmqtt?sslmode=disable" >/dev/null
     kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" rollout status deployment/pgmqtt --timeout=180s
 }
@@ -246,8 +258,49 @@ t3_multi_broker() {
         --version both
 }
 
+# `helm test` runs the chart's round-trip hook Pod, which logs in with the
+# credentials Secret the operator writes for a User CR. The Paho and soak
+# phases connect anonymously, so this is the one tier3 phase that goes
+# through the reconciler and password auth.
+t3_helm_test() {
+    local secret="$T3_TEST_USER-mqtt-credentials"
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" apply -f - <<EOF || return 1
+apiVersion: pgmqtt.io/v1alpha1
+kind: User
+metadata:
+  name: $T3_TEST_USER
+EOF
+    for _ in $(seq 1 60); do
+        if kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get secret "$secret" >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get secret "$secret" >/dev/null || return 1
+    # No --logs: the hook's delete policy removes the Pod on success, and
+    # helm then fails the test because it cannot fetch the logs. A failed
+    # Pod is kept, and t3_diagnostics prints it.
+    helm --kube-context "kind-$T3_CLUSTER" -n "$T3_NS" test pgmqtt --timeout 180s
+}
+
+t3_diagnostics() {
+    echo "==> [$TIER] cluster state after a failed phase" >&2
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get pods -o wide >&2 || true
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" logs -l app.kubernetes.io/name=pgmqtt \
+        --all-containers --prefix --tail=200 >&2 || true
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get events --sort-by=.lastTimestamp 2>&1 | tail -30 >&2 || true
+}
+
 t3_multi_broker_teardown() {
+    if [ -n "$KEEP_CLUSTER" ]; then
+        echo "validate.sh: --keep-cluster: kind cluster '$T3_CLUSTER' left running (kind delete cluster --name $T3_CLUSTER)"
+        return 0
+    fi
     kind delete cluster --name "$T3_CLUSTER" >/dev/null 2>&1 || true
+}
+
+t3_on_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] || t3_diagnostics
+    t3_multi_broker_teardown
 }
 
 t3_soak_smoke() {
@@ -287,13 +340,13 @@ t3_soak_homelab() {
 
 run_tier3() {
     run_tier2
-    # tier3 reuses one kind cluster for both multi-broker paho and the
-    # soak smokes — same broker install, no per-phase teardown. The
-    # cluster is created in t3_multi_broker_setup and torn down in
-    # t3_multi_broker_teardown.
+    # tier3 reuses one kind cluster for multi-broker paho, helm test and
+    # the soak smokes — same broker install, no per-phase teardown. The
+    # trap is set before setup so a half-built cluster is cleaned up too.
+    trap t3_on_exit EXIT
     phase "tier3 cluster setup" t3_multi_broker_setup
-    trap t3_multi_broker_teardown EXIT
     phase "multi-broker paho"   t3_multi_broker
+    phase "helm test"           t3_helm_test
     phase "soak smoke (qos1)"   t3_soak_smoke
     phase "soak smoke (qos0)"   t3_soak_homelab
     phase "tier3 cluster teardown" t3_multi_broker_teardown
