@@ -168,6 +168,17 @@ renders() {
         --set probes.readiness.initialDelaySeconds=0
     has overrides 'app.kubernetes.io/name: broker'
     has overrides 'name: mqtt-leader-election'
+    # Cluster-scoped names carry the namespace; the Lease name follows the
+    # release.
+    has overrides 'name: "mqtt:default"'
+    has overrides 'value: "mqtt-operator"'
+
+    # The Lease name has to stay a DNS label of at most 63 characters.
+    local x53; x53="$(printf 'x%.0s' {1..53})"
+    render long-name \
+        --set database.url='postgres://x/y' \
+        --set fullnameOverride="$x53-yyyyyyyyy"
+    has long-name "value: \"$x53-operator\""
     lacks overrides 'initialDelaySeconds: 5'
     lacks overrides 'initialDelaySeconds: 2'
 
