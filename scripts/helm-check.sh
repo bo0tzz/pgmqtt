@@ -171,6 +171,21 @@ renders() {
     lacks overrides 'initialDelaySeconds: 5'
     lacks overrides 'initialDelaySeconds: 2'
 
+    # A disabled listener is advertised to the operator as port 0, and the
+    # TCP probes move to the listener that is left.
+    render ws-only \
+        --set database.url='postgres://x/y' \
+        --set listeners.tcp.enabled=false \
+        --set probes.useHTTP=false
+    lacks ws-only '"1883"'
+    has ws-only '"8083"'
+
+    render tcp-only \
+        --set database.url='postgres://x/y' \
+        --set listeners.ws.enabled=false
+    lacks tcp-only '"8083"'
+    has tcp-only '"1883"'
+
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \
         --set database.url='postgres://x/y' \

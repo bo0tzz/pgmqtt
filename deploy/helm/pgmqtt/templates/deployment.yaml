@@ -97,10 +97,12 @@ spec:
             {{- end }}
             - name: PGMQTT_SERVICE_HOST
               value: {{ include "pgmqtt.serviceHost" . | quote }}
+            # 0 tells the operator not to advertise that listener in the
+            # credentials Secrets it generates.
             - name: PGMQTT_SERVICE_PORT
-              value: {{ .Values.listeners.tcp.port | quote }}
+              value: {{ ternary .Values.listeners.tcp.port 0 .Values.listeners.tcp.enabled | int | quote }}
             - name: PGMQTT_SERVICE_WS_PORT
-              value: {{ .Values.listeners.ws.port | quote }}
+              value: {{ ternary .Values.listeners.ws.port 0 .Values.listeners.ws.enabled | int | quote }}
             # Numeric env values pipe through `int` before quote because helm
             # / sprig render large integers (≥ 16M-ish) in Go's %v scientific
             # notation ("1.6777216e+07"), which the broker's strconv.Atoi

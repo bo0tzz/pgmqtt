@@ -3,10 +3,16 @@ NOTES.txt — printed after `helm install`/`helm upgrade`. Operators read
 this; keep it about the things they actually need to act on.
 */ -}}
 pgmqtt {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+{{- if .Values.listeners.tcp.enabled }}
 
 Reach the broker:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pgmqtt.fullname" . }} 1883:{{ .Values.listeners.tcp.port }}
   mosquitto_sub -h 127.0.0.1 -t test -u <user> -P <pass> -d
+{{- else }}
+
+Reach the broker (WebSocket only, path /mqtt):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pgmqtt.fullname" . }} 8083:{{ .Values.listeners.ws.port }}
+{{- end }}
 
 Create an MQTT user (the broker reads from Postgres via the operator):
   cat <<EOF | kubectl apply -f -
