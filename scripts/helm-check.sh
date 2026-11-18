@@ -26,9 +26,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHART="$ROOT/deploy/helm/pgmqtt"
 OUT="${HELM_CHECK_OUT:-/tmp/pgmqtt-helm-check}"
+# Render against the chart's kubeVersion floor rather than whatever default
+# the installed helm was built with.
+KUBE_VERSION=1.30.0
 
 lint() {
-    helm lint "$CHART" --set database.url='postgres://x/y'
+    helm lint "$CHART" --kube-version "$KUBE_VERSION" --set database.url='postgres://x/y'
 }
 
 # render <name> <helm args...>
@@ -36,7 +39,7 @@ render() {
     local name="$1"; shift
     local dir="$OUT/$name"
     mkdir -p "$dir"
-    helm template pgmqtt "$CHART" "$@" > "$dir/rendered.yaml"
+    helm template pgmqtt "$CHART" --kube-version "$KUBE_VERSION" "$@" > "$dir/rendered.yaml"
     test -s "$dir/rendered.yaml"
     printf 'resources:\n  - rendered.yaml\n' > "$dir/kustomization.yaml"
     if ! kustomize build "$dir" > /dev/null; then
@@ -74,7 +77,7 @@ lacks() {
 # reject at render time, with an error that names the actual problem.
 refuses() {
     local name="$1" want="$2" err; shift 2
-    if err="$(helm template pgmqtt "$CHART" "$@" 2>&1 > /dev/null)"; then
+    if err="$(helm template pgmqtt "$CHART" --kube-version "$KUBE_VERSION" "$@" 2>&1 > /dev/null)"; then
         echo "helm-check: '$name' rendered but the chart should refuse it" >&2
         return 1
     fi
@@ -102,6 +105,11 @@ renders() {
         --set probes.enabled=false
     has probes-off 'sleep:'
     lacks probes-off 'Probe:'
+
+    # The sleep handler is off by default before Kubernetes 1.30.
+    refuses old-kubernetes 'kubeVersion' \
+        --set database.url='postgres://x/y' \
+        --kube-version 1.29.0
 
     refuses prestop-outlasts-grace 'lifecycle.preStopSleepSeconds must be less than' \
         --set database.url='postgres://x/y' \
