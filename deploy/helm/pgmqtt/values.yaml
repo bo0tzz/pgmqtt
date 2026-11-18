@@ -484,7 +484,7 @@ crds:
   install: true
 
 ## Service host advertised in auto-generated User credential Secrets. Defaults
-## to <release-name>.<namespace>.svc.cluster.local.
+## to the chart's Service, <fullname>.<namespace>.svc.cluster.local.
 operator:
   serviceHost: ""
   ## Bcrypt cost used by the User reconciler when hashing passwords for the
@@ -493,11 +493,11 @@ operator:
 
 ## Janitor base tick frequency (the GCD of per-job stratified intervals).
 ## 1s default. fire_due_wills runs at this cadence (Paho v5 test_will_delay
-## asserts will-fire within 1s of WillDelayInterval); cleanup jobs run on
-## stratified 5s/10s/30s cadences internally, so idle DB churn is roughly
-## 5× lower than naive "every-job-every-tick". Lowering this also lowers
-## the per-job intervals' resolution. 0 leaves the broker's compiled-in
-## default (1s).
+## asserts will-fire within 1s of WillDelayInterval), as does
+## expire_sessions; the other jobs run on stratified 5s/10s/30s cadences
+## internally, so idle DB churn is roughly 5× lower than naive
+## "every-job-every-tick". Lowering this also lowers the per-job
+## intervals' resolution. 0 leaves the broker's compiled-in default (1s).
 janitor:
   intervalMs: 1000
 
