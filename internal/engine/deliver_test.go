@@ -377,6 +377,21 @@ func TestOversizeMessageIsDroppedNotStuck(t *testing.T) {
 	pub.Publish(t, "os/retained/big", big, 0, true)
 	pub.Publish(t, "os/retained/a", []byte("a"), 0, true)
 	pub.Publish(t, "os/retained/b", []byte("b"), 0, true)
+	// QoS 0 is not acknowledged: wait until the broker has stored all
+	// three, so the subscription below is not racing their publication.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		var n int
+		if err := h.Pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM retained WHERE topic LIKE 'os/retained/%'`).Scan(&n); err != nil {
+			t.Fatalf("count retained: %v", err)
+		}
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 3 retained messages stored", n)
+		}
+	}
 
 	sub := h.Connect(t, "os-sub", small)
 	defer sub.Close()
