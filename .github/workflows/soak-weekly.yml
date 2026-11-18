@@ -1,15 +1,17 @@
 name: soak-weekly
 
-# Tier-3 soak: in-cluster traffic generator + multi-broker paho conformance.
-# Mondays 04:00 UTC. The packet-cap=1-byte regression that escaped prior to
-# 0010 would have been caught here — multi-pod fanout hammered with sustained
-# QoS-1 publishes, parsed for loss/dups in the JSON output.
+# Weekly, Mondays 04:00 UTC. Two independent jobs; either one failing
+# fails the run.
+#
+#   tier3  `scripts/validate.sh tier3`, the same command that is run by
+#          hand before a tag: tier 2, then multi-broker Paho conformance,
+#          `helm test` and two short soaks against a 3-replica kind
+#          cluster. Nothing else in CI runs conformance across brokers.
+#   soak   a 60 s QoS 1 soak, then a 30-minute low-rate QoS 0 soak in the
+#          shape pgmqtt is deployed in, which is too long for tier 3.
 
 on:
   schedule:
-    # Mondays 04:00 UTC: weekly is enough for a soak (each run is ~10–15m
-    # of cluster time + image build + helm install). Tier-2 nightly already
-    # covers protocol drift; this catches deploy-shape + sustained-load bugs.
     - cron: '0 4 * * 1'
   workflow_dispatch: {}
 
@@ -17,6 +19,53 @@ permissions:
   contents: read
 
 jobs:
+  tier3:
+    name: tier3 (multi-broker paho + helm test + soak smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: latest
+
+      - name: install paho deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install paho-mqtt
+
+      - name: clone paho.mqtt.testing
+        run: git clone --depth 1 https://github.com/eclipse/paho.mqtt.testing /tmp/paho
+
+      - name: tier3 validate
+        # kind, kubectl and kustomize ship on ubuntu-latest. validate.sh
+        # creates its own kind cluster, dumps pod state and broker logs
+        # if a cluster phase fails, and deletes the cluster on exit.
+        run: bash scripts/validate.sh tier3 --paho /tmp/paho
+
+      - name: upload tier3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tier3-${{ github.run_id }}
+          path: |
+            /tmp/pgmqttd-validate-*.log
+            /tmp/paho-incluster-*.log
+            /tmp/soak-incluster-*.json
+            /tmp/soak-incluster-*.log
+          if-no-files-found: warn
+          retention-days: 30
+
   soak-incluster:
     name: soak (kind + helm + in-cluster pod)
     runs-on: ubuntu-latest
@@ -107,18 +156,6 @@ jobs:
             --inflight 1 \
             --qos 0
 
-      - name: tier3 multi-broker paho (optional)
-        # The existing tier3 helper spins its own kind cluster (it predates
-        # this workflow). We run it after the soak so a soak failure surfaces
-        # quickly even if paho would also flake. Best-effort: a paho run
-        # red here is informational, the soak verdict is the gate.
-        if: always()
-        continue-on-error: true
-        run: |
-          python3 -m pip install paho-mqtt
-          git clone --depth 1 https://github.com/eclipse/paho.mqtt.testing /tmp/paho
-          bash scripts/paho-multi-broker.sh --paho /tmp/paho --version both
-
       - name: collect cluster diagnostics on failure
         if: failure()
         run: |
@@ -137,6 +174,5 @@ jobs:
           path: |
             /tmp/soak-incluster-*.json
             /tmp/soak-incluster-*.log
-            /tmp/paho-multi-results.txt
           if-no-files-found: warn
           retention-days: 30
