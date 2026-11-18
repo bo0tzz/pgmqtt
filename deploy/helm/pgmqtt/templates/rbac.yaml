@@ -3,13 +3,15 @@
 # User CR. The User CRD is namespaced and intentionally lives anywhere —
 # operators put Users in whatever namespace makes sense for their
 # workload (per-app, per-team, etc.). Cross-namespace Secret RBAC is the
-# trade-off for that flexibility — a compromised broker pod can read
-# any Secret cluster-wide. To narrow scope, fork the chart and replace
-# this ClusterRole with a per-namespace Role wherever Users live.
+# trade-off for that flexibility. RBAC cannot limit the rule to the
+# generated Secrets, so the broker ServiceAccount, and with it a
+# compromised broker pod, can read, create and overwrite every Secret
+# in every namespace (not delete). To narrow scope, fork the chart and
+# replace this ClusterRole with a per-namespace Role wherever Users live.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "pgmqtt.fullname" . }}
+  name: {{ include "pgmqtt.clusterScopedName" . | quote }}
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
     app.kubernetes.io/component: broker
@@ -30,14 +32,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "pgmqtt.fullname" . }}
+  name: {{ include "pgmqtt.clusterScopedName" . | quote }}
   labels:
     {{- include "pgmqtt.labels" . | nindent 4 }}
     app.kubernetes.io/component: broker
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "pgmqtt.fullname" . }}
+  name: {{ include "pgmqtt.clusterScopedName" . | quote }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "pgmqtt.fullname" . }}

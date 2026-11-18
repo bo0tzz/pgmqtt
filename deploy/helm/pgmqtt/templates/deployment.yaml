@@ -1,3 +1,6 @@
+{{- if not (or .Values.listeners.tcp.enabled .Values.listeners.ws.enabled) }}
+{{- fail "listeners.tcp.enabled and listeners.ws.enabled are both false: pgmqttd exits at startup without a listener" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,7 +10,9 @@ metadata:
     {{- include "pgmqtt.labels" . | nindent 4 }}
     app.kubernetes.io/component: broker
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -22,7 +27,7 @@ spec:
       labels:
         {{- include "pgmqtt.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: broker
-        {{- with .Values.podLabels }}
+        {{- with omit (.Values.podLabels | default dict) "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.podAnnotations }}
@@ -73,6 +78,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: PGMQTT_LEADER_ELECTION_ID
+              value: {{ include "pgmqtt.leaderElectionID" . | quote }}
             - name: PGMQTT_DATABASE_URL
               {{- if .Values.database.existingSecret }}
               valueFrom:
@@ -92,10 +99,12 @@ spec:
             {{- end }}
             - name: PGMQTT_SERVICE_HOST
               value: {{ include "pgmqtt.serviceHost" . | quote }}
+            # 0 tells the operator not to advertise that listener in the
+            # credentials Secrets it generates.
             - name: PGMQTT_SERVICE_PORT
-              value: {{ .Values.listeners.tcp.port | quote }}
+              value: {{ ternary .Values.listeners.tcp.port 0 .Values.listeners.tcp.enabled | int | quote }}
             - name: PGMQTT_SERVICE_WS_PORT
-              value: {{ .Values.listeners.ws.port | quote }}
+              value: {{ ternary .Values.listeners.ws.port 0 .Values.listeners.ws.enabled | int | quote }}
             # Numeric env values pipe through `int` before quote because helm
             # / sprig render large integers (≥ 16M-ish) in Go's %v scientific
             # notation ("1.6777216e+07"), which the broker's strconv.Atoi
@@ -134,7 +143,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
             - name: PGMQTT_METRICS_ADDR
-              value: {{ if .Values.metrics.enabled }}":{{ .Values.metrics.port }}"{{ else }}""{{ end }}
+              value: {{ if include "pgmqtt.httpServerEnabled" . }}":{{ .Values.metrics.port }}"{{ else }}""{{ end }}
           {{- with .Values.extraEnvFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
@@ -150,7 +159,7 @@ spec:
               containerPort: {{ .Values.listeners.ws.port }}
               protocol: TCP
             {{- end }}
-            {{- if .Values.metrics.enabled }}
+            {{- if include "pgmqtt.httpServerEnabled" . }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
@@ -160,15 +169,15 @@ spec:
           # because the metrics-port endpoints can distinguish "process
           # alive" from "PG wedged" — readiness flips the pod out of the
           # Service when the pgxpool can't reach Postgres. The tcpSocket
-          # fallback below stays for environments without an HTTP metrics
-          # port; it also emits a "read connect" DEBUG line per probe
-          # because kubelet doesn't speak MQTT.
+          # fallback below is for running without the HTTP server; it
+          # also emits a "read connect" DEBUG line per probe because
+          # kubelet doesn't speak MQTT.
           {{- if .Values.probes.useHTTP }}
           livenessProbe:
             httpGet:
               path: /healthz/live
               port: metrics
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            initialDelaySeconds: {{ int .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
@@ -177,7 +186,7 @@ spec:
             httpGet:
               path: /healthz/ready
               port: metrics
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            initialDelaySeconds: {{ int .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
@@ -186,7 +195,7 @@ spec:
           livenessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
+            initialDelaySeconds: {{ int .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
@@ -194,7 +203,7 @@ spec:
           readinessProbe:
             tcpSocket:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 2 }}
+            initialDelaySeconds: {{ int .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 1 }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
@@ -208,11 +217,19 @@ spec:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
             periodSeconds: {{ .Values.probes.startup.periodSeconds | default 5 }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+          {{- end }}
           {{- if .Values.lifecycle.preStop }}
           lifecycle:
             preStop:
               {{- toYaml .Values.lifecycle.preStop | nindent 14 }}
+          {{- else if gt (int .Values.lifecycle.preStopSleepSeconds) 0 }}
+          {{- if ge (int .Values.lifecycle.preStopSleepSeconds) (int .Values.terminationGracePeriodSeconds) }}
+          {{- fail "lifecycle.preStopSleepSeconds must be less than terminationGracePeriodSeconds: the sleep counts against the grace period, so the broker would be SIGKILLed before it can drain" }}
           {{- end }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.lifecycle.preStopSleepSeconds }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -235,6 +252,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- if .Values.podAntiAffinity.enabled }}
+        {{- if hasKey (.Values.affinity | default dict) "podAntiAffinity" }}
+        {{- fail "podAntiAffinity.enabled=true cannot be combined with affinity.podAntiAffinity: write the whole anti-affinity rule under affinity, or remove it from there" }}
+        {{- end }}
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: {{ .Values.podAntiAffinity.weight }}

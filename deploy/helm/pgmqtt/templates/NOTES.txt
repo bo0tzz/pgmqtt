@@ -3,10 +3,16 @@ NOTES.txt — printed after `helm install`/`helm upgrade`. Operators read
 this; keep it about the things they actually need to act on.
 */ -}}
 pgmqtt {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+{{- if .Values.listeners.tcp.enabled }}
 
 Reach the broker:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pgmqtt.fullname" . }} 1883:{{ .Values.listeners.tcp.port }}
   mosquitto_sub -h 127.0.0.1 -t test -u <user> -P <pass> -d
+{{- else }}
+
+Reach the broker (WebSocket only, path /mqtt):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pgmqtt.fullname" . }} 8083:{{ .Values.listeners.ws.port }}
+{{- end }}
 
 Create an MQTT user (the broker reads from Postgres via the operator):
   cat <<EOF | kubectl apply -f -
@@ -22,14 +28,32 @@ Create an MQTT user (the broker reads from Postgres via the operator):
 {{- if not .Values.networkPolicy.enabled }}
 
 ⚠  NetworkPolicy is OFF.
-   The chart's ClusterRole grants the broker SA read access to Secrets
-   cluster-wide (so the operator can resolve passwordSecretRef across
-   namespaces). With no NetworkPolicy, an RCE on the broker pod would
-   expose every Secret in the cluster.
+   The chart's ClusterRole lets the broker ServiceAccount read, create
+   and overwrite Secrets in every namespace (the operator writes each
+   User's credentials Secret next to the User and reads its
+   passwordSecretRef). Code execution in a broker pod gets the same
+   access. A NetworkPolicy does not take that access away; it limits
+   what else such a pod can reach and where it can send what it reads.
 
    For homelab/production: enable networkPolicy with `egress.postgres`
    pinned to your CNPG/postgres-operator selector before exposing the
    broker outside its VLAN.
+{{- end }}
+
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.egress.postgres) }}
+
+ℹ  networkPolicy.egress.postgres is empty, so the policy allows egress
+   to any destination on TCP {{ .Values.networkPolicy.egress.postgresPort }}.
+   Pin it to your Postgres pods or CIDR.
+{{- end }}
+
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.egress.kubernetesAPI) }}
+
+⚠  networkPolicy.egress.kubernetesAPI is empty.
+   The fallback rule selects API server pods by label. Most network
+   plugins do not match a host-network API server that way; if the
+   operator logs API timeouts and Users stay unreconciled, set it:
+     --set 'networkPolicy.egress.kubernetesAPI[0].ipBlock.cidr=<api-server-ip>/32'
 {{- end }}
 
 {{- if and (not .Values.database.url) (not .Values.database.existingSecret) }}
@@ -52,20 +76,12 @@ Create an MQTT user (the broker reads from Postgres via the operator):
      --set serviceMonitor.labels.release=prometheus
 {{- end }}
 
-{{- if and .Values.tests.enabled (not .Values.tests.credentialsSecret) }}
+{{- if and .Values.tests.enabled .Values.listeners.tcp.enabled }}
 
-ℹ  helm test will spin up a mosquitto Pod that needs MQTT credentials.
-   Apply a User CR named e.g. `smoketest` (which auto-creates
-   `smoketest-mqtt-credentials`) BEFORE running `helm test`.
-{{- end }}
-
-{{- if and .Values.autoscaling.enabled (le (int .Values.replicaCount) 1) }}
-
-ℹ  autoscaling is enabled but replicaCount={{ .Values.replicaCount }}.
-   The HPA will adjust replicas, but Helm continues to template the
-   manifest with the static replicaCount; subsequent `helm upgrade`
-   may fight the HPA. Either drop replicaCount: 1 to a comment, or
-   configure the HPA's minReplicas to match.
+ℹ  `helm test` runs a mosquitto Pod that reads MQTT credentials from the
+   Secret `{{ .Values.tests.credentialsSecret }}` in this namespace.
+   Create it BEFORE running `helm test`: a User CR named `<name>` gets
+   the Secret `<name>-mqtt-credentials`.
 {{- end }}
 
 For ops, see the README and the sizing-matrix comment in values.yaml

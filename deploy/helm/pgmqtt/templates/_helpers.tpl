@@ -45,3 +45,35 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s.%s.svc.cluster.local" (include "pgmqtt.fullname" .) .Release.Namespace -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The binary serves /metrics and /healthz/* from one HTTP server, so the
+server has to stay up for HTTP probes even when metrics.enabled=false.
+Renders "true" or nothing.
+*/}}
+{{- define "pgmqtt.httpServerEnabled" -}}
+{{- if or .Values.metrics.enabled (and .Values.probes.enabled .Values.probes.useHTTP) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Name of the cluster-scoped RBAC objects. fullname is only unique within a
+namespace, so two releases with the same name in different namespaces
+would otherwise claim the same ClusterRole. The colon cannot occur in a
+namespace or in fullname, which keeps "a-b" in "c" apart from "a" in "b-c".
+*/}}
+{{- define "pgmqtt.clusterScopedName" -}}
+{{- printf "%s:%s" (include "pgmqtt.fullname" .) .Release.Namespace -}}
+{{- end -}}
+
+{{/*
+Lease name for the embedded operator's leader election, at most 63
+characters. Two releases in one namespace must not share a Lease, or only
+one of them ever reconciles. A release whose fullname is "pgmqtt" keeps
+the name the binary used to hard-code, so upgrading it does not elect a
+second leader while old and new Pods overlap.
+*/}}
+{{- define "pgmqtt.leaderElectionID" -}}
+{{- printf "%s-operator" (regexReplaceAll "[^a-z0-9]+$" (include "pgmqtt.fullname" . | trunc 54) "") -}}
+{{- end -}}
