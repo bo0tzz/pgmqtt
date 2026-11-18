@@ -26,12 +26,15 @@
 // time-bound spec precision:
 //
 //	fire_due_wills          1s   Paho test_will_delay asserts within 1s
-//	expire_sessions         5s   SessionExpiryInterval is minutes-hours
+//	expire_sessions         1s   Paho test_session_expiry allows 1s of slack
 //	expire_retained         5s   MessageExpiryInterval is seconds-grade
+//	expire_deliveries       5s   same, for messages queued to a client
 //	find_dead_brokers       5s   a dead broker is reaped after DeadBrokerGrace
 //	handle_dead_broker      —    fired in the same tick as find_dead_brokers
 //	refresh_deliveries_gauge 10s sub-minute observability gauge
 //	refresh_state_gauges    10s  sub-minute observability gauge
+//	refresh_notify_queue    10s  sub-minute observability gauge
+//	repair_sessions         30s  rows no current code path leaves behind
 //	sweep_inbound_qos2      30s  grace 1h default
 //	sweep_orphan_deliveries 30s  grace 10min default
 //	sweep_orphan_messages   30s  grace 10min default
@@ -117,6 +120,8 @@ const (
 	JobRefreshStateGauges    = "refresh_state_gauges"
 	JobSweepOrphanMessages   = "sweep_orphan_messages"
 	JobRefreshNotifyQueue    = "refresh_notify_queue"
+	JobExpireDeliveries      = "expire_deliveries"
+	JobRepairSessions        = "repair_sessions"
 )
 
 // defaultJobIntervals defines the per-job cadence. The base ticker fires
@@ -139,6 +144,8 @@ var defaultJobIntervals = map[string]time.Duration{
 	JobRefreshStateGauges:     10 * time.Second,
 	JobSweepOrphanMessages:    30 * time.Second,
 	JobRefreshNotifyQueue:     10 * time.Second,
+	JobExpireDeliveries:       5 * time.Second,
+	JobRepairSessions:         30 * time.Second,
 }
 
 // suspect is one unbroken run of probes that found a broker's lock free.
@@ -385,6 +392,8 @@ func (j *Janitor) Tick(ctx context.Context) error {
 		{JobFireDueWills, j.fireDueWills},
 		{JobExpireSessions, j.expireSessions},
 		{JobExpireRetained, j.expireRetained},
+		{JobExpireDeliveries, j.expireDeliveries},
+		{JobRepairSessions, j.repairSessions},
 		{JobSweepInboundQoS2, j.sweepInboundQoS2},
 		{JobSweepOrphanDeliveries, j.sweepOrphanDeliveries},
 		{JobRefreshDeliveriesGauge, j.refreshDeliveriesGauge},
@@ -539,11 +548,26 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 	}
 	defer tx.Rollback(ctx)
 
+	// A session ending is one of the two things that make its will due
+	// [MQTT-3.1.2-8], so an expired session that still holds one is not
+	// deleted: its will is made due, and the row goes on a later tick,
+	// once the will is out. Deleting it here would lose the will whenever
+	// publishing it had failed or it was scheduled past the expiry.
+	if _, err := tx.Exec(ctx, `
+		UPDATE sessions SET will_fire_at = now()
+		 WHERE connected = false
+		   AND session_expires_at <= now()
+		   AND will_topic IS NOT NULL
+		   AND (will_fire_at IS NULL OR will_fire_at > now())
+	`); err != nil {
+		return err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT client_id FROM sessions
 		 WHERE connected = false
 		   AND session_expires_at IS NOT NULL
 		   AND session_expires_at <= now()
+		   AND will_topic IS NULL
 		 FOR UPDATE
 	`)
 	if err != nil {
@@ -585,37 +609,81 @@ func (j *Janitor) expireSessions(ctx context.Context) error {
 // removed by an out-of-band path (operator psql, restore from backup);
 // the in-broker delete paths clean explicitly. Rare in steady state.
 func (j *Janitor) sweepOrphanDeliveries(ctx context.Context) error {
-	// Two cases both yield deliveries that no live client will ever drain:
-	//
-	//   (a) The session row is gone (graceful clean_start=true disconnect,
-	//       or an out-of-band DELETE). Pre-existing case.
-	//   (b) The session row is still there but the client disconnected as
-	//       clean_start=true a while ago. v3 doesn't model session expiry,
-	//       and ungraceful disconnects don't always run the session-DELETE
-	//       cleanup path, so these can sit indefinitely with their
-	//       deliveries (real-world: 11.7k stranded rows from a 3-day-old
-	//       `auto-aa1256f3` session). Wait `orphanGrace` past last_seen
-	//       before deleting so a momentary reconnect-flap doesn't lose
-	//       in-flight QoS-1 rows.
+	// deliveries has no foreign key to sessions (0006), so rows can
+	// outlive theirs. A session that still exists is never touched here,
+	// connected or not: whether its queue is kept is decided by its
+	// Session Expiry when the session ends, not by clean_start, which a
+	// v5 client sets on a perfectly persistent session.
 	cutoff := time.Now().Add(-j.orphanGrace)
 	ct, err := j.pool.Exec(ctx, `
-		DELETE FROM deliveries
-		 WHERE NOT EXISTS (
-		    SELECT 1 FROM sessions s WHERE s.client_id = deliveries.client_id
-		 )
-		    OR client_id IN (
-		    SELECT s.client_id FROM sessions s
-		     WHERE s.client_id = deliveries.client_id
-		       AND s.connected = false
-		       AND s.clean_start = true
-		       AND s.last_seen < $1
-		 )
+		DELETE FROM deliveries d
+		 WHERE d.created_at < $1
+		   AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.client_id = d.client_id)
 	`, cutoff)
 	if err == nil && j.metrics != nil {
 		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobSweepOrphanDeliveries).
 			Add(float64(ct.RowsAffected()))
 	}
 	return err
+}
+
+// expireDeliveries deletes queued deliveries whose message has expired
+// before delivery started [MQTT-3.3.2-5]. A connected client's sender
+// drops these as it meets them; this is for clients that are away, whose
+// expired rows would otherwise sit there counting against their queue
+// cap until they came back.
+func (j *Janitor) expireDeliveries(ctx context.Context) error {
+	ct, err := j.pool.Exec(ctx, `
+		DELETE FROM deliveries d
+		 USING messages m
+		 WHERE m.id = d.message_id
+		   AND d.state = 0
+		   AND m.expires_at <= now()
+	`)
+	if err == nil && j.metrics != nil {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobExpireDeliveries).
+			Add(float64(ct.RowsAffected()))
+	}
+	return err
+}
+
+// repairSessions puts right three kinds of session row that Engine.endSession
+// never leaves behind, but that brokers before 0.3.0 did, on every
+// shutdown and every reap, and still do while any are running during an
+// upgrade. Each is a disconnected, unowned row that is missing the one
+// thing that would ever move it on:
+//
+//   - a will with no fire time: it could never be published. It is made
+//     due now (late, but the client has not come back);
+//   - a finite Session Expiry Interval with no expiry time: the session
+//     would never expire. Its clock starts now;
+//   - a session that was meant to end with its connection, still here.
+//     It is deleted, once any will it has is out.
+func (j *Janitor) repairSessions(ctx context.Context) error {
+	const stranded = `NOT connected AND broker_id IS NULL`
+	var repaired int64
+	for _, q := range []string{
+		`UPDATE sessions SET will_fire_at = now()
+		  WHERE ` + stranded + ` AND will_topic IS NOT NULL AND will_fire_at IS NULL`,
+		`UPDATE sessions SET session_expires_at = now() + expiry_interval * interval '1 second'
+		  WHERE ` + stranded + ` AND session_expires_at IS NULL
+		    AND expiry_interval > 0 AND expiry_interval < 2147483647`,
+		`DELETE FROM sessions
+		  WHERE ` + stranded + ` AND expiry_interval = 0 AND will_topic IS NULL`,
+	} {
+		ct, err := j.pool.Exec(ctx, q)
+		if err != nil {
+			return err
+		}
+		repaired += ct.RowsAffected()
+	}
+	if repaired > 0 {
+		j.logger.Info("repaired session rows left by an older broker", "rows", repaired)
+		if j.metrics != nil {
+			j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobRepairSessions).Add(float64(repaired))
+		}
+	}
+	return nil
 }
 
 // expireRetained drops retained rows past their MessageExpiryInterval.
@@ -900,8 +968,9 @@ func (j *Janitor) forgetSuspectsExcept(candidates []uuid.UUID) {
 }
 
 // sweepOrphanMessages deletes messages with no referencing deliveries that are
-// older than the grace period. (Deliveries cascade-delete on session cleanup,
-// so abandoned messages accumulate without a sweep.)
+// older than the grace period. A message's deliveries go one by one, as
+// each is acknowledged or its session ends, and nothing else notices when
+// the last one has.
 func (j *Janitor) sweepOrphanMessages(ctx context.Context) error {
 	tx, err := j.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -929,6 +998,3 @@ func (j *Janitor) sweepOrphanMessages(ctx context.Context) error {
 	}
 	return nil
 }
-
-// Compile-time guard to keep handler errors from being unused.
-var _ = errors.New

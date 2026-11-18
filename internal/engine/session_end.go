@@ -119,6 +119,9 @@ func (e *Engine) endSession(ctx context.Context, s sessionEnd) (bool, error) {
 			return false, err
 		}
 	} else {
+		// expiry_interval is rewritten with the interval that was
+		// applied (a DISCONNECT may have changed it), NULL for "never",
+		// so the row alone says what its session_expires_at should be.
 		keepWill := s.Will != nil && !published
 		if _, err := tx.Exec(ctx, `
 			UPDATE sessions SET
@@ -127,6 +130,7 @@ func (e *Engine) endSession(ctx context.Context, s sessionEnd) (bool, error) {
 				last_seen=now(),
 				will_fire_at       = CASE WHEN $2 THEN now() + $3::bigint * interval '1 second' END,
 				session_expires_at = CASE WHEN $4 THEN now() + $5::bigint * interval '1 second' END,
+				expiry_interval    = CASE WHEN $4 THEN LEAST($5::bigint, 2147483646)::int END,
 				will_topic      = CASE WHEN $2 THEN will_topic END,
 				will_payload    = CASE WHEN $2 THEN will_payload END,
 				will_qos        = CASE WHEN $2 THEN will_qos END,
