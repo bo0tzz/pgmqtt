@@ -86,20 +86,28 @@ func runCapBoundary(t *testing.T, cap, seed int, expectReject bool) {
 	pub.Publish(t, "cap/y", []byte("boundary"), 1, false)
 
 	if expectReject {
-		if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		// The seed rows are queued for a connected client, so its sender
+		// may be sending them already (unacked, they still count). Skip
+		// those; the DISCONNECT must follow.
+		if err := sub.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			t.Fatalf("deadline: %v", err)
 		}
-		pk, err := sub.NextRaw()
-		if err != nil {
-			t.Fatalf("expected DISCONNECT, got read err: %v", err)
+		for {
+			pk, err := sub.NextRaw()
+			if err != nil {
+				t.Fatalf("expected DISCONNECT, got read err: %v", err)
+			}
+			if pk.FixedHeader.Type == packets.Publish && string(pk.Payload) == "seed" {
+				continue
+			}
+			if pk.FixedHeader.Type != packets.Disconnect {
+				t.Fatalf("expected DISCONNECT, got type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
+			}
+			if pk.ReasonCode != 0x97 {
+				t.Fatalf("expected reason 0x97, got 0x%X", pk.ReasonCode)
+			}
+			return
 		}
-		if pk.FixedHeader.Type != packets.Disconnect {
-			t.Fatalf("expected DISCONNECT, got type=%d", pk.FixedHeader.Type)
-		}
-		if pk.ReasonCode != 0x97 {
-			t.Fatalf("expected reason 0x97, got 0x%X", pk.ReasonCode)
-		}
-		return
 	}
 
 	// Accepted path: deliveries row count for cap-sub must increase by 1.

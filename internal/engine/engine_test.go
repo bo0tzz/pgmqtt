@@ -753,18 +753,28 @@ func TestSlowSubscriberQuotaExceeded(t *testing.T) {
 	defer pub.Close()
 	pub.Publish(t, "bp/y", []byte("overflow"), 1, false)
 
-	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	// The seeded rows are queued deliveries for a connected client, so its
+	// sender may already be sending them (they stay in flight, unacked,
+	// and still count against the cap). Skip those; the DISCONNECT must
+	// follow.
+	if err := sub.Conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("deadline: %v", err)
 	}
-	pk, err := sub.NextRaw()
-	if err != nil {
-		t.Fatalf("expected DISCONNECT, got read err: %v", err)
-	}
-	if pk.FixedHeader.Type != packets.Disconnect {
-		t.Fatalf("expected DISCONNECT, got type=%d", pk.FixedHeader.Type)
-	}
-	if pk.ReasonCode != 0x97 {
-		t.Fatalf("expected reason 0x97 (Quota Exceeded), got 0x%X", pk.ReasonCode)
+	for {
+		pk, err := sub.NextRaw()
+		if err != nil {
+			t.Fatalf("expected DISCONNECT, got read err: %v", err)
+		}
+		if pk.FixedHeader.Type == packets.Publish && string(pk.Payload) == "seed" {
+			continue
+		}
+		if pk.FixedHeader.Type != packets.Disconnect {
+			t.Fatalf("expected DISCONNECT, got type=%d payload=%q", pk.FixedHeader.Type, pk.Payload)
+		}
+		if pk.ReasonCode != 0x97 {
+			t.Fatalf("expected reason 0x97 (Quota Exceeded), got 0x%X", pk.ReasonCode)
+		}
+		return
 	}
 }
 
