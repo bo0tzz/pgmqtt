@@ -313,6 +313,9 @@ func (e *Engine) runOwnershipSweep(ctx context.Context) {
 			if err := e.sweepOrphanedSockets(ctx); err != nil {
 				e.logger.Warn("ownership sweep", "err", err)
 			}
+			if err := e.endOrphanedSessions(ctx); err != nil {
+				e.logger.Warn("orphaned session sweep", "err", err)
+			}
 			e.updateCapacityGauge()
 		}
 	}
@@ -554,19 +557,14 @@ func (e *Engine) shutdownGracefully() {
 			conns = append(conns, c)
 		}
 		e.connsMu.RUnlock()
+		// Closing a conn makes its goroutine record the end of its
+		// session (Conn.finish), which Serve waits for. There is no bulk
+		// "detach everything" afterwards: a session whose end could not
+		// be recorded stays owned by this broker, so that a peer's
+		// janitor ends it properly once this broker's lock has been
+		// gone for the grace. Detaching it here would strand its will.
 		for _, c := range conns {
 			c.gracefulClose()
-		}
-
-		// Detach this pod from sessions it owned.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if id := e.BrokerID(); id != uuid.Nil {
-			_, err := e.pool.Exec(ctx,
-				`UPDATE sessions SET connected=false, broker_id=NULL WHERE broker_id=$1`, id)
-			if err != nil {
-				e.logger.Warn("clear broker on shutdown", "err", err)
-			}
 		}
 	})
 }

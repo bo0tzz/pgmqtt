@@ -224,6 +224,17 @@ func NewMultiHarness(t *testing.T, n int, customise PodSetup) *MultiHarness {
 	return mh
 }
 
+// Shutdown stops this Pod the way SIGTERM does and waits for it to finish.
+func (p *Pod) Shutdown(t *testing.T) {
+	t.Helper()
+	p.cancel()
+	select {
+	case <-p.doneServe:
+	case <-time.After(30 * time.Second):
+		t.Fatal("pod shutdown timed out")
+	}
+}
+
 // Stop cancels all pods.
 func (mh *MultiHarness) Stop() {
 	for _, p := range mh.Pods {
@@ -257,6 +268,49 @@ type TestClient struct {
 	r      *mqttwire.Reader
 	pktid  atomic.Uint32
 	closed bool
+}
+
+// ConnectExpectReject sends a CONNECT that the broker is expected to
+// refuse and returns its reply: the CONNACK, or nil if the broker closed
+// the connection without one.
+func (h *Harness) ConnectExpectReject(t *testing.T, clientID string, opts ...func(*packets.Packet)) (*TestClient, *packets.Packet) {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", h.tcpAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	tc := &TestClient{Conn: c, r: mqttwire.NewReader(c)}
+	pk := &packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
+		ProtocolVersion: mqttwire.ProtocolMQTT5,
+		Connect: packets.ConnectParams{
+			ProtocolName:     []byte("MQTT"),
+			Clean:            true,
+			Keepalive:        60,
+			ClientIdentifier: clientID,
+			Username:         []byte("test"),
+			UsernameFlag:     true,
+			Password:         []byte("test"),
+			PasswordFlag:     true,
+		},
+	}
+	for _, o := range opts {
+		o(pk)
+	}
+	if err := mqttwire.Write(c, pk); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	tc.r.ProtocolVersion = pk.ProtocolVersion
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := tc.r.Read()
+	_ = c.SetReadDeadline(time.Time{})
+	if err != nil {
+		return tc, nil
+	}
+	if resp.FixedHeader.Type == packets.Connack && resp.ReasonCode == 0 {
+		t.Fatalf("CONNECT was accepted; expected a rejection")
+	}
+	return tc, &resp
 }
 
 // Connect opens a TCP connection and performs CONNECT (MQTT 5 by default).

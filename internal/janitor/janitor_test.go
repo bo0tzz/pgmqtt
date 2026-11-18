@@ -364,7 +364,9 @@ func TestJanitorConcurrentFireDueWillsExactlyOnce(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	mtx := metrics.New()
+	// The engine publishes the will and counts it; in production the
+	// janitor and the engine share one Metrics.
+	mtx := pod.Engine.Metrics()
 	jt := janitor.New(mh.Pool, pod.Engine, warnLogger())
 	jt.SetMetrics(mtx)
 

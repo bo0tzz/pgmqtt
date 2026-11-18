@@ -32,6 +32,7 @@ const (
 	cackClientIDInvalid     byte = 0x85
 	cackUnspecified         byte = 0x80
 	cackBadAuthMethod       byte = 0x8C
+	cackTopicNameInvalid    byte = 0x90
 )
 
 func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
@@ -148,6 +149,16 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 			}
 			d := pk.Connect.WillProperties.WillDelayInterval
 			c.willDelay = &d
+		}
+		// The will is published as an ordinary PUBLISH later, by code
+		// that has no client to reject it to. A wildcard here would go
+		// out as a topic name, and with will-retain would leave a
+		// retained message no client is allowed to clear.
+		if err := mqttwire.ValidateTopicName(c.willTopic); err != nil {
+			if pv == mqttwire.ProtocolMQTT5 {
+				_ = c.writeConnackReject(pv, cackTopicNameInvalid)
+			}
+			return fmt.Errorf("CONNECT will topic %q: %w", c.willTopic, err)
 		}
 	}
 	// SessionExpiryInterval / ReceiveMaximum / MaximumPacketSize / TopicAliasMaximum (v5).
@@ -496,6 +507,8 @@ func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroke
 				will_retain=$9,
 				will_delay=$10,
 				will_properties=$11,
+				will_fire_at=NULL,
+				session_expires_at=NULL,
 				session_token=gen_random_uuid(),
 				last_seen=now()
 			WHERE client_id=$1

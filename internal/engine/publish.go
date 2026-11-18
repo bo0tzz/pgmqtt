@@ -296,17 +296,38 @@ type publishResult struct {
 // DELETE all inside a single transaction. The caller is responsible for
 // the post-commit Notifier hook used by the in-process test harness.
 func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult, error) {
-	var res publishResult
-
 	startBegin := time.Now()
 	tx, err := e.beginTxTimed(ctx, pgx.TxOptions{})
 	beginDur := time.Since(startBegin)
 	e.metrics.ObservePublishStage("tx_begin", beginDur)
 	e.logSlowStage("publish", "tx_begin", beginDur, "topic", p.Topic)
 	if err != nil {
-		return res, err
+		return publishResult{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	res, err := e.publishTx(ctx, tx, p)
+	if err != nil {
+		return publishResult{}, err
+	}
+
+	startCommit := time.Now()
+	if err := tx.Commit(ctx); err != nil {
+		return publishResult{}, err
+	}
+	commitDur := time.Since(startCommit)
+	e.metrics.ObservePublishStage("tx_commit", commitDur)
+	e.logSlowStage("publish", "tx_commit", commitDur, "topic", p.Topic)
+	e.observeOverflow(res)
+	return res, nil
+}
+
+// publishTx is publishCore's body on a transaction the caller owns, so a
+// publish can commit or roll back together with other writes (a will with
+// the session row it came from). The caller commits and then calls
+// observeOverflow.
+func (e *Engine) publishTx(ctx context.Context, tx pgx.Tx, p publishCore) (publishResult, error) {
+	var res publishResult
 
 	if p.QoS2DedupKey != nil {
 		startQ2 := time.Now()
@@ -394,15 +415,14 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 		e.logSlowStage("publish", "notify", notifyDur, "topic", p.Topic, "peers", len(brokers))
 	}
 
-	startCommit := time.Now()
-	if err := tx.Commit(ctx); err != nil {
-		return res, err
-	}
-	commitDur := time.Since(startCommit)
-	e.metrics.ObservePublishStage("tx_commit", commitDur)
-	e.logSlowStage("publish", "tx_commit", commitDur, "topic", p.Topic)
 	res.BrokerIDs = brokers
 	res.OverflowClients = overflow
+	return res, nil
+}
+
+// observeOverflow counts a committed publish's over-cap subscribers.
+func (e *Engine) observeOverflow(res publishResult) {
+	overflow := res.OverflowClients
 	// Symmetric drop signal: count each over-cap subscriber as a dropped
 	// delivery with reason="overflow". The QoS-0 "row deleted after
 	// successful wire send" path already feeds DeliveriesDroppedTotal
@@ -418,7 +438,6 @@ func (e *Engine) publishCore(ctx context.Context, p publishCore) (publishResult,
 			e.metrics.ObserveDeliveryDropped("overflow")
 		}
 	}
-	return res, nil
 }
 
 // QuotaExceededLocally writes DISCONNECT 0x97 (Quota Exceeded) to the named

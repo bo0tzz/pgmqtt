@@ -519,104 +519,13 @@ func stateLabel(state int) string {
 	}
 }
 
-// fireDueWills publishes wills whose scheduled fire-time has arrived. We use
-// a CTE that captures the OLD values via a self-join (UPDATE...RETURNING in
-// Postgres returns the post-UPDATE row) and SELECT FOR UPDATE SKIP LOCKED so
-// concurrent janitors don't double-fire.
+// fireDueWills publishes wills whose scheduled fire-time has arrived.
 func (j *Janitor) fireDueWills(ctx context.Context) error {
-	tx, err := j.beginTxTimed(ctx, pgx.TxOptions{})
-	if err != nil {
-		return err
+	fired, err := j.eng.FireDueWills(ctx)
+	if j.metrics != nil && fired > 0 {
+		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobFireDueWills).Add(float64(fired))
 	}
-	defer tx.Rollback(ctx)
-
-	rows, err := tx.Query(ctx, `
-		SELECT client_id, will_topic, will_payload, will_qos, will_retain, will_properties, will_fire_at
-		  FROM sessions
-		 WHERE will_fire_at IS NOT NULL
-		   AND will_fire_at <= now()
-		   AND will_topic IS NOT NULL
-		 FOR UPDATE SKIP LOCKED
-	`)
-	if err != nil {
-		return err
-	}
-	type w struct {
-		client    string
-		topic     string
-		payload   []byte
-		qos       int
-		retain    bool
-		props     []byte
-		fireAt    time.Time
-	}
-	var wills []w
-	for rows.Next() {
-		var x w
-		if err := rows.Scan(&x.client, &x.topic, &x.payload, &x.qos, &x.retain, &x.props, &x.fireAt); err != nil {
-			rows.Close()
-			return err
-		}
-		wills = append(wills, x)
-	}
-	rows.Close()
-
-	if len(wills) == 0 {
-		return tx.Commit(ctx)
-	}
-
-	clientIDs := make([]string, len(wills))
-	for i, w := range wills {
-		clientIDs[i] = w.client
-	}
-
-	// Publish FIRST, clear will_* SECOND. Previously the order was
-	// reversed: clear committed before PublishWill ran, so a crash
-	// between them silently dropped the will. Inverting the order means
-	// a crash between publish and clear surfaces as a duplicate-will on
-	// the next janitor tick (the SKIP LOCKED query re-finds the row,
-	// re-fires) — duplicate-will is the better failure than lost-will.
-	//
-	// We hold the FOR UPDATE SKIP LOCKED row locks across PublishWill
-	// so concurrent janitors can't fire the same will twice within a
-	// single tick. PublishWill opens its own publishCore tx on a
-	// different conn — the outer lock just gates "who owns these rows
-	// for this round."
-	for _, w := range wills {
-		if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
-			j.logger.Warn("fire delayed will", "client", w.client, "err", err)
-			continue
-		}
-		if j.metrics != nil {
-			j.metrics.WillsFiredTotal.Inc()
-			// Lateness = (now - will_fire_at). Negative would indicate
-			// firing-too-early which the WHERE clause forbids; clamp to
-			// 0 just in case clocks skew or the SELECT/UPDATE window
-			// lets `now()` regress behind the row's will_fire_at value.
-			lateness := time.Since(w.fireAt).Seconds()
-			if lateness < 0 {
-				lateness = 0
-			}
-			j.metrics.WillFireLatenessSeconds.Observe(lateness)
-		}
-	}
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE sessions SET will_fire_at=NULL,
-		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
-		    will_retain=NULL, will_delay=NULL, will_properties=NULL
-		 WHERE client_id = ANY($1)
-	`, clientIDs); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	if j.metrics != nil {
-		j.metrics.JanitorSweptRowsTotal.WithLabelValues(JobFireDueWills).
-			Add(float64(len(wills)))
-	}
-	return nil
+	return err
 }
 
 // expireSessions deletes session rows whose v5 SessionExpiryInterval has
@@ -896,9 +805,10 @@ func (j *Janitor) maxProbeGap() time.Duration {
 	return max(j.deadBrokerGrace/2, 2*cadence)
 }
 
-// reapBroker claims brokerID's advisory lock and, if it gets it, fires
-// wills + clears ownership for the sessions that broker owned. The lock
-// is what keeps two janitors from reaping the same broker at once.
+// reapBroker claims brokerID's advisory lock and, if it gets it, ends
+// every session that broker owned (Engine.EndSessionsOfBroker: wills,
+// session expiry, ownership). The lock is what keeps two janitors from
+// reaping the same broker at once.
 //
 // Lock acquisition + work + unlock all run on a single acquired conn so
 // the unlock lands on the same Postgres session that holds the lock —
@@ -923,94 +833,11 @@ func (j *Janitor) reapBroker(ctx context.Context, brokerID uuid.UUID, freeFor ti
 	defer releaseBrokerLock(ctx, conn, lockKey)
 	j.logger.Warn("reaping dead broker", "broker", brokerID, "lock_free_for", freeFor)
 
-	rows, err := conn.Query(ctx, `
-		SELECT client_id, will_topic, will_payload, will_qos, will_retain,
-		       will_properties, will_delay
-		  FROM sessions
-		 WHERE broker_id = $1
-		   AND will_topic IS NOT NULL
-	`, brokerID)
-	if err != nil {
-		return true, err
-	}
-	type will struct {
-		client  string
-		topic   string
-		payload []byte
-		qos     int
-		retain  bool
-		props   []byte
-		delay   *int // nil or 0 = fire immediately
-	}
-	var wills []will
-	for rows.Next() {
-		var w will
-		if err := rows.Scan(&w.client, &w.topic, &w.payload, &w.qos, &w.retain, &w.props, &w.delay); err != nil {
-			rows.Close()
-			return true, err
-		}
-		wills = append(wills, w)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return true, err
-	}
-	rows.Close()
-
-	// Per [MQTT-3.1.3.2.2] (Will Delay Interval): the server MUST NOT
-	// publish the will until the delay has elapsed. The previous code
-	// fired ALL wills for the dead broker immediately, which broke v5
-	// will-delay clients (Z2M restart → instant "device went offline"
-	// instead of the configured 30 s settling window). Split the rows:
-	//   - delay nil or 0  → fire now, clear will_*
-	//   - delay > 0       → schedule will_fire_at, leave will_* set
-	//                       so fireDueWills picks them up at the right
-	//                       time. Clamp by session_expires_at if set.
-	for _, w := range wills {
-		if w.delay == nil || *w.delay == 0 {
-			if err := j.eng.PublishWill(ctx, w.topic, w.payload, byte(w.qos), w.retain, w.props); err != nil {
-				j.logger.Warn("fire will from dead broker", "client", w.client, "err", err)
-			}
-		}
-	}
-
-	// Step 1 — schedule delayed wills: clear broker_id, set will_fire_at
-	// (clamped against session_expires_at) but keep will_* so fireDueWills
-	// will pick the row up when its delay elapses.
-	if _, err := conn.Exec(ctx, `
-		UPDATE sessions SET
-		    connected=false,
-		    broker_id=NULL,
-		    last_seen=now(),
-		    will_fire_at = LEAST(
-		        now() + (will_delay * interval '1 second'),
-		        COALESCE(session_expires_at, 'infinity'::timestamptz)
-		    )
-		 WHERE broker_id = $1
-		   AND will_topic IS NOT NULL
-		   AND COALESCE(will_delay, 0) > 0
-	`, brokerID); err != nil {
-		return true, err
-	}
-
-	// Step 2 — every remaining session under the dead broker (no will,
-	// or will already fired immediately above): clear broker_id AND all
-	// will_* columns so a future fireDueWills tick can't double-fire.
-	//
-	// RowsAffected gates `claimed`. Holding the advisory lock alone isn't
-	// enough — a second janitor that grabs the lock *after* the first
-	// already NULLed broker_id finds nothing to clean up and shouldn't
-	// inflate pgmqtt_dead_brokers_handled_total. This matches the
-	// docstring ("false if another pod beat us to it").
-	ct, err := conn.Exec(ctx,
-		`UPDATE sessions SET connected=false, broker_id=NULL, last_seen=now(),
-		    will_topic=NULL, will_payload=NULL, will_qos=NULL,
-		    will_retain=NULL, will_delay=NULL, will_properties=NULL
-		 WHERE broker_id=$1`, brokerID)
-	if err != nil {
-		return true, err
-	}
-	return ct.RowsAffected() > 0, nil
+	// Holding the lock alone isn't enough to count as a claim: a second
+	// janitor that takes it after the first has finished finds nothing
+	// left to end and shouldn't inflate pgmqtt_dead_brokers_handled_total.
+	ended, err := j.eng.EndSessionsOfBroker(ctx, brokerID)
+	return ended > 0, err
 }
 
 // observeFree records a probe at time at that found brokerID's lock free,
