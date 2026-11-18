@@ -66,16 +66,36 @@ func SharedContainer(ctx context.Context) (*Shared, error) {
 	return shared, sErr
 }
 
+// sharedOrSkip returns the shared container. Without one, the test skips
+// on a developer machine that has no Docker, and fails wherever a green
+// run is taken to mean the database-backed tests ran: CI (which sets CI)
+// and scripts/validate.sh (which sets PGMQTT_TEST_REQUIRE_DB). Those
+// tests are most of the suite, so a skip there is a pass that tested
+// almost nothing.
+func sharedOrSkip(ctx context.Context, t *testing.T) *Shared {
+	t.Helper()
+	s, err := SharedContainer(ctx)
+	if err != nil {
+		if envOn("CI") || envOn("PGMQTT_TEST_REQUIRE_DB") {
+			t.Fatalf("postgres testcontainer unavailable (start Docker or set PGMQTT_TEST_DATABASE_URL): %v", err)
+		}
+		t.Skipf("postgres testcontainer unavailable: %v", err)
+	}
+	return s
+}
+
+func envOn(key string) bool {
+	v := os.Getenv(key)
+	return v != "" && v != "0" && v != "false"
+}
+
 // FreshPool returns a pgxpool.Pool against an isolated database created for this
 // test. The database is dropped on test cleanup. Migrations are applied.
 func FreshPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	s, err := SharedContainer(ctx)
-	if err != nil {
-		t.Skipf("postgres testcontainer unavailable: %v", err)
-	}
+	s := sharedOrSkip(ctx, t)
 
 	dbName := freshDBName(t)
 	admin, err := pgxpool.New(ctx, s.URL)
@@ -114,10 +134,7 @@ func FreshURL(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 
-	s, err := SharedContainer(ctx)
-	if err != nil {
-		t.Skipf("postgres testcontainer unavailable: %v", err)
-	}
+	s := sharedOrSkip(ctx, t)
 
 	dbName := freshDBName(t)
 	admin, err := pgxpool.New(ctx, s.URL)

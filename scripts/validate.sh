@@ -37,6 +37,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# internal/db/dbtest skips database-backed tests when it cannot start its
+# Postgres container. Those are most of the suite, so here a missing
+# container has to fail the tier rather than pass it.
+export PGMQTT_TEST_REQUIRE_DB=1
+
 # `go install` deposits binaries in $GOPATH/bin which isn't always on PATH.
 # Without this, govulncheck_phase's auto-install succeeds but the next line
 # can't find the binary it just installed.
