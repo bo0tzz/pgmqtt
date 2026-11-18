@@ -168,6 +168,50 @@ func TestSessionsHasNoNextPacketIDColumn(t *testing.T) {
 	}
 }
 
+// TestUsersOwnerColumnsKeepOldStatementsWorking runs the statements a broker
+// from before migration 0019 issues against the migrated table, as happens
+// while old and new Pods overlap during a rolling upgrade.
+func TestUsersOwnerColumnsKeepOldStatementsWorking(t *testing.T) {
+	t.Parallel()
+	pool := dbtest.FreshPool(t)
+	ctx := context.Background()
+
+	const oldUpsert = `
+		INSERT INTO users(username, password_hash) VALUES($1, $2)
+		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash`
+	if _, err := pool.Exec(ctx, oldUpsert, "legacy", "h1"); err != nil {
+		t.Fatalf("old insert: %v", err)
+	}
+
+	var ns, name, uid *string
+	if err := pool.QueryRow(ctx,
+		`SELECT owner_namespace, owner_name, owner_uid FROM users WHERE username='legacy'`,
+	).Scan(&ns, &name, &uid); err != nil {
+		t.Fatalf("read owner columns: %v", err)
+	}
+	if ns != nil || name != nil || uid != nil {
+		t.Errorf("row written by an old broker should have no owner, got %v/%v/%v", ns, name, uid)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`UPDATE users SET owner_namespace='mqtt', owner_name='legacy', owner_uid='u-1' WHERE username='legacy'`); err != nil {
+		t.Fatalf("set owner: %v", err)
+	}
+	if _, err := pool.Exec(ctx, oldUpsert, "legacy", "h2"); err != nil {
+		t.Fatalf("old upsert on an owned row: %v", err)
+	}
+	var hash string
+	if err := pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, "legacy").Scan(&hash); err != nil {
+		t.Fatalf("old select: %v", err)
+	}
+	if hash != "h2" {
+		t.Errorf("password_hash = %q, want h2", hash)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, "legacy"); err != nil {
+		t.Fatalf("old delete: %v", err)
+	}
+}
+
 // TestMigrateIgnoresPoolStatementTimeout holds the migration advisory lock
 // from a second session for longer than the pool's statement_timeout, the
 // way a peer pod running a slow migration would.
