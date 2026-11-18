@@ -687,8 +687,15 @@ func (c *Conn) Disconnect(reason byte) {
 		return
 	}
 	// If the sender is stuck writing to a client that is not reading,
-	// cut that write short rather than queue the close behind it.
-	_ = c.nc.SetWriteDeadline(time.Now().Add(closeNoticeTimeout))
+	// cut that write short rather than queue the close behind it. For a
+	// WebSocket the deadline goes on the socket underneath: gorilla's
+	// own is a plain field read by the write in progress.
+	deadline := time.Now().Add(closeNoticeTimeout)
+	if ws, ok := c.nc.(*wsConnAdapter); ok {
+		_ = ws.ws.UnderlyingConn().SetWriteDeadline(deadline)
+	} else {
+		_ = c.nc.SetWriteDeadline(deadline)
+	}
 	c.KickDrain()
 }
 
@@ -858,10 +865,13 @@ func (c *Conn) handlePubrec(ctx context.Context, pk *packets.Packet) error {
 	// code ≥ 0x80, the QoS-2 message is treated as completed: discard the
 	// outbound delivery row, release the inflight slot, do NOT send PUBREL.
 	if pk.ReasonCode >= 0x80 {
-		_, err := c.eng.pool.Exec(ctx,
+		ct, err := c.eng.pool.Exec(ctx,
 			`DELETE FROM deliveries WHERE client_id=$1 AND packet_id=$2 AND qos=2`,
 			c.clientID, pk.PacketID)
-		c.returnInflight()
+		// As in handlePuback: only a delivery we knew about held a slot.
+		if err == nil && ct.RowsAffected() > 0 {
+			c.returnInflight()
+		}
 		return err
 	}
 	if _, err := c.eng.pool.Exec(ctx,
@@ -978,8 +988,17 @@ func propsToJSON(p packets.Properties) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(b) == 0 || string(b) == `{}` || string(b) == "null" {
+	if string(b) == emptyPropsJSON {
 		return nil, nil
 	}
 	return b, nil
 }
+
+// emptyPropsJSON is how a Properties with nothing set marshals. The
+// struct has no omitempty, so that is a few hundred bytes of zeroes
+// rather than "{}"; storing it on every message (v3.1.1 included) and
+// parsing it on every delivery is pure overhead.
+var emptyPropsJSON = func() string {
+	b, _ := json.Marshal(packets.Properties{})
+	return string(b)
+}()

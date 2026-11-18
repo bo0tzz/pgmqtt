@@ -23,6 +23,7 @@ import (
 
 	"github.com/bo0tzz/pgmqtt/internal/config"
 	"github.com/bo0tzz/pgmqtt/internal/metrics"
+	mqttwire "github.com/bo0tzz/pgmqtt/internal/mqtt"
 )
 
 // Notifier is a post-commit hook for additional, optional delivery
@@ -473,7 +474,13 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 			if len(allowed) == 0 {
 				return true
 			}
+			// Only browsers send Origin, and only browsers can be made
+			// to open a cross-site WebSocket. A client without one is
+			// not what the allow-list is there to stop.
 			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
 			for _, a := range allowed {
 				if a == origin {
 					return true
@@ -502,16 +509,12 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 			e.logger.Warn("ws upgrade", "err", err)
 			return
 		}
-		// Bound the WS read frame at the configured server max packet
-		// size + a small header allowance. Without this, gorilla
-		// happily buffers attacker-controlled frames (announced sizes
-		// up to int64) BEFORE the MQTT codec layer sees them — a
-		// 100 MiB binary frame would allocate fully then get rejected.
-		// SetReadLimit also caps `read` to avoid unbounded grow on a
-		// single message.
-		if cap := e.maxPacketSize(); cap > 0 {
-			ws.SetReadLimit(int64(cap) + 64)
-		}
+		// gorilla buffers a whole frame before the MQTT codec sees any
+		// of it, so the codec's pre-CONNECT cap has to be applied here
+		// too: an unauthenticated peer gets the same 1 MiB as on TCP.
+		// handleConnect raises it to the server's limit once the client
+		// is authenticated.
+		ws.SetReadLimit(int64(mqttwire.PreConnectMaxPacketSize) + wsFrameAllowance)
 		nc := &wsConnAdapter{ws: ws}
 		if !e.tryReserveConn() {
 			e.logger.Warn("max connections reached; rejecting WS", "remote", r.RemoteAddr)
@@ -528,7 +531,8 @@ func (e *Engine) serveWS(ctx context.Context, ln net.Listener) {
 	}
 	mux.HandleFunc("/", handler)
 	mux.HandleFunc("/mqtt", handler)
-	srv := &http.Server{Handler: mux}
+	// Same bound as a TCP client gets to produce its CONNECT.
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: connectTimeout}
 	e.listenersMu.Lock()
 	e.wsServer = srv
 	e.listenersMu.Unlock()
@@ -768,17 +772,16 @@ func (e *Engine) releaseConn() { e.openConns.Add(-1) }
 // count. Exported for /metrics and tests.
 func (e *Engine) OpenConnections() int64 { return e.openConns.Load() }
 
-// rejectConnAtCap writes an MQTT-shaped CONNACK rejection (best effort) and
-// closes the socket. We don't know the client's protocol version yet, so we
-// emit a v5-style CONNACK with reason 0x9F (Connection Rate Exceeded) — v3.1.1
-// clients will see a malformed-CONNACK followed by close, which is the same
-// outcome they'd see for any other early-reject.
+// rejectConnAtCap closes a connection the broker has no room for, without
+// a CONNACK. Being full is temporary, and common client libraries
+// (MQTT.js among them) treat any refusing CONNACK as final and stop
+// reconnecting; a bare close they retry. Same reasoning as
+// dropConnectOnInfraError.
 func (e *Engine) rejectConnAtCap(nc net.Conn) {
-	defer nc.Close()
-	_ = nc.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	// Minimal v5 CONNACK: fixed header (0x20 0x03), session present (0x00),
-	// reason code 0x9F, properties length 0x00.
-	_, _ = nc.Write([]byte{0x20, 0x03, 0x00, 0x9F, 0x00})
+	if e.metrics != nil {
+		e.metrics.ConnectDroppedTotal.WithLabelValues("max_connections").Inc()
+	}
+	_ = nc.Close()
 }
 
 // localNotifier is the default — no-op. Production swaps in the

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -40,7 +39,18 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	// reserved bits, will-no-payload, etc.). mochi's ConnectValidate covers
 	// MQTT-3.1.2-{1..N}; we close the socket without CONNACK because the
 	// protocol level is untrusted at this point.
-	if code := pk.ConnectValidate(); code.Code != 0 {
+	// Two of mochi's checks are stricter than the spec, which requires
+	// the password and the will payload to be *present* when their flags
+	// are set, not non-empty [MQTT-3.1.2-9, -19]. A zero-length will
+	// payload is how a client asks for its retained status to be cleared
+	// when it dies. (An empty will topic, which mochi folds into the
+	// same code, is caught by the topic check below.)
+	code := pk.ConnectValidate()
+	if code == packets.ErrProtocolViolationFlagNoPassword ||
+		(code == packets.ErrProtocolViolationWillFlagNoPayload && pk.Connect.WillTopic != "") {
+		code = packets.CodeSuccess
+	}
+	if code.Code != 0 {
 		return fmt.Errorf("connect validate: %s", code.Reason)
 	}
 	pv := pk.ProtocolVersion
@@ -88,19 +98,23 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	c.cleanStart = pk.Connect.Clean
 	clientKeepalive := time.Duration(pk.Connect.Keepalive) * time.Second
 	c.keepalive = clientKeepalive
-	// Server policy cap — for v5 we advertise the override via ServerKeepAlive.
-	maxAllowedKeepalive := c.eng.maxAllowedKeepalive()
+	// Server keepalive policy applies to v5 only, where CONNACK's Server
+	// Keep Alive tells the client what it must now use. A v3.1.1 client
+	// cannot be told: capping it silently means it keeps pinging at its
+	// own interval, is cut off at 1.5x ours, fires its will, reconnects,
+	// and does it again. Its keepalive is taken as given, 0 ("none")
+	// included; a dead v3.1.1 peer is then found by TCP keepalive.
 	keepaliveOverridden := false
-	if c.keepalive == 0 {
-		// Spec: keepalive=0 means "no enforcement". We don't honor that
-		// (orphan-conn cleanup needs a deadline), so override to a sane
-		// default and tell the v5 client via ServerKeepAlive.
-		c.keepalive = defaultKeepalive
-		keepaliveOverridden = true
-	}
-	if c.keepalive > maxAllowedKeepalive {
-		c.keepalive = maxAllowedKeepalive
-		keepaliveOverridden = true
+	if pv == mqttwire.ProtocolMQTT5 {
+		maxAllowedKeepalive := c.eng.maxAllowedKeepalive()
+		if c.keepalive == 0 {
+			c.keepalive = defaultKeepalive
+			keepaliveOverridden = true
+		}
+		if c.keepalive > maxAllowedKeepalive {
+			c.keepalive = maxAllowedKeepalive
+			keepaliveOverridden = true
+		}
 	}
 
 	// Reject MQTT 5 enhanced authentication. We don't advertise any
@@ -143,8 +157,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		c.willQoS = pk.Connect.WillQos
 		c.willRetain = pk.Connect.WillRetain
 		if pv == mqttwire.ProtocolMQTT5 {
-			b, err := json.Marshal(pk.Connect.WillProperties)
-			if err == nil && string(b) != "{}" && string(b) != "null" {
+			if b, err := propsToJSON(pk.Connect.WillProperties); err == nil {
 				c.willProps = b
 			}
 			d := pk.Connect.WillProperties.WillDelayInterval
@@ -209,14 +222,20 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	c.inflight = make(chan struct{}, inflightCap)
 	c.drainKick = make(chan struct{}, 1)
 
-	// Lift the codec's pre-CONNECT 1 MiB inbound size cap to the configured
-	// server policy (PGMQTT_MAX_PACKET_SIZE; default 16 MiB). 0 leaves the
-	// codec's PreConnectMaxPacketSize cap in place. The client's CONNECT
-	// MaximumPacketSize property only governs what WE send TO them
-	// (handled in c.write), not what we accept from them; the inbound cap
-	// is purely server policy.
-	if cap := c.eng.maxPacketSize(); cap > 0 {
-		c.reader.SetMaxPacketSize(uint32(cap))
+	// Lift the pre-CONNECT 1 MiB inbound size cap to the configured
+	// server policy (PGMQTT_MAX_PACKET_SIZE; default 16 MiB). The
+	// client's CONNECT MaximumPacketSize property only governs what WE
+	// send TO them (handled in c.write), not what we accept from them;
+	// the inbound cap is purely server policy.
+	inboundCap := c.eng.maxPacketSize()
+	if inboundCap <= 0 {
+		// "No cap" means the protocol's own limit, not the pre-CONNECT
+		// one the reader would otherwise keep.
+		inboundCap = mqttwire.MaxPacketSize
+	}
+	c.reader.SetMaxPacketSize(uint32(inboundCap))
+	if ws, ok := c.nc.(*wsConnAdapter); ok {
+		ws.ws.SetReadLimit(int64(inboundCap) + wsFrameAllowance)
 	}
 
 	// Take ownership in a single transaction.
@@ -331,6 +350,15 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	// sender takes over and works through the queued backlog and
 	// whatever arrives after it, in order.
 	if !c.cleanStart {
+		// QoS 2 publishes the client sent on an earlier connection and
+		// has not released yet still count against our Receive Maximum,
+		// and their PUBRELs will count them back down.
+		var awaitingRelease int32
+		if err := c.eng.pool.QueryRow(ctx,
+			`SELECT count(*) FROM inbound_qos2 WHERE client_id=$1`, c.clientID).Scan(&awaitingRelease); err != nil {
+			c.eng.logger.Warn("count inbound qos2", "client", c.clientID, "err", err)
+		}
+		c.inboundInflight.Store(awaitingRelease)
 		if err := c.resumeInflight(ctx); err != nil {
 			c.eng.logger.Warn("resume in-flight deliveries", "client", c.clientID, "err", err)
 			if c.eng.metrics != nil {
@@ -436,6 +464,8 @@ func authReasonLabel(reason byte) string {
 		return "client_id_invalid"
 	case cackUnsupportedProtocol:
 		return "unsupported_protocol"
+	case cackTopicNameInvalid:
+		return "topic_name_invalid"
 	default:
 		return "other"
 	}

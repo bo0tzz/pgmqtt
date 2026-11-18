@@ -22,6 +22,12 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
+// janitorTaskLabel names the janitor sub-job on its metrics. Not "job":
+// Prometheus attaches its own job label at scrape time and renames ours
+// to exported_job, so every query written against the documented name
+// silently matched nothing.
+const janitorTaskLabel = "task"
+
 // Metrics bundles all pgmqtt_* collectors + the registry that hands them to
 // promhttp. One Metrics is shared across the engine, listener, janitor.
 type Metrics struct {
@@ -55,8 +61,9 @@ type Metrics struct {
 	// banned (0x88), bad_auth_method (0x8C — enhanced auth attempted).
 	AuthFailuresTotal *prometheus.CounterVec
 
-	// ConnectDroppedTotal counts CONNECTs dropped pre-CONNACK by the
-	// per-IP limiter (bcrypt-CPU DoS mitigation). Reasons:
+	// ConnectDroppedTotal counts connections closed without a CONNACK.
+	// Reasons other than the per-IP limiter's are listed in its Help.
+	// The limiter's (bcrypt-CPU DoS mitigation):
 	//   * rate_limit  — over the configured CONNECTs/sec budget for the
 	//                   source IP. Socket closed without CONNACK.
 	//   * penalty_box — IP exhausted its auth-failure budget; further
@@ -156,9 +163,9 @@ type Metrics struct {
 	//                       LISTEN + advisory-lock.
 	//   ctx_cancel        — parent context cancelled mid-loop (Stop()).
 	//                       Recorded only for completeness; not an error.
-	//   exhausted_retries — all reconnect attempts failed; the Pod is
-	//                       about to os.Exit(1) so the kubelet replaces
-	//                       it. Alert: any non-zero increment.
+	// A listener that cannot re-take its lock exits the process. That
+	// is not counted here: a counter bumped just before os.Exit is never
+	// scraped.
 	ListenerRestartsTotal *prometheus.CounterVec
 
 	// DrainSessionQueueTotal counts invocations of drainSessionQueue —
@@ -281,16 +288,19 @@ func New() *Metrics {
 		}, []string{"stage"}),
 		AuthFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_auth_failures_total",
-			Help: "Credential rejections at CONNECT, labelled by reason " +
-				"(bad_credentials, not_authorized, banned, bad_auth_method).",
+			Help: "CONNECTs refused with a CONNACK, labelled by reason " +
+				"(bad_credentials, not_authorized, bad_auth_method, " +
+				"client_id_invalid, unsupported_protocol, topic_name_invalid, other). " +
+				"Despite the name this is every refusal, not only credential ones.",
 		}, []string{"reason"}),
 		ConnectDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_connect_dropped_total",
 			Help: "CONNECTs dropped without a CONNACK, labelled by reason: " +
 				"rate_limit / penalty_box (per-IP limiter, bcrypt-CPU DoS " +
-				"mitigation) or db_error (Postgres unreachable mid-CONNECT; " +
-				"socket closed so the client retries instead of treating a " +
-				"CONNACK reject as final).",
+				"mitigation), db_error (Postgres unreachable mid-CONNECT) or " +
+				"max_connections (this Pod is full). The last two close the " +
+				"socket so the client retries instead of treating a CONNACK " +
+				"reject as final.",
 		}, []string{"reason"}),
 		SubscribesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgmqtt_subscribes_total",
@@ -302,15 +312,15 @@ func New() *Metrics {
 		}),
 		JanitorTickSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "pgmqtt_janitor_tick_seconds",
-			Help: "Per-sub-job duration of janitor.Tick. Labels: job.",
+			Help: "Per-sub-job duration of janitor.Tick. Labels: task.",
 			Buckets: []float64{
 				.0001, .0005, .001, .005, .01, .05, .1, .25, .5, 1, 2.5, 5, 10,
 			},
-		}, []string{"job"}),
+		}, []string{janitorTaskLabel}),
 		JanitorErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_janitor_errors_total",
-			Help: "Per-sub-job error counter for janitor.Tick. Labels: job.",
-		}, []string{"job"}),
+			Help: "Per-sub-job error counter for janitor.Tick. Labels: task.",
+		}, []string{janitorTaskLabel}),
 		Subscriptions: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgmqtt_subscriptions",
 			Help: "Rows in the subscriptions table (refreshed each janitor tick).",
@@ -336,9 +346,9 @@ func New() *Metrics {
 		JanitorSweptRowsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_janitor_swept_rows_total",
 			Help: "Rows acted on by each janitor sweep job (deleted, expired, " +
-				"fired, etc.). Labels: job. Compare with the corresponding state " +
+				"fired, etc.). Labels: task. Compare with the corresponding state " +
 				"gauge to detect sweep falling behind inflow.",
-		}, []string{"job"}),
+		}, []string{janitorTaskLabel}),
 		NotifyQueueUsageRatio: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgmqtt_pg_notify_queue_usage_ratio",
 			Help: "pg_notification_queue_usage(), 0..1. Above ~0.5 means " +
@@ -381,10 +391,12 @@ func New() *Metrics {
 		}),
 		ListenerRestartsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_listener_restarts_total",
-			Help: "Dedicated-listener-connection reconnect events. " +
-				"Reasons: wait_error (NOTIFY wait returned non-EOF error; conn was rebuilt), " +
-				"ctx_cancel (parent context cancelled mid-loop), " +
-				"exhausted_retries (reconnect failed N times; Pod exiting for kubelet replacement).",
+			Help: "Dedicated-listener-connection events. " +
+				"Reasons: wait_error (the listener lost its Postgres session and with it " +
+				"this broker's advisory lock; it reconnects), " +
+				"ctx_cancel (stopped at shutdown). A listener that cannot get its lock back " +
+				"in time exits the process, which no counter here can report: " +
+				"alert on container restarts for that.",
 		}, []string{"reason"}),
 		DrainSessionQueueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_drain_session_queue_total",
@@ -453,6 +465,9 @@ func New() *Metrics {
 	m.DeliveriesDroppedTotal.WithLabelValues("oversized")
 	m.DeliveriesDroppedTotal.WithLabelValues("write_error")
 	m.DeliveriesDroppedTotal.WithLabelValues("overflow")
+	// Without this the first loss creates the series at 1 and
+	// increase() over that window reads 0.
+	m.ListenerRestartsTotal.WithLabelValues("wait_error")
 
 	reg.MustRegister(
 		m.Connections,

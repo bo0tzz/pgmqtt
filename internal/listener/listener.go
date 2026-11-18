@@ -241,11 +241,8 @@ func (l *Listener) run(ctx context.Context) {
 					}
 					return
 				}
-				if l.mtx != nil {
-					l.mtx.ListenerRestartsTotal.WithLabelValues("exhausted_retries").Inc()
-				}
-				l.logger.Error("listener reconnect exhausted; exiting for kubelet replacement",
-					"broker", l.uuid)
+				l.logger.Error("listener could not re-take its lock in time; exiting for kubelet replacement",
+					"broker", l.uuid, "deadline", reconnectDeadline)
 				osExit(1)
 				return
 			}

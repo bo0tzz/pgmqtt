@@ -9,6 +9,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// wsFrameAllowance is added to a packet-size cap to get the WebSocket
+// read limit for it.
+const wsFrameAllowance = 64
+
 // wsConnAdapter presents a gorilla websocket as a net.Conn so the same MQTT
 // codec can be used over WebSocket. MQTT-over-WebSocket frames each MQTT
 // packet (or any chunk) as a binary WebSocket frame; we concatenate frame

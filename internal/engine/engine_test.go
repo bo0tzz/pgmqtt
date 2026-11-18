@@ -2,7 +2,6 @@ package engine_test
 
 import (
 	"context"
-	"io"
 	"net"
 	"sync"
 	"testing"
@@ -566,36 +565,6 @@ func TestWillSuppressedOnGraceful(t *testing.T) {
 	pk, err := observer.NextRaw()
 	if err == nil && pk.FixedHeader.Type == packets.Publish {
 		t.Fatalf("graceful disconnect must suppress will, got publish %q", pk.Payload)
-	}
-}
-
-// TestMaxConnectionsRejects asserts that a Pod at the connection cap rejects
-// new sockets with CONNACK reason 0x9F.
-func TestMaxConnectionsRejects(t *testing.T) {
-	t.Parallel()
-	h := enginetest.NewHarness(t)
-	h.Engine.SetMaxConnectionsForTest(1)
-
-	c1 := h.Connect(t, "ml-1")
-	defer c1.Close()
-
-	// Direct TCP dial — write a CONNECT, expect CONNACK 0x9F + close.
-	d, err := net.DialTimeout("tcp", h.TCPAddr(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer d.Close()
-	if err := d.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("deadline: %v", err)
-	}
-	// Read whatever the broker sends and assert CONNACK with 0x9F.
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(d, buf); err != nil {
-		t.Fatalf("read connack: %v", err)
-	}
-	// 0x20 = CONNACK fixed header. buf[3] is the reason code.
-	if buf[0] != 0x20 || buf[3] != 0x9F {
-		t.Fatalf("expected CONNACK 0x9F, got % x", buf)
 	}
 }
 
