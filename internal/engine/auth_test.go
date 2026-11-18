@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -100,35 +99,29 @@ func TestSetAuthBcryptCost(t *testing.T) {
 	}
 }
 
-// TestAuthenticateUnknownUserCostsAsMuchAsWrongPassword compares the two
-// failure paths at a cost other than bcrypt's default. Each bcrypt cost step
-// doubles the work, so a dummy hash left at the default cost 10 would make
-// the unknown-user path eight times slower than the wrong-password path at
-// cost 7; the factor-of-two tolerance separates that from scheduling noise.
-func TestAuthenticateUnknownUserCostsAsMuchAsWrongPassword(t *testing.T) {
-	const cost = 7
-	pool := dbtest.FreshPool(t)
-	ctx := context.Background()
-	insertUserHash(t, pool, "known", mustHash(t, "right", cost))
-
+// TestUnknownUserComparisonMatchesConfiguredCost: an unknown username is
+// compared against a dummy hash so that it costs as much as a wrong
+// password. That only holds while the dummy hash's cost equals the cost the
+// real hashes are written at, which used to be fixed at 10 whatever
+// PGMQTT_BCRYPT_COST said. Checked on the hash itself: comparing the two
+// paths' wall-clock times is too noisy on a shared CI runner to gate on.
+func TestUnknownUserComparisonMatchesConfiguredCost(t *testing.T) {
 	t.Cleanup(func() { SetAuthBcryptCost(bcrypt.DefaultCost) })
-	SetAuthBcryptCost(cost)
-
-	fastest := func(user string) time.Duration {
-		best := time.Duration(1<<63 - 1)
-		for i := 0; i < 7; i++ {
-			start := time.Now()
-			if err := Authenticate(ctx, pool, user, "wrong"); !errors.Is(err, ErrAuthFailed) {
-				t.Fatalf("authenticate %q: %v", user, err)
-			}
-			if d := time.Since(start); d < best {
-				best = d
-			}
+	for _, cost := range []int{bcrypt.MinCost, 7, bcrypt.DefaultCost, 12} {
+		SetAuthBcryptCost(cost)
+		got, err := bcrypt.Cost(*dummyHash.Load())
+		if err != nil {
+			t.Fatalf("cost %d: dummy hash is not a valid bcrypt hash: %v", cost, err)
 		}
-		return best
+		if got != cost {
+			t.Errorf("configured cost %d, dummy hash costs %d", cost, got)
+		}
+		if err := bcrypt.CompareHashAndPassword(*dummyHash.Load(), []byte("anything")); !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			t.Errorf("cost %d: comparing against the dummy hash: %v", cost, err)
+		}
 	}
-	known, unknown := fastest("known"), fastest("nobody")
-	if unknown > 2*known || known > 2*unknown {
-		t.Errorf("wrong password took %v, unknown user took %v: the paths are distinguishable", known, unknown)
+	SetAuthBcryptCost(99)
+	if got, _ := bcrypt.Cost(*dummyHash.Load()); got != bcrypt.DefaultCost {
+		t.Errorf("out-of-range cost: dummy hash costs %d, want the default %d", got, bcrypt.DefaultCost)
 	}
 }
