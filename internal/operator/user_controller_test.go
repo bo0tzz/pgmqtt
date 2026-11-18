@@ -561,13 +561,13 @@ func TestReconcile_AutoGenSecretPasswordPreservedAcrossReconciles(t *testing.T) 
 		t.Fatal("first-pass password is empty")
 	}
 
-	// Wipe the observed-hash status so the reconciler is forced through the
+	// Wipe the observed Secret version so the reconciler is forced through the
 	// existing-secret password-preservation branch on the next pass.
 	var u pgmqttv1alpha1.User
 	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "preserve"}, &u); err != nil {
 		t.Fatalf("get user: %v", err)
 	}
-	u.Status.ObservedSecretHash = ""
+	u.Status.ObservedSecretVersion = ""
 	u.Status.CredentialsSecretRef = nil
 	if err := cli.Status().Update(context.Background(), &u); err != nil {
 		t.Fatalf("status update: %v", err)
@@ -1230,7 +1230,7 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 // Secret. We then simulate "peer manager B reached the K8s API faster
 // than R_A's view" by directly mutating the Secret's data["password"]
 // to a fresh value via the underlying client, then clear the User CR's
-// observed-secret-hash to force R_A through the non-short-circuit path.
+// observed Secret version to force R_A through the non-short-circuit path.
 // R_A's next Reconcile must:
 //   - preserve the peer-set password (NOT overwrite with a fresh random),
 //   - re-Get to observe that password,
@@ -1277,13 +1277,13 @@ func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
 	if err := cli.Update(context.Background(), &sec); err != nil {
 		t.Fatalf("simulate peer write: %v", err)
 	}
-	// Bypass the ObservedSecretHash short-circuit so reconcile re-runs
+	// Bypass the settled-Secret shortcut so reconcile re-runs
 	// the bcrypt+PG path.
 	var u pgmqttv1alpha1.User
 	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha"}, &u); err != nil {
 		t.Fatalf("get user: %v", err)
 	}
-	u.Status.ObservedSecretHash = ""
+	u.Status.ObservedSecretVersion = ""
 	u.Status.CredentialsSecretRef = nil
 	if err := cli.Status().Update(context.Background(), &u); err != nil {
 		t.Fatalf("clear status: %v", err)
@@ -1338,9 +1338,10 @@ func assertSecretMatchesDB(t *testing.T, cli client.Client, pool *pgxpool.Pool, 
 // Setup: seed a User row with a cost-4 hash via direct PG insert
 // (bypassing the reconciler so we can pin the cost). Configure the
 // reconciler with BcryptCost=10 and a credentials Secret already
-// holding the cleartext that produced the cost-4 hash, with the User
-// CR's Status.ObservedSecretHash matching sha256(cleartext) so the
-// short-circuit *would* trigger. Run Reconcile.
+// holding the cleartext that produced the cost-4 hash. The User's
+// status is what a release before 0.3.0 left behind (a SHA-256 of the
+// password, no Secret version), so this is also the upgrade path: the
+// password is found unchanged by comparing it with the stored hash.
 //
 // Expected post-condition: stored hash now has cost prefix "$2a$10$"
 // AND the metric counter for reason="cost_bump" incremented by 1.
@@ -1369,8 +1370,7 @@ func TestRehashOnCostBump(t *testing.T) {
 	}
 
 	// Build the corresponding K8s state: a User CR + auto-gen Secret with
-	// the same cleartext, plus a populated Status that would normally
-	// short-circuit (ObservedSecretHash matches sha256(cleartext)).
+	// the same cleartext, plus the Status an older release wrote.
 	hashSum := sha256.Sum256([]byte(cleartext))
 	observedHash := hex.EncodeToString(hashSum[:])
 	user := &pgmqttv1alpha1.User{
@@ -1427,6 +1427,19 @@ func TestRehashOnCostBump(t *testing.T) {
 	after := operator.UserRehashTotalForTest("cost_bump")
 	if after-before != 1 {
 		t.Errorf("cost_bump metric delta: got %v, want 1", after-before)
+	}
+
+	// Post-condition 3: the password digest the older release left in
+	// status is gone, replaced by the Secret's identity.
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: username}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if got.Status.ObservedSecretHash != "" {
+		t.Errorf("status.observedSecretHash still holds %q", got.Status.ObservedSecretHash)
+	}
+	if got.Status.ObservedSecretVersion == "" {
+		t.Error("status.observedSecretVersion not set")
 	}
 }
 

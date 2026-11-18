@@ -7,9 +7,7 @@ package operator
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -262,24 +261,39 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		cost = bcrypt.DefaultCost
 	}
 
-	// Decide what, if anything, has to be written. The stored hash is kept
-	// when the cleartext is the one last reconciled (ObservedSecretHash
-	// matches) AND the hash is at or above the configured cost: bumping
-	// operator.bcryptCost must not leave existing rows on the old cost
-	// forever — see pgmqtt_user_rehash_total{reason="cost_bump"}.
+	// Decide what, if anything, has to be written.
+	//
+	// settled: this User owns the row, and the Secret is the same object at
+	// the same resourceVersion as when the row was last written. Its content
+	// cannot have changed, so the password is not compared at all. That is
+	// what keeps a no-op reconcile cheap, and it is why status needs to hold
+	// nothing derived from the password: a Secret's identity says when to
+	// look again, and the bcrypt hash already in the row says whether the
+	// password is still the same.
 	//
 	// Requiring ObservedUsername == username means a rename always writes
-	// the row under the new name, and so does the first pass over a User
-	// last reconciled before status.observedUsername existed.
-	//
-	// A row taken over from a User that no longer exists holds that User's
-	// password, whatever this User's status says, so it is always rehashed.
-	hash := sha256Hex(password)
-	cleartextUnchanged := row != nil && replaces == nil &&
+	// the row under the new name.
+	version := secretVersion(secret)
+	owned := row != nil && row.owner != nil && *row.owner == me
+	settled := owned && version != "" &&
 		user.Status.ObservedUsername == username &&
-		user.Status.ObservedSecretHash == hash &&
+		user.Status.ObservedSecretVersion == version &&
 		user.Status.CredentialsSecretRef != nil &&
 		user.Status.CredentialsSecretRef.Name == secret.Name
+
+	var cleartextUnchanged bool
+	switch {
+	case row == nil, replaces != nil:
+		// No row yet, or one taken over from a User that no longer exists
+		// and so holding that User's password.
+	case settled:
+		cleartextUnchanged = true
+	default:
+		cleartextUnchanged = bcrypt.CompareHashAndPassword([]byte(row.hash), []byte(password)) == nil
+	}
+
+	// Bumping operator.bcryptCost must not leave existing rows on the old
+	// cost forever — see pgmqtt_user_rehash_total{reason="cost_bump"}.
 	rehashReason := ""
 	switch {
 	case !cleartextUnchanged:
@@ -288,59 +302,74 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		rehashReason = "cost_bump"
 	}
 
-	owned := row != nil && row.owner != nil && *row.owner == me
-	if rehashReason == "" && owned {
-		before := user.DeepCopy()
-		setReady(&user, true, "Reconciled", "")
-		return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
-	}
+	if rehashReason != "" || !owned {
+		// With nothing to rehash, the row is right but has no owner yet
+		// (it predates the owner columns): it is adopted as it stands.
+		newHash := ""
+		if rehashReason == "" {
+			newHash = row.hash
+		} else {
+			b, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+			if err != nil {
+				return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
+			}
+			newHash = string(b)
+		}
 
-	// Reaching here with nothing to rehash means the row is right but has
-	// no owner yet: it predates the owner columns and is adopted as it is.
-	newHash := ""
-	if rehashReason == "" {
-		newHash = row.hash
-	} else {
-		b, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+		claimed, err := r.writeRow(ctx, username, newHash, me, replaces)
 		if err != nil {
-			return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
+			return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 		}
-		newHash = string(b)
-	}
-
-	claimed, err := r.writeRow(ctx, username, newHash, me, replaces)
-	if err != nil {
-		return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
-	}
-	if !claimed {
-		// Another User took the username after loadRow. The next pass
-		// reads who and reports the conflict.
-		logger.Info("username claimed concurrently by another User; rechecking", "username", username)
-		before := user.DeepCopy()
-		setReady(&user, false, reasonUsernameConflict, fmt.Sprintf("username %q was claimed by another User", username))
-		if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
-			return ctrl.Result{}, err
+		if !claimed {
+			// Another User took the username after loadRow. The next pass
+			// reads who and reports the conflict.
+			logger.Info("username claimed concurrently by another User; rechecking", "username", username)
+			before := user.DeepCopy()
+			setReady(&user, false, reasonUsernameConflict, fmt.Sprintf("username %q was claimed by another User", username))
+			if err := r.patchStatus(ctx, &user, before); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	if rehashReason != "" {
-		userRehashTotal.WithLabelValues(rehashReason).Inc()
+		if rehashReason != "" {
+			userRehashTotal.WithLabelValues(rehashReason).Inc()
+		}
+		logReason := rehashReason
+		if logReason == "" {
+			logReason = "adopted"
+		}
+		logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", logReason)
 	}
 
 	before := user.DeepCopy()
-	user.Status.ObservedSecretHash = hash
+	user.Status.ObservedSecretVersion = version
 	user.Status.ObservedUsername = username
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 	setReady(&user, true, "Reconciled", "")
-	if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
-		return ctrl.Result{}, err
+	return ctrl.Result{}, r.patchStatus(ctx, &user, before)
+}
+
+// secretVersion identifies one revision of a Secret object. Two reads that
+// return the same value saw the same content; nothing about the content can
+// be derived from it.
+func secretVersion(secret *corev1.Secret) string {
+	if secret.ResourceVersion == "" {
+		return ""
 	}
-	logReason := rehashReason
-	if logReason == "" {
-		logReason = "adopted"
+	return string(secret.UID) + "/" + secret.ResourceVersion
+}
+
+// patchStatus writes the status changes made to user since before was
+// copied from it, and skips the API call when there are none.
+func (r *UserReconciler) patchStatus(ctx context.Context, user, before *pgmqttv1alpha1.User) error {
+	// Releases before 0.3.0 kept a SHA-256 of the password here. Clearing it
+	// on every write removes it from each User the first time it is
+	// reconciled, without depending on the installed CRD pruning it.
+	user.Status.ObservedSecretHash = ""
+	if equality.Semantic.DeepEqual(before.Status, user.Status) {
+		return nil
 	}
-	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", logReason)
-	return ctrl.Result{}, nil
+	return r.Status().Patch(ctx, user, client.MergeFrom(before))
 }
 
 // usernameFor is the MQTT username a User asks for.
@@ -472,7 +501,7 @@ func (r *UserReconciler) reportConflict(ctx context.Context, user *pgmqttv1alpha
 	setReady(user, false, reasonUsernameConflict, conflictMessage(username, owner))
 	// releaseOtherRows has run by now, so this User holds no row at all.
 	user.Status.ObservedUsername = ""
-	if err := r.Status().Patch(ctx, user, client.MergeFrom(before)); err != nil {
+	if err := r.patchStatus(ctx, user, before); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: conflictRecheckInterval}, nil
@@ -676,11 +705,6 @@ func generatePassword() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
 // Reasons set on the Ready condition when a reconcile fails.
 const (
 	reasonDBError          = "DBError"
@@ -701,7 +725,7 @@ func (r *UserReconciler) fail(ctx context.Context, user *pgmqttv1alpha1.User, re
 	before := user.DeepCopy()
 	setReady(user, false, reason, msg)
 	logStatusUpdateError(log.FromContext(ctx).WithName("pgmqtt-user"),
-		r.Status().Patch(ctx, user, client.MergeFrom(before)), reason, err)
+		r.patchStatus(ctx, user, before), reason, err)
 	return ctrl.Result{}, err
 }
 

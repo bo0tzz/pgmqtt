@@ -115,7 +115,19 @@ spec:
                   required:
                     - name
                 observedSecretHash:
+                  description: |
+                    Deprecated and always empty. Releases before 0.3.0
+                    stored a SHA-256 of the password here; the reconciler
+                    clears it on its first pass over the User.
                   type: string
+                observedSecretVersion:
+                  description: |
+                    Identity (`<uid>/<resourceVersion>`) of the Secret the
+                    password was last read from. While the Secret still
+                    has it, the reconciler knows the password is unchanged
+                    without comparing it against the stored hash.
+                  type: string
+                  maxLength: 512
                 observedUsername:
                   description: |
                     MQTT username most recently reconciled into the

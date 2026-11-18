@@ -29,10 +29,23 @@ type UserStatus struct {
 	// +optional
 	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
 
-	// ObservedSecretHash is sha256 of the password value last reconciled
-	// successfully into the database. Used to skip re-hashing on no-op.
+	// ObservedSecretHash is always empty. Releases before 0.3.0 stored an
+	// unsalted SHA-256 of the password here, readable by anyone who can
+	// read the User; the reconciler clears it on its first pass. The field
+	// is kept so the clearing patch works whichever CRD version is
+	// installed.
+	//
+	// Deprecated: replaced by ObservedSecretVersion.
 	// +optional
 	ObservedSecretHash string `json:"observedSecretHash,omitempty"`
+
+	// ObservedSecretVersion identifies the Secret the password was last
+	// read from, as "<uid>/<resourceVersion>". While the Secret still has
+	// that identity its content cannot have changed, so the reconciler
+	// skips comparing the password against the stored hash. It says
+	// nothing about the password itself.
+	// +optional
+	ObservedSecretVersion string `json:"observedSecretVersion,omitempty"`
 
 	// ObservedUsername is the MQTT username (spec.username, or
 	// metadata.name when unset) most recently reconciled into the
