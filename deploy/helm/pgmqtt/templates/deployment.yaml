@@ -7,7 +7,9 @@ metadata:
     {{- include "pgmqtt.labels" . | nindent 4 }}
     app.kubernetes.io/component: broker
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

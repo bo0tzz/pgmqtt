@@ -128,6 +128,23 @@ renders() {
     lacks metrics-off-tcp-probes 'containerPort: 9090'
     lacks metrics-off-tcp-probes 'path: /healthz'
 
+    # Under autoscaling the HPA owns the replica count, and its floor (not
+    # replicaCount) decides whether a PDB of 1 would block node drains.
+    render hpa \
+        --set database.url='postgres://x/y' \
+        --set autoscaling.enabled=true \
+        --set replicaCount=1
+    lacks hpa '  replicas:'
+    has hpa 'minAvailable: 1'
+
+    render hpa-floor-1 \
+        --set database.url='postgres://x/y' \
+        --set autoscaling.enabled=true \
+        --set autoscaling.minReplicas=1 \
+        --set replicaCount=3
+    lacks hpa-floor-1 '  replicas:'
+    has hpa-floor-1 'minAvailable: 0'
+
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \
         --set database.url='postgres://x/y' \

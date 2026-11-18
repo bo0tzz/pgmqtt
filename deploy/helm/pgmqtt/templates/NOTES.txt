@@ -75,15 +75,6 @@ Create an MQTT user (the broker reads from Postgres via the operator):
    `smoketest-mqtt-credentials`) BEFORE running `helm test`.
 {{- end }}
 
-{{- if and .Values.autoscaling.enabled (le (int .Values.replicaCount) 1) }}
-
-ℹ  autoscaling is enabled but replicaCount={{ .Values.replicaCount }}.
-   The HPA will adjust replicas, but Helm continues to template the
-   manifest with the static replicaCount; subsequent `helm upgrade`
-   may fight the HPA. Either drop replicaCount: 1 to a comment, or
-   configure the HPA's minReplicas to match.
-{{- end }}
-
 For ops, see the README and the sizing-matrix comment in values.yaml
 above `resources:`. Front the broker with an L4/L7 TLS terminator for
 mqtts://1883 / wss://8083 — pgmqttd doesn't terminate TLS itself.

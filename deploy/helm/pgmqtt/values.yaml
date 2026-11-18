@@ -1,7 +1,8 @@
 # Default values for pgmqtt.
 
 ## Number of pgmqttd Pods. Each Pod is fully stateless w.r.t. local state;
-## scale freely.
+## scale freely. Ignored when autoscaling.enabled=true: the Deployment is
+## then rendered without `replicas` so an upgrade does not undo the HPA.
 replicaCount: 2
 
 image:
@@ -148,7 +149,10 @@ grafana:
 
 ## PodDisruptionBudget. Default minAvailable=1 prevents a rolling cluster
 ## upgrade from taking every replica down at once. Set to false if you
-## prefer to manage disruption budgets out-of-band.
+## prefer to manage disruption budgets out-of-band. With a single replica
+## (replicaCount, or autoscaling.minReplicas under autoscaling) the chart
+## renders minAvailable=0 instead, because a budget of 1 would block every
+## node drain.
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
