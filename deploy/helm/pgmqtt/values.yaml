@@ -394,9 +394,13 @@ extraVolumeMounts: []
 
 ## Time the kubelet allows from the start of Pod termination until
 ## SIGKILL. It covers the preStop sleep (lifecycle.preStopSleepSeconds)
-## and then the broker's own shutdown after SIGTERM: draining in-flight
-## CONNACK/PUBLISH/SUBSCRIBE handlers and closing connections cleanly.
-## Bump for very large fan-outs.
+## and then the broker's own shutdown after SIGTERM. That shutdown does
+## not drain: requests in progress are cancelled, every client is
+## disconnected (v5 clients are told 0x8B, server shutting down), and
+## each session's end is recorded, which publishes or schedules its
+## will. A session whose end is not recorded in time is ended by another
+## Pod about 30 seconds after this one is gone. Bump for tens of
+## thousands of connections per Pod.
 terminationGracePeriodSeconds: 30
 
 ## Use the host's network namespace. Almost never needed — the broker is a
@@ -418,11 +422,17 @@ runtimeClassName: ""
 ## Kubernetes API. Mounting the SA token is required.
 automountServiceAccountToken: true
 
-## Liveness/readiness probes. The default thresholds are conservative for
-## normal startup; production operators frequently bump failureThreshold /
-## timeoutSeconds when their Postgres is occasionally slow (managed PG
-## vacuums, PITR replays, etc.) so a brief stall doesn't restart the broker
-## mid-stream.
+## Liveness/readiness probes. Raising failureThreshold / timeoutSeconds
+## on readiness keeps a Pod in the Service through a slow Postgres
+## (managed PG vacuums, PITR replays, etc.).
+##
+## Probes do not decide whether a Postgres outage restarts the broker.
+## Liveness never fails on Postgres state. What restarts a broker is its
+## own rule: one that has lost its Postgres session, and with it the lock
+## that marks it alive, exits if it cannot get the lock back within 20
+## seconds. That is fixed, not configurable, because other Pods rely on
+## it to know when a silent broker is really gone. An outage longer than
+## that restarts every broker Pod and disconnects every client.
 probes:
   enabled: true
   ## Probe mode. true = httpGet against /healthz/{live,ready} on the
