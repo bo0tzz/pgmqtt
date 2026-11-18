@@ -1188,12 +1188,155 @@
     },
     {
       "type": "row",
-      "title": "Resources",
+      "title": "Wills and failover",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 53
+      },
+      "collapsed": false,
+      "id": 106
+    },
+    {
+      "type": "timeseries",
+      "title": "Wills fired/sec",
+      "description": "Rate of pgmqtt_wills_fired_total. Wills are published for clients that went away without a clean DISCONNECT, so a burst usually means a network partition or a broker pod dying.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(pgmqtt_wills_fired_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "wills"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 32
+    },
+    {
+      "type": "timeseries",
+      "title": "Will fire lateness",
+      "description": "How long after its scheduled time the janitor fired a delayed will. Should stay within about one janitor interval (1 s by default); more means the janitor is falling behind or was not running.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by(le)(rate(pgmqtt_will_fire_lateness_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by(le)(rate(pgmqtt_will_fire_lateness_seconds_bucket{namespace=~\"$namespace\",pod=~\"$pod\"}[15m])))",
+          "refId": "B",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 33
+    },
+    {
+      "type": "timeseries",
+      "title": "Dead brokers reaped (15m)",
+      "description": "pgmqtt_dead_brokers_handled_total: brokers a janitor judged dead and cleaned up after, releasing their sessions and firing or scheduling their clients' wills. Expected after a pod crash or node loss.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 54
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(pgmqtt_dead_brokers_handled_total{namespace=~\"$namespace\",pod=~\"$pod\"}[15m]))",
+          "refId": "A",
+          "legendFormat": "reaped"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          },
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "id": 34
+    },
+    {
+      "type": "row",
+      "title": "Resources",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 62
       },
       "collapsed": false,
       "id": 105
@@ -1205,7 +1348,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 54
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1245,7 +1388,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 54
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -1285,7 +1428,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 54
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
