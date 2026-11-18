@@ -249,25 +249,24 @@ func (l *Listener) run(ctx context.Context) {
 				osExit(1)
 				return
 			}
-			// Reconnect succeeded. Two things to do, in this order:
+			// Reconnect succeeded. The follow-up is database work, so it
+			// is handed to the engine's dispatcher: this goroutine has
+			// to be back in WaitForNotification to notice the next
+			// loss. In order, the engine will
 			//
-			// 1) AttestOwnedSessions: re-assert broker_id + connected for
-			//    every Conn we still hold in memory, gated by
-			//    session_token so a legitimate takeover isn't stomped.
-			//    Peers do not reap a broker inside LockReacquireDeadline
+			// 1) AttestOwnedSessions: re-assert broker_id + connected
+			//    for every Conn it still holds, gated by session_token
+			//    so a legitimate takeover isn't stomped. Peers do not
+			//    reap a broker inside LockReacquireDeadline
 			//    (janitor.DeadBrokerGrace), so the rows should be as we
-			//    left them; this stays as a backstop because publish-side
-			//    NOTIFY routing depends on broker_id pointing at us. Must
-			//    precede KickAllDrains for the same reason.
+			//    left them; this stays as a backstop because NOTIFY
+			//    routing depends on broker_id pointing at us.
 			//
-			// 2) KickAllDrains: peer Pods' `pg_notify` fan-outs during
-			//    our reconnect window landed on a deaf channel. Their
-			//    delivery rows sit at state=0 with no drain kick. Wake
-			//    every local Conn's drain loop. Kicks coalesce;
-			//    drainOnce iterates the queue.
+			// 2) wake every connection's sender: NOTIFYs sent while we
+			//    were away went nowhere, and their delivery rows are
+			//    sitting queued.
 			if l.eng != nil {
-				l.eng.AttestOwnedSessions(ctx)
-				l.eng.KickAllDrains()
+				l.eng.AfterListenerReconnect()
 			}
 			continue
 		}
@@ -349,9 +348,7 @@ func (l *Listener) dispatchNotification(ctx context.Context, notif *pgconn.Notif
 			return
 		}
 		l.logger.Debug("listener notify", "broker", l.uuid, "msg", msgID)
-		if err := l.eng.Deliver(ctx, msgID); err != nil {
-			l.logger.Warn("deliver", "msg", msgID, "err", err)
-		}
+		l.eng.NotifyDelivery(msgID)
 	case takeoverCh:
 		// Payload format (current): <36-char prevToken><clientID>.
 		// Forward-compat: a payload that doesn't parse as

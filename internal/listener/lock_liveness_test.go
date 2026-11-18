@@ -240,3 +240,57 @@ func TestReconnectGivesUpAtDeadlineWhenDialHangs(t *testing.T) {
 		t.Fatal("listener still reconnecting long after its deadline")
 	}
 }
+
+// TestStalledSubscriberDoesNotDelayLockLossNotice: the listener goroutine
+// is what notices that this broker's lock is gone, and the deadline for
+// re-taking it counts from that moment. It used to deliver messages
+// inline, so one subscriber that had stopped reading kept it busy in
+// ten-second write timeouts: in the audit's run it noticed 37 seconds
+// late, by which time a peer had already reaped the broker.
+func TestStalledSubscriberDoesNotDelayLockLossNotice(t *testing.T) {
+	var exits atomic.Int32
+	t.Cleanup(listener.SetOSExitForTest(func(int) { exits.Add(1) }))
+
+	mh := enginetest.NewMultiHarness(t, 2, nil)
+	listeners := make([]*listener.Listener, len(mh.Pods))
+	for i, p := range mh.Pods {
+		l, err := listener.Start(context.Background(), mh.URL, p.Engine, newPodLogger())
+		if err != nil {
+			t.Fatalf("listener[%d]: %v", i, err)
+		}
+		listeners[i] = l
+		t.Cleanup(l.Stop)
+		p.Engine.SetBrokerID(l.BrokerID())
+		p.Engine.SetTakeoverNotifier(listener.NewTakeoverNotifier(mh.Pool))
+		p.BrokerID = l.BrokerID()
+	}
+
+	stalled := mh.Pods[0].Connect(t, "stalled-subscriber")
+	defer stalled.Close()
+	stalled.Subscribe(t, "big/#", 0)
+	if err := stalled.Conn.(*net.TCPConn).SetReadBuffer(4096); err != nil {
+		t.Fatalf("shrink read buffer: %v", err)
+	}
+
+	pub := mh.Pods[1].Connect(t, "publisher")
+	defer pub.Close()
+	payload := make([]byte, 512*1024)
+	for i := 0; i < 24; i++ {
+		pub.Publish(t, "big/x", payload, 0, false)
+	}
+	time.Sleep(time.Second) // pod 0 is now up against the full socket
+
+	before := listeners[0].LockEpoch()
+	terminateListenerBackends(t, mh)
+	killed := time.Now()
+	for listeners[0].LockEpoch() == before {
+		if time.Since(killed) > 3*time.Second {
+			t.Fatalf("listener had not noticed its lock was gone %s after losing it", time.Since(killed).Round(time.Millisecond))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitListenerBackends(t, mh, 2)
+	if n := exits.Load(); n != 0 {
+		t.Errorf("listener gave up %d times; it should have reconnected", n)
+	}
+}

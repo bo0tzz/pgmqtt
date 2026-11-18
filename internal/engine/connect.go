@@ -327,14 +327,12 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		return err
 	}
 
-	// Drain queued / inflight deliveries (state 0,1,2) for resumed sessions.
-	// Counter ordering matches the dead-broker-Inc fix shape: Inc the
-	// success counter only AFTER drainSessionQueue returns nil. A failed
-	// drain bumps a sibling _failures_total so we keep an attempt-rate
-	// signal even when the drain itself is wedged on PG.
+	// A resumed session first gets back what it had in flight, then the
+	// sender takes over and works through the queued backlog and
+	// whatever arrives after it, in order.
 	if !c.cleanStart {
-		if err := c.drainSessionQueue(ctx); err != nil {
-			c.eng.logger.Warn("drain queue", "client", c.clientID, "err", err)
+		if err := c.resumeInflight(ctx); err != nil {
+			c.eng.logger.Warn("resume in-flight deliveries", "client", c.clientID, "err", err)
 			if c.eng.metrics != nil {
 				c.eng.metrics.DrainSessionQueueFailuresTotal.WithLabelValues("reconnect").Inc()
 			}
@@ -343,17 +341,15 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 		}
 	}
 
-	// Background drain loop: when PUBACK/PUBCOMP frees an in-flight slot it
-	// kicks drainKick; we re-scan state=0 deliveries and send what fits.
-	// Register on the engine WaitGroup so shutdownGracefully waits for the
-	// goroutine to exit before pool.Close() runs — otherwise a drain
-	// query can land on a closing pool and emit a noisy warning at every
-	// shutdown.
+	// Registered on the engine WaitGroup so shutdown waits for it before
+	// the pool is closed.
+	c.senderActive.Store(true)
 	c.eng.wg.Add(1)
 	go func() {
 		defer c.eng.wg.Done()
-		c.runDrainLoop(ctx)
+		c.runSender(ctx)
 	}()
+	c.KickDrain()
 	return nil
 }
 

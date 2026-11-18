@@ -109,6 +109,14 @@ type Engine struct {
 	shutdownOnce sync.Once
 	shutdown     chan struct{}
 
+	// The dispatcher: a single goroutine that runs queued tasks in
+	// order, so that whoever queues them (the listener) never waits on
+	// Postgres. See deliver.go.
+	dispatchMu   sync.Mutex
+	dispatchQ    []func(context.Context)
+	dispatchWake chan struct{}
+	dispatchOnce sync.Once
+
 	// Tunables — exposed for tests.
 	//
 	// KeepAliveMultiplier sets the read-deadline as
@@ -128,6 +136,7 @@ func New(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, logger *sl
 		logger:         logger,
 		conns:          make(map[string]*Conn),
 		shutdown:       make(chan struct{}),
+		dispatchWake:   make(chan struct{}, 1),
 		KeepAliveMultiplier: 1.5,
 		notify:         &localNotifier{},
 		takeover:       noopTakeover{},

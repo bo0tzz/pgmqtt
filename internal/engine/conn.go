@@ -23,7 +23,17 @@ const (
 	connectTimeout        = 10 * time.Second
 	defaultKeepalive      = 60 * time.Second
 	maxConcurrentInflight = 1024 // upper bound on per-conn outgoing inflight messages
+
+	// closeNoticeTimeout bounds the DISCONNECT that precedes a
+	// server-initiated close, which is a courtesy and must not hold the
+	// close up.
+	closeNoticeTimeout = 2 * time.Second
 )
+
+// writeTimeout is how long one packet may take to leave for a client that
+// is not reading. Past it the connection is closed. A var so tests can
+// shorten it.
+var writeTimeout = 10 * time.Second
 
 // Conn is a single client connection.
 type Conn struct {
@@ -55,7 +65,19 @@ type Conn struct {
 	maxPacketSize   uint32 // v5 MaximumPacketSize the client will accept; 0 = no limit
 	receiveMaximum  uint16 // v5 ReceiveMaximum the client will accept; 65535 if unset
 	inflight        chan struct{} // token-bucket; capacity = receiveMaximum
-	drainKick       chan struct{} // single-slot signal to wake the drain loop
+	drainKick       chan struct{} // single-slot signal to wake the sender
+
+	// inflightOverdraft counts in-flight messages resent on resume that
+	// found the window already full (the client came back with a smaller
+	// Receive Maximum). Their acknowledgements pay this off before any
+	// slot is released, so the window never ends up wider than agreed.
+	inflightOverdraft atomic.Int32
+
+	// senderActive is set once the sender goroutine is running.
+	// closeNotice holds a requested server-side close: 0 for none,
+	// otherwise 0x100 | the v5 DISCONNECT reason code to send first.
+	senderActive atomic.Bool
+	closeNotice  atomic.Int32
 
 	inboundInflight atomic.Int32 // QoS>0 PUBLISHes received, pre-PUBACK/PUBCOMP
 
@@ -324,35 +346,37 @@ func (c *Conn) tryConsumeRateToken() bool {
 	return true
 }
 
+// write encodes pk and writes it to the socket, serialised with every
+// other writer of this connection. A write that fails or times out closes
+// the connection: the stream may hold half a packet, and a client that
+// has stopped reading is not going to start because we wait longer.
 func (c *Conn) write(pk *packets.Packet) error {
+	return c.writeWithin(pk, writeTimeout)
+}
+
+func (c *Conn) writeWithin(pk *packets.Packet, timeout time.Duration) error {
 	if c.closing.Load() {
 		return errors.New("conn closing")
 	}
 	pk.ProtocolVersion = c.protocol
-	if c.maxPacketSize > 0 {
-		// Encode once to size-check; mochi's MaxSize gating in WritePacket
-		// uses a similar approach.
-		buf, err := mqttwire.Encode(pk)
-		if err != nil {
-			return err
-		}
-		if uint32(len(buf)) > c.maxPacketSize {
-			return errPacketTooLarge
-		}
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-		if err := c.nc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			return err
-		}
-		_, err = c.nc.Write(buf)
+	buf, err := mqttwire.Encode(pk)
+	if err != nil {
 		return err
+	}
+	if c.maxPacketSize > 0 && uint32(len(buf)) > c.maxPacketSize {
+		return errPacketTooLarge
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if err := c.nc.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := c.nc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		c.shutdown()
 		return err
 	}
-	return mqttwire.Write(c.nc, pk)
+	if _, err := c.nc.Write(buf); err != nil {
+		c.shutdown()
+		return err
+	}
+	return nil
 }
 
 // V5 server policy. The broker advertises these in CONNACK and enforces
@@ -562,22 +586,47 @@ func (c *Conn) tryAcquireInflight() bool {
 	}
 }
 
-// returnInflight releases a flow-control slot and kicks the drain loop.
+// inflightAvailable reports whether a QoS>0 message could be sent now.
+func (c *Conn) inflightAvailable() bool {
+	if c.protocol != mqttwire.ProtocolMQTT5 || c.inflight == nil {
+		return true
+	}
+	return len(c.inflight) < cap(c.inflight)
+}
+
+// holdInflight accounts for a message that is already in flight and has
+// to be resent whether or not there is room for it.
+func (c *Conn) holdInflight() {
+	if !c.tryAcquireInflight() {
+		c.inflightOverdraft.Add(1)
+	}
+}
+
+// returnInflight releases a flow-control slot and wakes the sender.
 func (c *Conn) returnInflight() {
 	if c.inflight == nil {
 		return
 	}
-	select {
-	case <-c.inflight:
-	default:
+	for {
+		over := c.inflightOverdraft.Load()
+		if over <= 0 {
+			select {
+			case <-c.inflight:
+			default:
+			}
+			break
+		}
+		if c.inflightOverdraft.CompareAndSwap(over, over-1) {
+			break
+		}
 	}
 	c.KickDrain()
 }
 
-// KickDrain signals the drain loop to scan for queued deliveries. Safe
-// to call from any goroutine and non-blocking: drainKick is a 1-slot
-// channel and a pending kick coalesces with a second one. No-op for
-// conns that haven't completed CONNECT (drainKick is allocated there).
+// KickDrain wakes the sender to look for queued deliveries. Safe to call
+// from any goroutine and non-blocking: drainKick is a 1-slot channel and
+// a pending kick coalesces with a second one. No-op for conns that
+// haven't completed CONNECT (drainKick is allocated there).
 func (c *Conn) KickDrain() {
 	if c.drainKick == nil {
 		return
@@ -588,99 +637,75 @@ func (c *Conn) KickDrain() {
 	}
 }
 
-// runDrainLoop wakes on drainKick and tries to send any state=0 deliveries
-// for this client up to the in-flight cap.
-func (c *Conn) runDrainLoop(ctx context.Context) {
+// runSender is the connection's sender goroutine: the only thing that
+// sends this client its deliveries (see deliver.go), and where a
+// server-initiated close is carried out. It sleeps until kicked.
+//
+// It does not stop on ctx: that is cancelled the moment the broker is
+// told to shut down, which is exactly when it is needed to say goodbye.
+// Database calls made with a cancelled ctx fail at once, so it does not
+// linger either; it ends when the connection is closed.
+func (c *Conn) runSender(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.eng.logger.Error("drain loop panic",
+			c.eng.logger.Error("sender panic",
 				"client", c.clientID, "panic", r, "stack", string(debug.Stack()))
-			// Best-effort tear down: a half-broken drain loop is worse than
-			// a clean takeover by the next CONNECT.
+			// A half-broken sender is worse than a clean reconnect.
 			c.shutdown()
 		}
 	}()
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-c.closed:
 			return
 		case <-c.drainKick:
-			// Drain deliveries until we hit the cap or run out of queued rows.
-			for {
-				if c.closing.Load() {
-					return
-				}
-				done, err := c.drainOnce(ctx)
-				if err != nil {
-					c.eng.logger.Warn("drain", "client", c.clientID, "err", err)
-					break
-				}
-				if done {
-					break
-				}
+		}
+		for {
+			if c.carryOutClose() || c.closing.Load() {
+				return
+			}
+			disposed, err := c.drainBatch(ctx)
+			if err != nil {
+				c.eng.logger.Warn("drain", "client", c.clientID, "err", err)
+				break
+			}
+			if disposed == 0 {
+				break
 			}
 		}
 	}
 }
 
-// drainOnce sends a single queued delivery if a slot is available. Returns
-// done=true when there's nothing to send or no slot. The slot accounting is
-// done inside deliverOne — drainOnce just selects + dispatches.
-func (c *Conn) drainOnce(ctx context.Context) (done bool, err error) {
-	row := c.eng.pool.QueryRow(ctx, `
-		SELECT d.id, d.qos, d.state, d.packet_id,
-		       m.topic, m.payload, m.properties, m.retain, m.expires_at,
-		       COALESCE(
-		         (SELECT array_agg(s.subscription_id ORDER BY s.subscription_id)
-		            FROM subscriptions s
-		           WHERE s.client_id = d.client_id
-		             AND s.subscription_id IS NOT NULL
-		             AND mqtt_topic_match(s.topic_filter, m.topic)),
-		         '{}'::int[]) AS sub_ids,
-		       COALESCE(
-		         (SELECT bool_or(s.retain_as_published)
-		            FROM subscriptions s
-		           WHERE s.client_id = d.client_id
-		             AND mqtt_topic_match(s.topic_filter, m.topic)),
-		         false) AS retain_as_published
-		  FROM deliveries d JOIN messages m ON m.id = d.message_id
-		 WHERE d.client_id = $1 AND d.state = 0 AND d.qos > 0
-		   AND (m.expires_at IS NULL OR m.expires_at > now())
-		 ORDER BY d.id LIMIT 1
-	`, c.clientID)
-	var (
-		deliveryID        int64
-		qos, state        byte
-		packetID          *int
-		topic             string
-		payload           []byte
-		props             []byte
-		retain            bool
-		expiresAt         *time.Time
-		subIDs            []int
-		retainAsPublished bool
-	)
-	if err := row.Scan(&deliveryID, &qos, &state, &packetID, &topic, &payload, &props, &retain, &expiresAt, &subIDs, &retainAsPublished); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return true, nil
-		}
-		return true, err
+// Disconnect asks for this connection to be closed by the server, telling
+// a v5 client why first. It never blocks, so it is safe on any goroutine,
+// including ones that must not wait on a client (the listener, another
+// client's publish, the shutdown loop).
+func (c *Conn) Disconnect(reason byte) {
+	c.closeNotice.CompareAndSwap(0, 0x100|int32(reason))
+	if !c.senderActive.Load() {
+		c.shutdown()
+		return
 	}
-	wireRetain := false
-	if retainAsPublished {
-		wireRetain = retain
+	// If the sender is stuck writing to a client that is not reading,
+	// cut that write short rather than queue the close behind it.
+	_ = c.nc.SetWriteDeadline(time.Now().Add(closeNoticeTimeout))
+	c.KickDrain()
+}
+
+// carryOutClose performs a requested close, if there is one.
+func (c *Conn) carryOutClose() bool {
+	notice := c.closeNotice.Load()
+	if notice == 0 {
+		return false
 	}
-	sent, err := c.eng.deliverOneTracked(ctx, deliveryID, c.clientID, qos, state, packetID, topic, payload, props, expiresAt, subIDs, wireRetain, false)
-	if err != nil {
-		return true, err
+	if c.protocol == mqttwire.ProtocolMQTT5 {
+		_ = c.writeWithin(&packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+			ReasonCode:  byte(notice),
+		}, closeNoticeTimeout)
 	}
-	if !sent {
-		// No slot available; leave queued, runDrainLoop wakes again on PUBACK.
-		return true, nil
-	}
-	return false, nil
+	c.shutdown()
+	return true
 }
 
 func (c *Conn) shutdown() {
@@ -716,17 +741,9 @@ func (c *Conn) SessionToken() uuid.UUID { return c.sessionToken }
 // ClientID returns the resolved client identifier (empty before CONNECT).
 func (c *Conn) ClientID() string { return c.clientID }
 
-// gracefulClose is invoked at server shutdown — sends a v5 Disconnect with
-// reason code 0x8b (Server shutting down) when applicable, then closes.
-func (c *Conn) gracefulClose() {
-	if c.protocol == mqttwire.ProtocolMQTT5 {
-		_ = c.write(&packets.Packet{
-			FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
-			ReasonCode:  0x8B, // Server shutting down
-		})
-	}
-	c.shutdown()
-}
+// gracefulClose is invoked at server shutdown: v5 clients are told the
+// server is shutting down (0x8B) before the socket closes.
+func (c *Conn) gracefulClose() { c.Disconnect(0x8B) }
 
 // finish records the end of this connection's session: see
 // Engine.endSession for what that involves. It runs once, when run

@@ -482,16 +482,12 @@ func (e *Engine) QuotaExceededLocallyForToken(clientID string, sessionToken uuid
 func (e *Engine) kickForQuota(conn *Conn, clientID string) {
 	conn.quotaOnce.Do(func() {
 		e.logger.Info("quota exceeded — disconnecting", "client", clientID)
-		if conn.protocol == mqttwire.ProtocolMQTT5 {
-			_ = conn.write(&packets.Packet{
-				FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
-				ReasonCode:  0x97, // Quota Exceeded
-			})
-		}
 		if e.metrics != nil {
 			e.metrics.QuotaExceededTotal.Inc()
 		}
-		conn.Shutdown()
+		// Called from another client's publish or from the listener:
+		// neither may wait on this client's socket.
+		conn.Disconnect(0x97) // Quota Exceeded
 	})
 }
 

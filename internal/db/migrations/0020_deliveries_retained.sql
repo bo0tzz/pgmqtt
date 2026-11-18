@@ -1,0 +1,14 @@
+-- deliveries.retained: this delivery exists because a new subscription
+-- matched a retained message, so its PUBLISH carries RETAIN=1
+-- [MQTT-3.3.1-8] whatever the subscription's Retain As Published says.
+--
+-- Until now such deliveries were written to the socket by the SUBSCRIBE
+-- handler itself, outside the path every other delivery takes, which is
+-- how they came to ignore the client's Receive Maximum and to abort the
+-- whole replay on one oversize message. They are now queued like any
+-- other delivery and sent by the connection's sender; this flag is the
+-- one thing about them the sender could not otherwise know.
+--
+-- Safe for brokers of the previous version during a rolling upgrade: they
+-- never name the column, and the default is what their rows mean.
+ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS retained BOOLEAN NOT NULL DEFAULT false;

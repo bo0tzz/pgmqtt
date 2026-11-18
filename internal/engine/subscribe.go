@@ -223,6 +223,7 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 		return err
 	}
 
+	queued := false
 	for _, r := range batch {
 		effectiveQoS := byte(r.qos)
 		if opts.QoS < effectiveQoS {
@@ -253,31 +254,37 @@ func (c *Conn) dispatchRetainedForFilter(ctx context.Context, filter string, opt
 			pk.Properties.SubscriptionIdentifier = []int{opts.SubscriptionID}
 		}
 		if effectiveQoS > 0 {
-			// Need a packet id and a deliveries row so PUBACK/PUBREC can be tracked.
-			msgID, err := c.persistRetainedDispatch(ctx, r.topic, r.payload, effectiveQoS, r.props)
-			if err != nil {
+			// Queued like any other QoS>0 delivery, so that it goes out
+			// under the client's Receive Maximum and is resent if the
+			// connection drops first. The sender picks it up below.
+			if err := c.queueRetained(ctx, r.topic, r.payload, effectiveQoS, r.props); err != nil {
 				return err
 			}
-			pid, err := c.allocPacketID(ctx, msgID, effectiveQoS)
-			if err != nil {
-				return err
-			}
-			pk.PacketID = pid
+			queued = true
+			continue
 		}
 		if err := c.write(pk); err != nil {
+			if errors.Is(err, errPacketTooLarge) {
+				// Too big for this client; the rest may still fit.
+				c.eng.metrics.ObserveDeliveryDropped("oversized")
+				continue
+			}
 			return err
 		}
+	}
+	if queued {
+		c.KickDrain()
 	}
 	return nil
 }
 
-// persistRetainedDispatch creates a messages row + a deliveries row for this
-// client so we can properly track QoS>0 retained delivery. We do not insert
-// for other clients (this is a single-client retained replay, not a fanout).
-func (c *Conn) persistRetainedDispatch(ctx context.Context, topic string, payload []byte, qos byte, props []byte) (int64, error) {
+// queueRetained queues one retained message for this client alone: a
+// messages row of its own and a deliveries row marked retained, so the
+// PUBLISH carries RETAIN=1 [MQTT-3.3.1-8].
+func (c *Conn) queueRetained(ctx context.Context, topic string, payload []byte, qos byte, props []byte) error {
 	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer tx.Rollback(ctx)
 	var msgID int64
@@ -285,40 +292,15 @@ func (c *Conn) persistRetainedDispatch(ctx context.Context, topic string, payloa
 		INSERT INTO messages(topic, payload, qos, retain, properties)
 		VALUES ($1, $2, $3, true, $4) RETURNING id
 	`, topic, payload, qos, jsonOrNil(props)).Scan(&msgID); err != nil {
-		return 0, err
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO deliveries(client_id, message_id, qos, state)
-		VALUES ($1, $2, $3, 0)
+		INSERT INTO deliveries(client_id, message_id, qos, state, retained)
+		VALUES ($1, $2, $3, 0, true)
 	`, c.clientID, msgID, qos); err != nil {
-		return 0, err
+		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return msgID, nil
-}
-
-// allocPacketID assigns a packet id to a queued delivery (state=0 -> 1).
-// Uses the per-Conn in-memory allocator so the per-delivery UPDATE on
-// sessions.next_packet_id is gone — the only DB mutation is the
-// deliveries row state transition.
-func (c *Conn) allocPacketID(ctx context.Context, msgID int64, _ byte) (uint16, error) {
-	pid, err := c.AllocPacketID(ctx)
-	if err != nil {
-		return 0, err
-	}
-	ct, err := c.eng.pool.Exec(ctx, `
-		UPDATE deliveries SET packet_id=$1, state=1
-		 WHERE client_id=$2 AND message_id=$3 AND state=0
-	`, int(pid), c.clientID, msgID)
-	if err != nil {
-		return 0, err
-	}
-	if ct.RowsAffected() == 0 {
-		return 0, errors.New("retained delivery row missing")
-	}
-	return pid, nil
+	return tx.Commit(ctx)
 }
 
 func nullInt(v int) any {
