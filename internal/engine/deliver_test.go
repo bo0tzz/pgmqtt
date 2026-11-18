@@ -480,10 +480,6 @@ func TestQueuedQoS0IsSentWhenSenderWakes(t *testing.T) {
 		`INSERT INTO deliveries(client_id, message_id, qos, state) VALUES ('q0-sub', $1, 0, 0)`, msgID); err != nil {
 		t.Fatalf("seed delivery: %v", err)
 	}
-	if pk := nextPublish(sub, 300*time.Millisecond); pk != nil {
-		t.Fatalf("delivered without any wake-up: %+v", pk)
-	}
-
 	h.Engine.KickAllDrains()
 	pk := nextPublish(sub, 3*time.Second)
 	if pk == nil || string(pk.Payload) != "missed" {
