@@ -29,9 +29,6 @@ func (l *Listener) SetURLForTest(url string) {
 // constant; tests read it to scale their deadlines.
 const ReconnectInitialBackoffForTest = reconnectInitialBackoff
 
-// ReconnectMaxAttemptsForTest exposes reconnectMaxAttempts for tests.
-const ReconnectMaxAttemptsForTest = reconnectMaxAttempts
-
 // SetReconnectDeadlineForTest shortens the lock-reacquire deadline. Call
 // before Start and restore after Stop: the listener goroutine reads it.
 func SetReconnectDeadlineForTest(d time.Duration) (restore func()) {

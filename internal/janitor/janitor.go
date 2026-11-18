@@ -91,7 +91,15 @@ import (
 // only counts time during which its own broker's lock was held without
 // interruption (see ownLockUnbroken). Anything that wipes every lock
 // wipes ours too, and that restarts every clock.
+//
+// The samples themselves have to be real: each is timestamped when its
+// probe returns, a probe that errors restarts the clock, so does a gap
+// between probes longer than maxProbeGap (a stalled tick saw nothing),
+// and a reap needs minDeadBrokerSamples of them however long the janitor
+// interval is.
 const DeadBrokerGrace = listener.LockReacquireDeadline + 10*time.Second
+
+const minDeadBrokerSamples = 3
 
 const brokerLockPrefix = "pgmqtt:broker:"
 
@@ -133,6 +141,13 @@ var defaultJobIntervals = map[string]time.Duration{
 	JobRefreshNotifyQueue:     10 * time.Second,
 }
 
+// suspect is one unbroken run of probes that found a broker's lock free.
+type suspect struct {
+	since   time.Time
+	last    time.Time
+	samples int
+}
+
 // Run loops until ctx is cancelled, running Tick every interval on this Pod.
 type Janitor struct {
 	pool     *pgxpool.Pool
@@ -160,13 +175,13 @@ type Janitor struct {
 	// against pathological clients that send PUBLISH but never PUBREL.
 	inboundQoS2Grace time.Duration
 
-	// deadBrokerGrace: see DeadBrokerGrace. suspects maps a broker whose
-	// lock was found free to the time it was first found free; an entry
-	// is dropped the moment the lock is seen held again, so the grace
-	// always measures one unbroken stretch.
+	// deadBrokerGrace: see DeadBrokerGrace. suspects tracks each broker
+	// whose lock was found free; an entry is dropped the moment the lock
+	// is seen held again, so the grace always measures one unbroken run
+	// of free probes.
 	deadBrokerGrace time.Duration
 	suspectsMu      sync.Mutex
-	suspects        map[uuid.UUID]time.Time
+	suspects        map[uuid.UUID]suspect
 
 	// lockEpoch reports the listener's count of lock losses; suspectsEpoch
 	// is its value when the current suspects were recorded. nil (tests
@@ -200,7 +215,7 @@ func New(pool *pgxpool.Pool, eng *engine.Engine, logger *slog.Logger) *Janitor {
 		orphanGrace:      10 * time.Minute,
 		inboundQoS2Grace: 1 * time.Hour,
 		deadBrokerGrace:  DeadBrokerGrace,
-		suspects:         make(map[uuid.UUID]time.Time),
+		suspects:         make(map[uuid.UUID]suspect),
 	}
 }
 
@@ -243,7 +258,8 @@ func (j *Janitor) SetOrphanGrace(d time.Duration) { j.orphanGrace = d }
 func (j *Janitor) SetInboundQoS2Grace(d time.Duration) { j.inboundQoS2Grace = d }
 
 // SetDeadBrokerGrace overrides DeadBrokerGrace. For tests: any value at or
-// below listener.LockReacquireDeadline lets a live broker be reaped.
+// below listener.LockReacquireDeadline lets a live broker be reaped, and
+// zero reaps on the first free probe.
 func (j *Janitor) SetDeadBrokerGrace(d time.Duration) { j.deadBrokerGrace = d }
 
 // SetLockEpoch installs the listener's LockEpoch, which lets the janitor
@@ -341,7 +357,7 @@ func (j *Janitor) Tick(ctx context.Context) error {
 			var claimed bool
 			if err := j.timed(JobHandleDeadBroker, func() error {
 				var err error
-				claimed, err = j.handleDeadBroker(ctx, id, now)
+				claimed, err = j.handleDeadBroker(ctx, id)
 				return err
 			}); err != nil {
 				j.logger.Warn("dead broker handling", "broker", id, "err", err)
@@ -779,6 +795,11 @@ func (j *Janitor) findDeadBrokerCandidates(ctx context.Context) ([]uuid.UUID, er
 func (j *Janitor) ownLockUnbroken(ctx context.Context) (bool, error) {
 	free, err := j.brokerLockFree(ctx, j.eng.BrokerID())
 	if err != nil {
+		// We can't vouch for our own lock, so nothing observed so far
+		// can be carried across this tick.
+		j.suspectsMu.Lock()
+		clear(j.suspects)
+		j.suspectsMu.Unlock()
 		return false, err
 	}
 	held := !free
@@ -840,7 +861,7 @@ func releaseBrokerLock(ctx context.Context, conn *pgxpool.Conn, lockKey string) 
 // Returns true if we claimed the broker (caller increments the metric);
 // false if it is alive, still inside its grace, or another pod beat us
 // to it.
-func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID, now time.Time) (claimed bool, err error) {
+func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID) (claimed bool, err error) {
 	// This process is running, so its broker is not dead, whatever the
 	// lock says.
 	if brokerID == j.eng.BrokerID() {
@@ -848,17 +869,31 @@ func (j *Janitor) handleDeadBroker(ctx context.Context, brokerID uuid.UUID, now 
 	}
 	free, err := j.brokerLockFree(ctx, brokerID)
 	if err != nil {
+		j.clearSuspect(brokerID)
 		return false, err
 	}
 	if !free {
 		j.clearSuspect(brokerID)
 		return false, nil
 	}
-	freeFor := j.lockFreeFor(brokerID, now)
+	// The clock reads after the probe: the tick may have waited a long
+	// time for a pool connection, and none of that wait was observation.
+	freeFor, samples := j.observeFree(brokerID, j.nowFn())
 	if freeFor < j.deadBrokerGrace {
 		return false, nil
 	}
+	if j.deadBrokerGrace > 0 && samples < minDeadBrokerSamples {
+		return false, nil
+	}
 	return j.reapBroker(ctx, brokerID, freeFor)
+}
+
+// maxProbeGap is the longest two consecutive probes of a suspect may be
+// apart and still count as one run. Scales with the probe cadence so a
+// long janitor interval slows detection down instead of preventing it.
+func (j *Janitor) maxProbeGap() time.Duration {
+	cadence := max(j.interval, j.jobIntervals[JobFindDeadBrokers])
+	return max(j.deadBrokerGrace/2, 2*cadence)
 }
 
 // reapBroker claims brokerID's advisory lock and, if it gets it, fires
@@ -978,32 +1013,43 @@ func (j *Janitor) reapBroker(ctx context.Context, brokerID uuid.UUID, freeFor ti
 	return ct.RowsAffected() > 0, nil
 }
 
-// lockFreeFor records that brokerID's lock was found free at now and
-// returns how long it has been continuously free as far as this janitor
-// has seen.
-func (j *Janitor) lockFreeFor(brokerID uuid.UUID, now time.Time) time.Duration {
+// observeFree records a probe at time at that found brokerID's lock free,
+// and returns how long the current unbroken run of such probes spans and
+// how many probes are in it.
+func (j *Janitor) observeFree(brokerID uuid.UUID, at time.Time) (time.Duration, int) {
+	maxGap := j.maxProbeGap()
 	j.suspectsMu.Lock()
-	since, ok := j.suspects[brokerID]
-	if !ok {
-		since = now
-		j.suspects[brokerID] = now
+	s, ok := j.suspects[brokerID]
+	restarted := ok && at.Sub(s.last) > maxGap
+	if !ok || restarted {
+		s = suspect{since: at}
 	}
+	s.last = at
+	s.samples++
+	j.suspects[brokerID] = s
 	j.suspectsMu.Unlock()
-	if !ok && j.deadBrokerGrace > 0 {
-		j.logger.Info("broker lock is free; will reap if it stays free",
-			"broker", brokerID, "grace", j.deadBrokerGrace)
+	if j.deadBrokerGrace > 0 {
+		switch {
+		case restarted:
+			j.logger.Info("gap between dead-broker probes too long; restarting its clock",
+				"broker", brokerID, "max_gap", maxGap)
+		case !ok:
+			j.logger.Info("broker lock is free; will reap if it stays free",
+				"broker", brokerID, "grace", j.deadBrokerGrace)
+		}
 	}
-	return now.Sub(since)
+	return at.Sub(s.since), s.samples
 }
 
-// clearSuspect records that brokerID's lock was found held.
+// clearSuspect ends brokerID's run of free probes: its lock was found
+// held, or the probe could not be answered.
 func (j *Janitor) clearSuspect(brokerID uuid.UUID) {
 	j.suspectsMu.Lock()
 	_, ok := j.suspects[brokerID]
 	delete(j.suspects, brokerID)
 	j.suspectsMu.Unlock()
 	if ok {
-		j.logger.Info("broker lock is held again; no longer a reap candidate", "broker", brokerID)
+		j.logger.Info("broker is no longer a reap candidate", "broker", brokerID)
 	}
 }
 

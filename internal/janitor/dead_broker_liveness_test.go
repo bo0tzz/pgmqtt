@@ -105,22 +105,39 @@ func holdBrokerLock(t *testing.T, mh *enginetest.MultiHarness, broker uuid.UUID)
 	}
 }
 
+// probeStep is how far the fake clock moves between ticks when a test
+// lets time pass: the production probe cadence.
+const probeStep = 5 * time.Second
+
 // fakeClockJanitor returns a janitor for pod 0 that probes for dead
-// brokers on every Tick and reads time from the returned pointer. tick
-// advances the clock, runs one Tick and returns clientID's session.
-func fakeClockJanitor(t *testing.T, mh *enginetest.MultiHarness, clientID string) (jt *janitor.Janitor, tick func(advance time.Duration) sessionState) {
+// brokers on every Tick and runs on a fake clock. jump moves the clock by
+// d in one go and ticks once; pass moves it by d in probeStep increments,
+// ticking at each, the way a healthy janitor would. Both return
+// clientID's session afterwards.
+func fakeClockJanitor(t *testing.T, mh *enginetest.MultiHarness, clientID string) (jt *janitor.Janitor, jump, pass func(d time.Duration) sessionState) {
 	now := time.Now()
 	jt = janitor.New(mh.Pool, mh.Pods[0].Engine, warnLogger())
 	jt.SetJobIntervals(map[string]time.Duration{janitor.JobFindDeadBrokers: 0})
 	jt.SetNowForTest(func() time.Time { return now })
-	return jt, func(advance time.Duration) sessionState {
+	jump = func(d time.Duration) sessionState {
 		t.Helper()
-		now = now.Add(advance)
+		now = now.Add(d)
 		if err := jt.Tick(context.Background()); err != nil {
 			t.Fatalf("tick: %v", err)
 		}
 		return readSession(t, mh, clientID)
 	}
+	pass = func(d time.Duration) sessionState {
+		t.Helper()
+		st := readSession(t, mh, clientID)
+		for d > 0 {
+			step := min(d, probeStep)
+			st = jump(step)
+			d -= step
+		}
+		return st
+	}
+	return jt, jump, pass
 }
 
 func (s sessionState) owned() bool { return s.brokerID != nil && s.connected && s.willTopic != nil }
@@ -184,14 +201,14 @@ func TestJanitorJudgesNobodyWithoutOwnLock(t *testing.T) {
 	peer := uuid.New()
 	seedSessionOwnedBy(t, mh, "nolock-ghost", peer)
 
-	jt, tick := fakeClockJanitor(t, mh, "nolock-ghost")
+	jt, jump, _ := fakeClockJanitor(t, mh, "nolock-ghost")
 	jt.SetDeadBrokerGrace(0)
 
-	if s := tick(0); !s.owned() {
+	if s := jump(0); !s.owned() {
 		t.Fatalf("reaped a peer while our own lock was not held: %+v", s)
 	}
 	holdBrokerLock(t, mh, mh.Pods[0].BrokerID)
-	if s := tick(0); s.brokerID != nil {
+	if s := jump(0); s.brokerID != nil {
 		t.Fatalf("peer not reaped once our own lock was held: %+v", s)
 	}
 }
@@ -205,14 +222,14 @@ func TestJanitorReapsPeerOnlyAfterGrace(t *testing.T) {
 	peer := uuid.New()
 	seedSessionOwnedBy(t, mh, "grace-ghost", peer)
 
-	_, tick := fakeClockJanitor(t, mh, "grace-ghost")
-	if s := tick(0); !s.owned() {
+	_, jump, pass := fakeClockJanitor(t, mh, "grace-ghost")
+	if s := jump(0); !s.owned() {
 		t.Fatalf("reaped on first sight of a free lock: %+v", s)
 	}
-	if s := tick(janitor.DeadBrokerGrace - time.Second); !s.owned() {
+	if s := pass(janitor.DeadBrokerGrace - time.Second); !s.owned() {
 		t.Fatalf("reaped inside the grace: %+v", s)
 	}
-	if s := tick(time.Second); s.brokerID != nil || s.connected {
+	if s := pass(time.Second); s.brokerID != nil || s.connected {
 		t.Fatalf("not reaped after the grace: %+v", s)
 	}
 }
@@ -227,26 +244,114 @@ func TestJanitorGraceRestartsWhenLockReheld(t *testing.T) {
 	peer := uuid.New()
 	seedSessionOwnedBy(t, mh, "flap-ghost", peer)
 
-	_, tick := fakeClockJanitor(t, mh, "flap-ghost")
-	if s := tick(0); !s.owned() {
-		t.Fatalf("reaped on first sight of a free lock: %+v", s)
+	_, jump, pass := fakeClockJanitor(t, mh, "flap-ghost")
+	if s := pass(janitor.DeadBrokerGrace - 2*probeStep); !s.owned() {
+		t.Fatalf("reaped inside the grace: %+v", s)
 	}
 
-	// The peer's listener comes back...
+	// The peer's listener comes back for one probe...
 	release := holdBrokerLock(t, mh, peer)
-	if s := tick(10 * time.Second); !s.owned() {
+	if s := jump(probeStep); !s.owned() {
 		t.Fatalf("reaped while the lock was held: %+v", s)
 	}
-	// ...and drops again, with the first clock already past the grace.
+	// ...and drops again. The first run of free probes would be past the
+	// grace by now had it not been broken.
 	release()
-	if s := tick(janitor.DeadBrokerGrace); !s.owned() {
-		t.Fatalf("reaped on the stale clock from before the lock was re-held: %+v", s)
+	if s := pass(janitor.DeadBrokerGrace - time.Second); !s.owned() {
+		t.Fatalf("reaped on the clock from before the lock was re-held: %+v", s)
 	}
-	if s := tick(janitor.DeadBrokerGrace - time.Second); !s.owned() {
-		t.Fatalf("reaped inside the second grace: %+v", s)
-	}
-	if s := tick(time.Second); s.brokerID != nil {
+	if s := pass(probeStep + time.Second); s.brokerID != nil {
 		t.Fatalf("not reaped after a full grace from the second loss: %+v", s)
+	}
+}
+
+// TestJanitorGraceRestartsAfterProbeGap: a janitor that did not look for
+// most of the grace (a stalled tick, an exhausted pool) has not seen the
+// lock free "on every check". Two probes a grace apart are two samples,
+// not thirty seconds of evidence.
+func TestJanitorGraceRestartsAfterProbeGap(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	startListener(t, mh)
+	seedSessionOwnedBy(t, mh, "gap-ghost", uuid.New())
+
+	_, jump, pass := fakeClockJanitor(t, mh, "gap-ghost")
+	if s := pass(2 * probeStep); !s.owned() {
+		t.Fatalf("reaped inside the grace: %+v", s)
+	}
+	if s := jump(janitor.DeadBrokerGrace); !s.owned() {
+		t.Fatalf("reaped across a probe gap as long as the grace: %+v", s)
+	}
+	if s := pass(janitor.DeadBrokerGrace - time.Second); !s.owned() {
+		t.Fatalf("reaped inside the grace that restarted after the gap: %+v", s)
+	}
+	if s := pass(time.Second); s.brokerID != nil {
+		t.Fatalf("not reaped after a full grace of regular probes: %+v", s)
+	}
+}
+
+// TestJanitorGraceClockStartsWhenProbeReturns: Tick reads the clock once
+// at the top and can then wait a long time for a pool connection. A
+// suspect first seen at the end of that wait was first seen then, not
+// when the tick began; otherwise a tick stalled for longer than the grace
+// reaps on the very next probes, milliseconds apart.
+func TestJanitorGraceClockStartsWhenProbeReturns(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	startListener(t, mh)
+	seedSessionOwnedBy(t, mh, "stall-ghost", uuid.New())
+
+	jt := janitor.New(mh.Pool, mh.Pods[0].Engine, warnLogger())
+	jt.SetJobIntervals(map[string]time.Duration{janitor.JobFindDeadBrokers: 0})
+	// A long interval widens the gap the janitor tolerates between
+	// probes, so the gap rule cannot rescue a wrong timestamp here.
+	jt.SetInterval(2 * janitor.DeadBrokerGrace)
+	start := time.Now()
+	stall := janitor.DeadBrokerGrace + 5*time.Second
+	var calls int
+	now := start
+	jt.SetNowForTest(func() time.Time {
+		calls++
+		if calls == 1 {
+			return start // the stalled tick's reading, taken before the wait
+		}
+		return now
+	})
+
+	now = start.Add(stall)
+	for i := 0; i < 4; i++ {
+		if err := jt.Tick(context.Background()); err != nil {
+			t.Fatalf("tick: %v", err)
+		}
+		if s := readSession(t, mh, "stall-ghost"); !s.owned() {
+			t.Fatalf("probe %d after the stall: reaped a broker first seen free %s ago: %+v",
+				i+1, now.Sub(start.Add(stall)), s)
+		}
+		now = now.Add(500 * time.Millisecond)
+	}
+}
+
+// TestJanitorNeedsThreeSamplesAtLongIntervals: with a janitor interval
+// longer than the grace, the second probe is already "after the grace".
+// Two samples are not enough to call a broker dead.
+func TestJanitorNeedsThreeSamplesAtLongIntervals(t *testing.T) {
+	t.Parallel()
+	mh := enginetest.NewMultiHarness(t, 1, nil)
+	startListener(t, mh)
+	seedSessionOwnedBy(t, mh, "slow-ghost", uuid.New())
+
+	const interval = 60 * time.Second
+	jt, jump, _ := fakeClockJanitor(t, mh, "slow-ghost")
+	jt.SetInterval(interval)
+
+	if s := jump(0); !s.owned() {
+		t.Fatalf("reaped on first sight of a free lock: %+v", s)
+	}
+	if s := jump(interval); !s.owned() {
+		t.Fatalf("reaped on the second sample: %+v", s)
+	}
+	if s := jump(interval); s.brokerID != nil {
+		t.Fatalf("not reaped on the third sample: %+v", s)
 	}
 }
 
@@ -264,34 +369,37 @@ func TestJanitorGraceRestartsWhenOwnLockInterrupted(t *testing.T) {
 	seedSessionOwnedBy(t, mh, "bounce-ghost", peer)
 
 	var epoch atomic.Uint64
-	jt, tick := fakeClockJanitor(t, mh, "bounce-ghost")
+	jt, jump, pass := fakeClockJanitor(t, mh, "bounce-ghost")
 	jt.SetLockEpoch(epoch.Load)
 
 	release := holdBrokerLock(t, mh, mh.Pods[0].BrokerID)
-	if s := tick(0); !s.owned() {
+	if s := jump(0); !s.owned() {
 		t.Fatalf("reaped on first sight of a free lock: %+v", s)
+	}
+	if s := pass(janitor.DeadBrokerGrace - probeStep); !s.owned() {
+		t.Fatalf("reaped inside the grace: %+v", s)
 	}
 
 	// Our lock is missing at the tick where the peer's grace would end.
 	release()
-	if s := tick(janitor.DeadBrokerGrace); !s.owned() {
+	if s := jump(probeStep); !s.owned() {
 		t.Fatalf("reaped a peer while our own lock was not held: %+v", s)
 	}
 	// It is back: the peer gets a full grace from here.
 	holdBrokerLock(t, mh, mh.Pods[0].BrokerID)
-	if s := tick(time.Second); !s.owned() {
+	if s := pass(janitor.DeadBrokerGrace - probeStep); !s.owned() {
 		t.Fatalf("reaped on a clock from before our own lock was lost: %+v", s)
 	}
 
 	// Our lock was lost and re-taken entirely between two ticks.
 	epoch.Add(1)
-	if s := tick(janitor.DeadBrokerGrace); !s.owned() {
+	if s := jump(probeStep); !s.owned() {
 		t.Fatalf("reaped on a clock spanning a loss of our own lock: %+v", s)
 	}
-	if s := tick(janitor.DeadBrokerGrace - time.Second); !s.owned() {
+	if s := pass(janitor.DeadBrokerGrace - time.Second); !s.owned() {
 		t.Fatalf("reaped inside the grace: %+v", s)
 	}
-	if s := tick(time.Second); s.brokerID != nil {
+	if s := pass(time.Second); s.brokerID != nil {
 		t.Fatalf("not reaped after a full grace under an unbroken own lock: %+v", s)
 	}
 }

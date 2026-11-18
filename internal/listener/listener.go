@@ -10,7 +10,6 @@ package listener
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -39,17 +38,16 @@ const (
 	tcpKeepaliveInterval = 5
 	tcpKeepaliveCount    = 3
 
-	// Reconnect backoff. On a non-EOF NOTIFY wait error we tear down the
+	// Reconnect backoff. On a NOTIFY wait error we tear down the
 	// dedicated conn (which auto-releases the advisory lock) and try to
 	// re-acquire LISTEN + lock. First attempt fires immediately — only a
-	// FAILED attempt sleeps, with backoff doubling 1→2→4→8 s. The loop
-	// gives up after reconnectMaxAttempts or LockReacquireDeadline,
-	// whichever comes first, and the Pod exits so kubelet replaces it
+	// FAILED attempt sleeps, with backoff doubling 1→2→4 s and then
+	// staying at 4 s, so attempts keep landing until
+	// LockReacquireDeadline. Then the Pod exits so kubelet replaces it
 	// (advisory lock + LISTEN registration are per-conn so the new Pod
 	// gets a clean state).
 	reconnectInitialBackoff = 1 * time.Second
-	reconnectMaxBackoff     = 16 * time.Second
-	reconnectMaxAttempts    = 5
+	reconnectMaxBackoff     = 4 * time.Second
 
 	// LockReacquireDeadline is the longest a running broker may go
 	// without holding its advisory lock. It is one half of the liveness
@@ -197,9 +195,13 @@ func (l *Listener) Stop() {
 func (l *Listener) run(ctx context.Context) {
 	defer close(l.doneCh)
 	defer func() {
+		// This goroutine is the only thing that notices a lost lock. If
+		// it dies the broker would go on serving clients with no lock
+		// and no LISTEN, which is exactly the state peers reap.
 		if r := recover(); r != nil {
-			l.logger.Error("listener goroutine panic",
+			l.logger.Error("listener goroutine panic; exiting for kubelet replacement",
 				"panic", r, "stack", string(debug.Stack()))
+			osExit(1)
 		}
 	}()
 	pubCh := unquotedPub(l.uuid)
@@ -218,10 +220,7 @@ func (l *Listener) run(ctx context.Context) {
 				}
 				return
 			}
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			// Non-EOF, non-cancellation wait error. Tear down the conn
+			// Any other wait error, a closed conn included. Tear down the conn
 			// (releases the advisory lock as a side-effect) and try to
 			// reconnect with exponential backoff. If reconnect succeeds
 			// we resume the loop on the new conn; if all attempts fail
@@ -232,7 +231,7 @@ func (l *Listener) run(ctx context.Context) {
 			}
 			if !l.reconnect(ctx) {
 				// Distinguish "ctx cancelled mid-reconnect" (clean Stop())
-				// from "we burned through reconnectMaxAttempts". The
+				// from "the deadline passed without the lock". The
 				// former must return cleanly so graceful shutdown doesn't
 				// crash the pod; the latter is the kubelet-replacement
 				// path that signals failure via osExit.
@@ -306,9 +305,9 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 	// one: for the common case where Postgres is back within
 	// milliseconds, the lock is re-held before anything else notices.
 	backoff := reconnectInitialBackoff
-	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
-		// Bail before the dial on cancellation so Stop() during
-		// reconnect returns promptly.
+	for attempt := 1; ; attempt++ {
+		// Bail before the dial on cancellation or deadline so Stop()
+		// during reconnect returns promptly.
 		if dctx.Err() != nil {
 			return false
 		}
@@ -321,23 +320,13 @@ func (l *Listener) reconnect(ctx context.Context) bool {
 			return true
 		}
 		l.logger.Warn("listener reconnect failed", "attempt", attempt, "err", err)
-		// Last attempt — don't sleep, just bail.
-		if attempt == reconnectMaxAttempts {
-			break
-		}
 		select {
 		case <-dctx.Done():
 			return false
 		case <-time.After(backoff):
 		}
-		if backoff < reconnectMaxBackoff {
-			backoff *= 2
-			if backoff > reconnectMaxBackoff {
-				backoff = reconnectMaxBackoff
-			}
-		}
+		backoff = min(backoff*2, reconnectMaxBackoff)
 	}
-	return false
 }
 
 // dispatchNotification handles a single NOTIFY. Wrapped in its own recover so
