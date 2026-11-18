@@ -68,17 +68,15 @@ type Config struct {
 	// the broker's `users` table. 10 is bcrypt's library default.
 	BcryptCost int
 
-	// MaxQueuedDeliveriesPerClient bounds the per-conn outbound queue depth
-	// in the deliveries table. When a slow subscriber is at the cap:
-	//   * QoS-0 messages targeted at them are silently dropped (spec-OK).
-	//   * QoS>0 messages targeted at them are dropped AND the subscriber is
-	//     DISCONNECTed with reason 0x97 (Quota Exceeded).
-	// 0 disables the cap entirely.
+	// MaxQueuedDeliveriesPerClient bounds a client's queued deliveries,
+	// counted separately for QoS 0 and QoS>0. A message for a client that
+	// is at the cap in its class is not queued for it, and the client is
+	// DISCONNECTed with reason 0x97 (Quota Exceeded). 0 disables the cap.
 	MaxQueuedDeliveriesPerClient int
 
 	// MaxConnections caps concurrent client connections this Pod will accept.
-	// Above the cap, CONNACK is rejected with reason 0x9F (Connection Rate
-	// Exceeded) and the socket is closed. 0 disables the cap.
+	// Above the cap a new connection is closed without a CONNACK, so the
+	// client retries. 0 disables the cap.
 	MaxConnections int
 
 	// MaxInboundMsgsPerSec is the per-connection token-bucket rate for
@@ -155,6 +153,7 @@ type Config struct {
 }
 
 func FromEnv() (*Config, error) {
+	receiveMaximum := getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)
 	c := &Config{
 		DatabaseURL: os.Getenv("PGMQTT_DATABASE_URL"),
 		TCPAddr:     getenv("PGMQTT_TCP_ADDR", ":1883"),
@@ -172,7 +171,7 @@ func FromEnv() (*Config, error) {
 		LeaderElectionID: getenvDefaultEmpty("PGMQTT_LEADER_ELECTION_ID", DefaultLeaderElectionID),
 		WatchNamespaces:  splitTrimmed(os.Getenv("PGMQTT_WATCH_NAMESPACES"), ","),
 
-		V5ReceiveMaximum:             uint16(getenvInt("PGMQTT_RECEIVE_MAXIMUM", 100)),
+		V5ReceiveMaximum:             uint16(receiveMaximum),
 		V5KeepaliveMax:               time.Duration(getenvInt("PGMQTT_KEEPALIVE_MAX_SEC", 60)) * time.Second,
 		BcryptCost:                   getenvInt("PGMQTT_BCRYPT_COST", 10),
 		MaxQueuedDeliveriesPerClient: getenvInt("PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT", 10000),
@@ -193,6 +192,10 @@ func FromEnv() (*Config, error) {
 	}
 	if c.TCPAddr == "" && c.WSAddr == "" {
 		return nil, fmt.Errorf("at least one of PGMQTT_TCP_ADDR or PGMQTT_WS_ADDR must be set")
+	}
+	if receiveMaximum < 1 || receiveMaximum > 65535 {
+		// A uint16 conversion would wrap 65536 to 0 and 70000 to 4464.
+		return nil, fmt.Errorf("PGMQTT_RECEIVE_MAXIMUM must be in [1, 65535]")
 	}
 	if c.V5KeepaliveMax <= 0 {
 		return nil, fmt.Errorf("PGMQTT_KEEPALIVE_MAX_SEC must be > 0")

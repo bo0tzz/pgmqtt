@@ -50,20 +50,16 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", ScrubURLError(err, url))
 	}
-	// Aggressive TCP keepalive on the client-side socket so a zombie
-	// (peer pod killed without sending FIN/RST — common when a CNPG
-	// primary is evicted, OOM-killed, or otherwise exits non-gracefully)
-	// surfaces as a kernel-level socket error within ~11 min instead of
-	// Linux's default ~2 hours. The listener uses the same dialer (see
-	// listener.go).
-	cfg.ConnConfig.DialFunc = keepalivedDialer
+	// statement_timeout cannot help when the server itself is gone without
+	// a FIN or RST (a CNPG primary on a lost node): a query then waits on
+	// a socket nothing will ever answer. TCP keepalive is what ends it.
+	cfg.ConnConfig.DialFunc = KeepaliveDialer
 	// PingTimeout bounds the on-Acquire liveness ping. pgxpool's default
 	// ShouldPing pings any conn idle > 1s before handing it out; with
 	// PingTimeout=0 (upstream default) that ping inherits the caller's
 	// context and blocks indefinitely against a half-open socket.
 	// Setting a small explicit timeout means a wedged conn is detected
-	// and destroyed on the NEXT Acquire — recovery in seconds, not the
-	// ~11 min the kernel keepalive needs in the idle case. 2s is
+	// and destroyed on the NEXT Acquire, without waiting on keepalive. 2s is
 	// generous for an in-cluster PG RTT (<1ms typical) and short enough
 	// that callers don't perceive it as a hang.
 	cfg.PingTimeout = 2 * time.Second
@@ -96,15 +92,28 @@ func Open(ctx context.Context, url string, opts Options) (*pgxpool.Pool, error) 
 	return pool, nil
 }
 
-// keepalivedDialer is the pool's net.Dialer with aggressive TCP keepalive.
-// Matches the listener's dialer so both broker→PG paths fail fast when the
-// peer dies without sending FIN/RST. Go's `KeepAlive` field maps to
-// TCP_KEEPIDLE only; the interval (TCP_KEEPINTVL) and count (TCP_KEEPCNT)
-// use the Linux defaults of 75 s × 9, so a dead peer is detected after
-// ~10 s of idle + ~11 min of probing. Beats the ~2-hour bare default by
-// an order of magnitude. For tighter detection an operator can layer
-// tcp_user_timeout via the OS / sysctl.
-func keepalivedDialer(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 10 * time.Second}
+// TCP keepalive schedule for every connection the broker makes to
+// Postgres: a peer that has gone silent is given up on after
+// KeepaliveIdle + KeepaliveCount*KeepaliveInterval, about 25 s.
+const (
+	KeepaliveIdle     = 10 * time.Second
+	KeepaliveInterval = 5 * time.Second
+	KeepaliveCount    = 3
+)
+
+// KeepaliveDialer dials with the keepalive schedule above. The whole
+// schedule has to be set: Dialer.KeepAlive alone sets only the idle time
+// and leaves the probe interval and count at Go's 15 s x 9, which is
+// minutes before a dead peer is noticed.
+func KeepaliveDialer(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{
+		Timeout: 5 * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     KeepaliveIdle,
+			Interval: KeepaliveInterval,
+			Count:    KeepaliveCount,
+		},
+	}
 	return d.DialContext(ctx, network, addr)
 }

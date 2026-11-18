@@ -8,15 +8,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// keepalivedDialer is the pool's client-side keepalive dialer; without
-// it the May 2026 CNPG-churn incident reproduces (zombie TCP socket to
-// a gone PG primary, 110-min wedge). The dialer itself is tiny — guard
-// against accidental deletion or unwiring from db.go's Open.
-func TestKeepalivedDialerRespectsContext(t *testing.T) {
+// KeepaliveDialer is the pool's and the listener's dialer; without it the
+// May 2026 CNPG-churn incident reproduces (zombie TCP socket to a gone PG
+// primary, 110-min wedge).
+func TestKeepaliveDialerRespectsContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := keepalivedDialer(ctx, "tcp", "127.0.0.1:1"); err == nil {
+	if _, err := KeepaliveDialer(ctx, "tcp", "127.0.0.1:1"); err == nil {
 		t.Fatal("expected dial to fail on cancelled ctx")
 	}
 }

@@ -211,3 +211,20 @@ func TestGetenvIntWarnsOnBadValue(t *testing.T) {
 		t.Errorf("expected offending value in log; got: %q", logged)
 	}
 }
+
+// TestReceiveMaximumOutOfRangeIsRejected: the value used to be converted to
+// uint16 unchecked, so 65536 became 0 and 70000 became 4464.
+func TestReceiveMaximumOutOfRangeIsRejected(t *testing.T) {
+	t.Setenv("PGMQTT_DATABASE_URL", "postgres://x/y")
+	for _, v := range []string{"0", "65536", "70000"} {
+		t.Setenv("PGMQTT_RECEIVE_MAXIMUM", v)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("PGMQTT_RECEIVE_MAXIMUM=%s accepted", v)
+		}
+	}
+	t.Setenv("PGMQTT_RECEIVE_MAXIMUM", "65535")
+	c, err := FromEnv()
+	if err != nil || c.V5ReceiveMaximum != 65535 {
+		t.Errorf("PGMQTT_RECEIVE_MAXIMUM=65535: %v, %v", c, err)
+	}
+}

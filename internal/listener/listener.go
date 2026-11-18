@@ -12,7 +12,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -31,12 +30,6 @@ import (
 
 const (
 	advisoryLockNamespace = "pgmqtt:broker:"
-
-	// TCP keepalive aggressively configured so a dead/partitioned Pod's
-	// advisory lock releases inside ~25 s rather than ~2 h.
-	tcpKeepaliveIdle     = 10 // seconds
-	tcpKeepaliveInterval = 5
-	tcpKeepaliveCount    = 3
 
 	// Reconnect backoff. On a NOTIFY wait error we tear down the
 	// dedicated conn (which auto-releases the advisory lock) and try to
@@ -138,13 +131,17 @@ func dialAndRegister(ctx context.Context, url string, id uuid.UUID) (*pgx.Conn, 
 	}
 	cfg.RuntimeParams = mergeParams(cfg.RuntimeParams, map[string]string{
 		// Server-side TCP keepalives; takes effect on this backend's outbound socket.
-		"tcp_keepalives_idle":     strconv.Itoa(tcpKeepaliveIdle),
-		"tcp_keepalives_interval": strconv.Itoa(tcpKeepaliveInterval),
-		"tcp_keepalives_count":    strconv.Itoa(tcpKeepaliveCount),
+		// So that a dead or partitioned Pod's advisory lock is released
+		// within ~25 s rather than ~2 h.
+		"tcp_keepalives_idle":     strconv.Itoa(int(db.KeepaliveIdle.Seconds())),
+		"tcp_keepalives_interval": strconv.Itoa(int(db.KeepaliveInterval.Seconds())),
+		"tcp_keepalives_count":    strconv.Itoa(db.KeepaliveCount),
 		"application_name":        "pgmqttd-listener",
 	})
-	// Client-side TCP keepalives on the Go end of the socket as well.
-	cfg.DialFunc = keepalivedDialer
+	// The same schedule on our end, so that on a silent partition this
+	// broker notices it has lost its lock when Postgres drops the session,
+	// not minutes later.
+	cfg.DialFunc = db.KeepaliveDialer
 
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
@@ -441,23 +438,4 @@ func mergeParams(base, extra map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-// keepalivedDialer uses the same keepalive schedule on the client end as
-// dialAndRegister asks the server for. With a plain KeepAlive the client
-// keeps Go's default probe interval and count (15 s × 9), so on a silent
-// partition Postgres would drop the session (and the lock) after ~25 s
-// while this end took over two minutes to notice — a window where the
-// broker serves clients believing it still holds a lock it lost long ago.
-func keepalivedDialer(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := net.Dialer{
-		Timeout: 5 * time.Second,
-		KeepAliveConfig: net.KeepAliveConfig{
-			Enable:   true,
-			Idle:     tcpKeepaliveIdle * time.Second,
-			Interval: tcpKeepaliveInterval * time.Second,
-			Count:    tcpKeepaliveCount,
-		},
-	}
-	return d.DialContext(ctx, network, addr)
 }
