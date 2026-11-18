@@ -1,81 +1,94 @@
 # validate.sh — measured wall-clock + bug coverage per tier
 
 `scripts/validate.sh` is the canonical pre-commit / pre-tag validation
-entrypoint. This page records what each tier actually costs in wall-clock
-on a representative developer laptop, what categories of bugs each tier
-catches that the previous tier misses, and where the dominant time goes.
+entrypoint. This page records what each tier costs in wall-clock, what
+categories of bugs each tier catches that the previous tier misses, and
+where the time goes.
 
-Numbers are from a 2026-05 session on a 12-core laptop, NVMe disk, Docker
-in rootless mode. Treat them as the lower-bound floor; CI runners are
-slower (typically 1.5–2× on the same workload).
+Two sets of numbers:
+
+- **Local**: 2026-11-18, a 20-thread laptop (i9-12900H, NVMe, Docker 29),
+  Go build cache and container images warm.
+- **CI**: the `conformance` job's own phase summary on GitHub's
+  `ubuntu-latest` runners, October–November 2026. Those runners start
+  with a cold Go build cache, which is where most of the difference in
+  the first two phases comes from.
+
+Every tier needs Docker, and fails without it. About three quarters of
+the Go suite (122 of 163 tests on 2026-11-18: the db, engine, janitor,
+listener and operator packages) runs against Postgres 18 in a
+testcontainer, one container per package. `internal/db/dbtest` skips
+those tests when the container cannot start, unless `CI` or
+`PGMQTT_TEST_REQUIRE_DB` is set; `validate.sh` sets the latter, so a
+green tier always means they ran.
+`PGMQTT_TEST_DATABASE_URL` points them at an existing server instead.
+
+`govulncheck` is not part of any tier. `--vulncheck` adds it as a first
+phase (about 5 s once installed); CI runs it as its own job.
 
 ## tier1 — `scripts/validate.sh tier1`
 
-Wall clock: **≈10s** (cold), 5–7s warm cache.
+Wall clock: **≈15–20 s** local, **3–5 min** on a CI runner.
 
-Phases:
+| Phase            | Local | CI     | What it runs                                           |
+|------------------|-------|--------|--------------------------------------------------------|
+| `go vet`         | ~1s   | 1–2m   | `go vet ./...`                                         |
+| `make test-race` | 14–17s | 2–3m   | `go test ./... -count=1 -race -timeout 10m`: the whole suite, including every database-backed test |
+| `helm lint`      | <1s   | <1s    | `scripts/helm-check.sh lint`                           |
+| `helm template`  | a few s | a few s | `scripts/helm-check.sh render`: renders the chart at its Kubernetes floor (1.30) under a couple of dozen value sets, strict-parses each with `kustomize build`, asserts on the content of several, and checks that the combinations the chart must refuse are refused with the right error |
 
-| Phase             | Time  | What it actually runs                                  |
-|-------------------|-------|--------------------------------------------------------|
-| `go vet`          |  ~2s  | `go vet ./...`                                         |
-| `make test-race`  |  ~5s  | `go test ./... -count=1 -race -timeout 10m` (test-light packages — full unit suite is in tier2) |
-| `helm lint`       |  <1s  | `helm lint deploy/helm/pgmqtt`                         |
-| `helm template`   |  ~3s  | four render variants (defaults, multi-replica + UI, external secret + bcrypt-cost override, every optional resource on), each strict-parsed with `kustomize build` |
-
-The `go test -race` time is misleading: most of pgmqtt's heavy tests are
-gated on `testcontainers` and only run when `PGMQTT_TEST_DATABASE_URL` is
-set. Tier1 deliberately runs only the side without it (fast, hermetic).
-Coverage of the test-DB path lives in tier2's `make coverage` phase.
-
-**Bug classes caught here that nothing else does:**
-- Type errors / missing-import / compile fails (fast feedback).
+**Bug classes caught here:**
+- Type errors / missing-import / compile fails.
 - Static `go vet` issues (mostly printf-vet and copy-by-value-of-Mutex).
-- Helm chart structural issues (`helm lint` + `helm template` + strict parse) — typoed
-  values keys, indentation drift, render-time-only Sprig errors. The
-  recent strict int-parsing fix (`maxPacketSize=1` silently accepted)
-  was caught at `helm template` time.
-- The data race detector when run against the small set of pure-Go
-  tests in tier1.
+- Anything the Go tests cover, which is most of the broker: the SQL
+  path, migrations, the engine, the janitor, the listener, and the
+  operator's reconciler against controller-runtime's fake client.
+- Data races in all of the above.
+- Helm chart issues that show up in a render: typoed values keys,
+  indentation drift, render-time-only Sprig errors, duplicate mapping
+  keys that helm emits but Flux and kustomize reject, named ports that
+  nothing declares, value combinations the binary would refuse at
+  startup.
 
 **Bug classes NOT caught here:**
-- Anything that needs Postgres (no testcontainer here).
-- Protocol-level bugs (no MQTT client speaks to the broker).
+- Protocol-level bugs that only a real MQTT client finds (no client
+  other than the test harness speaks to the broker).
 - Multi-replica fanout issues (no kind cluster).
+- A chart value rendered in scientific notation. No render is searched
+  for it; see "Helm scientific-notation rendering" in `AGENTS.md`.
 
-Run after: every code change, in the editor save loop. Treat tier1 as
-"`make ci-light`" — should always be green before you write a commit
-message.
+Run after: every code change. It should always be green before you
+write a commit message.
 
 ## tier2 — `scripts/validate.sh tier2 --paho PATH`
 
-Wall clock: **≈6m12s** total on this laptop.
+Wall clock: **≈7 min** (408 s) local, **10–12 min** on a CI runner. CI runs
+exactly this as the `paho v3+v5 (single broker)` job in `ci.yml`, on
+every PR, push to main and tag.
 
-Phases (from a real run):
+| Phase           | Local | CI      | Notes                                          |
+|-----------------|-------|---------|------------------------------------------------|
+| (tier1 prefix)  | ~15s  | 3–5m    | re-runs the whole tier1                        |
+| `make coverage` | ~10s  | 30–45s  | the suite a second time, without `-race`, for `coverage.out` / `coverage.txt` |
+| `paho setup`    | ~4s   | 5–7s    | starts `postgres:18-alpine` and one broker on free loopback ports |
+| `paho v3+v5`    | ~6.5m | ~6m     | paho.mqtt.testing's `client_test.py` + `client_test5.py`, run sequentially by `scripts/paho-conformance.py` |
+| `paho teardown` | <1s   | <1s     | stops the broker, removes the container        |
 
-| Phase                    | Time   | Notes                                          |
-|--------------------------|--------|------------------------------------------------|
-| (tier1 prefix)           | ~10s   | re-runs the whole tier1                        |
-| `make coverage`          | ~80s   | full `go test ./... -coverprofile -timeout 10m` against testcontainer Postgres |
-| `paho setup`             | ~10s   | docker-pulls postgres:18-alpine, boots single broker |
-| `paho v3+v5`             | ~355s  | dominant cost: paho.mqtt.testing's `client_test_v3.py` + `client_test_v5.py`, run sequentially |
-| `paho teardown`          |  <1s   | docker-rm + kill                              |
-
-The 6m12s figure is the wall-clock observed in the same session that
-landed migration 0010 + this page. The paho v3+v5 phase is ~95% of it;
-splitting v3 and v5 to run in parallel is the obvious next optimisation
-(blocked on parameterising the broker port and conformance wrapper).
+The Paho phase is nearly all of it, and nearly all of that is the
+suite's own `sleep` calls, so it does not get faster on a faster
+machine. Ports, container name and scratch files are per run, so two
+worktrees can run tier2 at the same time.
 
 **Bug classes caught here that tier1 doesn't:**
-- Anything that touches the SQL path (most of pgmqtt's behaviour).
-  Migration 0010's publish-cap short-circuit + autovacuum tuning was
-  validated here.
-- MQTT 3.1.1 + 5.0 protocol conformance: PUBREC reason codes, retain
-  semantics, will-delay timing, session-takeover ordering, v5
-  property-shape regressions. The packet-cap=1 bug surfaced as paho
-  v5 publish-cap-conformance failures before being root-caused as
-  helm scientific-notation rendering at the chart level.
-- Subscriber-quota DISCONNECT 0x97 path (TestSlowSubscriberQuotaExceeded,
-  re-tested as part of the full coverage run).
+- MQTT 3.1.1 + 5.0 protocol conformance as an independent client sees
+  it: PUBREC reason codes, retain semantics, will-delay timing,
+  session expiry, session-takeover ordering, v5 property shapes. The
+  packet-cap=1 bug surfaced here as publish failures before being
+  root-caused as helm scientific-notation rendering.
+
+Expected result: `v311: 9/10 passing (+1 known-flaky)` and
+`v5: 23/27 passing (+4 known-flaky)`; a v5 count of 24 or 25 is also
+normal. The known-flaky list is explained in `AGENTS.md`.
 
 **Bug classes NOT caught here:**
 - Multi-pod fanout (single broker only).
@@ -87,22 +100,29 @@ Run after: any non-trivial change, before commit / before opening a PR.
 
 ## tier3 — `scripts/validate.sh tier3 --paho PATH`
 
-Wall clock: ~15-20m end-to-end (one tier3 run on a `pgmqtt-perf` kind
-cluster: 6m tier2 prefix + ~7m multi-broker paho + ~70s soak smoke +
-~3m kind cluster setup/teardown). Numbers vary with docker image
-build cache state; cold runs add ~2m for image build + load.
+Wall clock: **≈18 min** (1064 s) local. CI runs exactly this as the `tier3`
+job of `soak-weekly.yml` (Mondays 04:00 UTC); that job has not run
+yet, so there is no CI figure.
 
-| Phase                    | Wall       | Notes                                          |
-|--------------------------|------------|------------------------------------------------|
-| (tier2 prefix)           | ~6m        | full tier2                                     |
-| `tier3 cluster setup`    | ~3m        | docker build pgmqtt:tier3 + kind create + helm install + postgres rollout |
-| `multi-broker paho`      | ~7m        | `scripts/paho-multi-broker-incluster.sh`: builds the python+paho image, kind-loads it, runs `kubectl run` Pod against `pgmqtt.<ns>.svc.cluster.local:1883` (cluster DNS, no port-forward) |
-| `soak smoke`             | ~80s       | `scripts/soak-incluster.sh`: 60s × 1000 msg/s × QoS 1 across 3 pubs / 3 subs, also via the in-cluster Pod path |
-| `tier3 cluster teardown` | ~10s       | kind delete cluster                            |
+| Phase                    | Local  | Notes                                          |
+|--------------------------|--------|------------------------------------------------|
+| (tier2 prefix)           | ~7m    | full tier2                                     |
+| `tier3 cluster setup`    | ~47s   | docker build `pgmqtt:tier3`, kind create, Postgres 18 StatefulSet, helm install with 3 replicas |
+| `multi-broker paho`      | ~6.5m  | `scripts/paho-multi-broker-incluster.sh`: builds a python + paho image, kind-loads it, runs it as a Pod against `pgmqtt.<ns>.svc.cluster.local:1883` |
+| `helm test`              | ~7s    | applies a User CR, waits for the operator's credentials Secret, runs the chart's round-trip test hook |
+| `soak smoke (qos1)`      | ~80s   | `scripts/soak-incluster.sh`: 60s × 1000 msg/s × QoS 1, 3 pubs / 3 subs |
+| `soak smoke (qos0)`      | ~135s  | `scripts/soak-incluster.sh`: 120s × 100 msg/s × QoS 0, 1 pub / 3 subs |
+| `tier3 cluster teardown` | a few s | kind delete cluster                            |
 
-Both multi-broker paho and soak smoke now run as Pods inside the same
-kind cluster. The earlier port-forward path (`scripts/paho-multi-broker.sh`)
-is deprecated — it died after ~10 paho connections under load.
+Everything that talks to the cluster runs as a Pod inside it. The older
+port-forward path (`scripts/paho-multi-broker.sh`) died after about ten
+connections and is not used by anything. The cluster is whatever node
+image the installed `kind` defaults to; the chart refuses Kubernetes
+older than 1.30.
+
+If a cluster phase fails, `validate.sh` prints pod state, the last 200
+log lines of every broker Pod and recent events before it deletes the
+cluster. `--keep-cluster` leaves the cluster up instead.
 
 **Bug classes caught here that tier2 doesn't:**
 - Cross-pod fanout: subscriptions on Pod A, publishes on Pod C, the
@@ -110,26 +130,37 @@ is deprecated — it died after ~10 paho connections under load.
 - Sustained-load behaviour over kind networking. The packet-cap=1
   regression that escaped to a tagged release would have surfaced as
   zero-or-near-zero throughput under the soak smoke.
-- Helm-rendered template applied to a real apiserver — schema
-  validation, security context, PDB/HPA/NetworkPolicy admission.
-- Operator (User CR) reconciler behaviour under realistic Lease
-  contention.
+- Helm-rendered templates applied to a real apiserver: schema
+  validation, security context, the chart's own test hook.
+- The operator end to end, by `helm test`: a User CR is reconciled into
+  a `users` row and a credentials Secret, and a client logs in with
+  that password. The Paho and soak phases connect anonymously.
 - Image build correctness (the Dockerfile's static binary path runs
-  here; a CGO-on or libc-linked drift would surface as ImagePullBackOff
-  or runtime crash).
+  here; a CGO-on or libc-linked drift would surface as a crash on
+  start).
 
-Run before: cutting a tag, weekly nightly CI, after any change to the
-helm chart's pod-spec or to the broker's connection / fanout path.
+Expected Paho result: `v311: 9/10 passing (+1 known-flaky)` and
+`v5: 25/27 passing (+2 known-flaky)`.
+
+Run before: cutting a tag, and after any change to the chart's pod spec
+or to the broker's connection / fanout path.
 
 ## Cumulative coverage
 
 | Tier  | What it adds over the previous tier                              |
 |-------|------------------------------------------------------------------|
-| tier1 | static + lint + small unit tests + chart render. Cheap floor.    |
-| tier2 | full coverage (testcontainer DB) + protocol conformance.         |
-| tier3 | deploy-shape + multi-pod fanout + sustained-load smoke.          |
+| tier1 | static checks + the whole Go suite under `-race` + chart render. |
+| tier2 | protocol conformance from an independent client; coverage profile. |
+| tier3 | deploy shape + multi-pod fanout + operator + sustained-load smoke. |
 
-The cadence in CI follows the same shape: tier1 surface is in `ci.yml`
-(every PR), tier2 is `conformance-nightly.yml` (daily 03:00 UTC), tier3
-is `soak-weekly.yml` (Mondays 04:00 UTC). See those workflow files for
-the exact wiring.
+Where each tier runs in CI:
+
+| Tier  | Workflow / job                                   | When                          |
+|-------|--------------------------------------------------|-------------------------------|
+| tier1 | `ci.yml`: `test`, `helm-lint` (the same commands, as separate jobs) | every PR, push to main, tag |
+| tier2 | `ci.yml`: `paho v3+v5 (single broker)`           | every PR, push to main, tag   |
+| tier3 | `soak-weekly.yml`: `tier3`                       | Mondays 04:00 UTC, or by hand |
+
+There is no nightly workflow. `ci.yml` also runs `smoke (helm + kind)`,
+a chart install against a CloudNativePG cluster with a User CR
+round-trip, which no tier runs locally.

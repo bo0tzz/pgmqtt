@@ -10,38 +10,56 @@ Three tiers, additive (`tier3 ⊃ tier2 ⊃ tier1`). Wall-clock + exact bug
 coverage are documented in [`scripts/validate-timings.md`](scripts/validate-timings.md).
 Short version:
 
-| Tier  | When to run                                | Wall clock      | Run command                                       |
-|-------|--------------------------------------------|------------------|---------------------------------------------------|
-| tier1 | After every code change                    | ~10s             | `make validate TIER=tier1`                        |
-| tier2 | Before commit / before PR                  | ~6m              | `make validate TIER=tier2 PAHO=/tmp/paho-testing` |
-| tier3 | Before tag / weekly nightly                | ~12–18m          | `make validate TIER=tier3 PAHO=/tmp/paho-testing` |
+| Tier  | When to run                       | Wall clock (local; CI)   | Run command                                       |
+|-------|-----------------------------------|--------------------------|---------------------------------------------------|
+| tier1 | After every code change           | ~20s; 3–5m               | `make validate TIER=tier1`                        |
+| tier2 | Before commit / before PR         | ~7m; 10–12m              | `make validate TIER=tier2 PAHO=/tmp/paho-testing` |
+| tier3 | Before tag (CI runs it weekly)    | ~18m                     | `make validate TIER=tier3 PAHO=/tmp/paho-testing` |
+
+Every tier needs Docker. The Go suite runs against a Postgres
+testcontainer, and under `validate.sh` (and in CI) a test that cannot
+get one fails instead of skipping. A bare `go test ./...` on a machine
+without Docker still skips those tests, which is most of them.
 
 What each tier closes that the prior tier misses:
 
-- **tier1** — compile / vet / race-light unit tests / chart lint+template+
-  strict parse. Catches static bugs, helm rendering issues (typoed values
-  keys, scientific-notation in int fields, duplicate label keys that helm
-  emits but Flux/kustomize reject), small-package data races.
-- **tier2** — full unit suite against a testcontainer Postgres + paho v3+v5
-  conformance against a single broker. Catches SQL path regressions and
+- **tier1** — vet, the whole Go suite under `-race`, chart lint + four
+  renders + strict parse. Catches compile errors, SQL-path and engine
+  regressions, data races, and chart structure problems (typoed values
+  keys, duplicate label keys that helm emits but Flux/kustomize reject).
+- **tier2** — paho v3+v5 conformance against a single broker, plus a
+  second, non-race run of the suite for the coverage profile. Catches
   MQTT protocol shape bugs (reason codes, retain, will-delay, takeover
-  ordering).
-- **tier3** — multi-broker paho via kind + 60s soak smoke. Catches cross-
-  pod fanout bugs, deploy-shape regressions (helm-rendered manifests
-  applied to a real apiserver), sustained-load issues.
+  ordering) that the Go tests don't.
+- **tier3** — a 3-replica kind cluster: multi-broker paho, `helm test`,
+  two soak smokes (QoS 1 and QoS 0). Catches cross-pod fanout bugs,
+  deploy-shape regressions (helm-rendered manifests applied to a real
+  apiserver), the operator path (User CR → Secret → password login) and
+  sustained-load issues.
 
 In CI:
 
-- `ci.yml` — covers tier1's surface on every PR (vet, test, test-race,
-  helm lint, kind-based smoke). Already green is your gate to merge.
+- `ci.yml` runs on every PR, push to main and tag. `test`, `helm-lint`
+  and `smoke (helm + kind)` cover tier1's surface plus a chart install
+  against CNPG; `paho v3+v5 (single broker)` runs `validate.sh tier2`.
+  All green is your gate to merge.
   Dependency scanning lives in its own `govulncheck (deps)` job so an
   upstream advisory doesn't read as a test failure; it still gates merge.
   For the same reason `validate.sh` doesn't run govulncheck in any tier;
   pass `--vulncheck` (or `make validate ... VULNCHECK=1`) to add it.
-- `conformance-nightly.yml` — runs tier2 daily at 03:00 UTC. Doesn't gate
-  PRs; informational regression detector.
-- `soak-weekly.yml` — runs an in-cluster soak (and tier3 paho multi-broker,
-  best-effort) Mondays 04:00 UTC. Fails on any QoS≥1 loss/dups.
+- Publishing is part of `ci.yml` too. `docker` pushes the image on main
+  and on tags, and only after `test`, `helm-lint`, conformance and smoke
+  have passed. On a tag, `chart` then publishes the chart (it calls
+  `chart-release.yml`) once the image is up. A tag on which any of
+  those four is red publishes nothing. `govulncheck` is not one of
+  them.
+- `soak-weekly.yml` — Mondays 04:00 UTC, two jobs. `tier3` runs
+  `validate.sh tier3` and is the only automated multi-broker conformance
+  run. `soak` runs a 60 s QoS 1 soak (fails on any loss or duplicate)
+  and a 30 min QoS 0 soak (fails under 95% delivery). A failure in
+  either job fails the run.
+
+There is no nightly workflow; tier 2 moved into `ci.yml`.
 
 ## Worktree-based parallel agent workflow
 
@@ -89,16 +107,29 @@ agents can pattern-match instead of re-discovering.
 
 ### Helm scientific-notation rendering of int fields
 
-Helm renders very large ints (≥10^7) in scientific notation when the
-template doesn't force an explicit string conversion. This silently
-truncated `maxPacketSize: 16777216` → `1.6777216e+07` → broker parsed
-as `1` due to an Atoi tolerant cast that accepted the `1` prefix and
-dropped the rest.
+Helm holds numbers from `values.yaml` as floats and prints them in
+scientific notation from 1,000,000 up, unless the template forces an
+integer. This turned `maxPacketSize: 16777216` into `1.6777216e+07`,
+which the broker read as `1`: `getenvInt` used `fmt.Sscanf("%d")`, which
+takes the leading integer prefix and drops the rest.
 
-Fix: strict `strconv.ParseUint` in `internal/config/config.go` + helm
-templates that pass numeric values through `int` (not `printf`'s default).
-Caught by tier1 helm template + a parsing test; both are now part of
-the standard validation run.
+Two fixes:
+
+- `getenvInt` in `internal/config/config.go` uses `strconv.Atoi`, which
+  rejects `1.6777216e+07`. A rejected value does not stop the broker:
+  it logs `config: failed to parse env var as int — using default` and
+  runs with the default. So today this bug class shows up as a limit
+  quietly sitting at its default, with one warning line at startup.
+- The numeric env values in `templates/deployment.yaml` go through
+  `int` before `quote`. (The two port values do not; a port cannot
+  reach a million.)
+
+Nothing automated checks the second point. `scripts/helm-check.sh`
+strict-parses every render and asserts on some of their content, but
+nothing searches a render for scientific notation, and its values all
+come from `--set`, which hands helm an integer and never reproduces the
+problem. When you add a numeric env to the chart, render it once with a
+value of a million or more given in a values file, and read the output.
 
 ### kubectl port-forward instability under sustained load
 
@@ -119,6 +150,11 @@ The in-cluster soak rig (`scripts/soak-incluster.sh`) is the canonical
 way to soak-test against a kind cluster. It builds a tiny distroless
 image with the soak binary, side-loads it into kind, and runs the soak
 as a Pod that connects to the Service VIP directly.
+`scripts/paho-multi-broker-incluster.sh` does the same for Paho
+conformance and is what tier 3 runs. `scripts/paho-multi-broker.sh` is
+the old port-forward path, kept for debugging; nothing automated calls
+it, and the weekly workflow step that did failed every week behind
+`continue-on-error`.
 
 ### Agent over-claiming completeness
 
@@ -151,12 +187,25 @@ before its listener reaped itself (2026-11-17).
 
 The rules now, in `internal/janitor` and `internal/listener`:
 
-- A broker without its lock for `listener.LockReacquireDeadline` exits.
+- A broker without its lock for `listener.LockReacquireDeadline` (20 s)
+  exits.
 - The janitor reaps a peer only after its lock has been free on every
-  check for `janitor.DeadBrokerGrace` (the deadline plus a margin).
+  check for `janitor.DeadBrokerGrace` (the deadline plus 10 s).
 - It counts that time only while its own lock was held without
   interruption, never judges anyone while its own lock is missing, and
   never judges itself.
+
+The price is latency. The janitor checks every 5 s, so a broker that
+really did die is reaped about 30–35 s after Postgres releases its
+lock (at once, for a killed process). Only then are its clients' wills
+fired and its sessions' ownership cleared. Anything that waits for a
+will after killing a broker (SIGKILL, a lost node) has to allow for
+that. A broker that shuts down normally is different: it publishes the
+wills of the clients it disconnects itself, as it closes them.
+
+The other side of the contract is just as fixed: neither 20 s nor the
+margin is configurable, so a Postgres outage longer than 20 s makes
+every broker Pod exit and restart.
 
 Don't shorten the grace below the deadline, and don't "repair" a reap
 after the fact instead of preventing it: a will that was published
@@ -164,31 +213,53 @@ can't be recalled.
 
 ### Janitor tick interval changes break paho
 
-`PGMQTT_JANITOR_INTERVAL_MS` controls how often the janitor sweeps. The
-paho conformance suite has timing-sensitive tests (notably `test_will_delay`)
-that assume a default tick at or below 1s. Bumping the default tick to
-5s landed once and was reverted within the same session because
-`test_will_delay` regressed.
+`PGMQTT_JANITOR_INTERVAL_MS` controls how often the janitor sweeps. Two
+Paho v5 tests assume the default is 1 s:
 
-Fix: keep the default at 1s. Operators who want longer intervals set the
+- `test_session_expiry` reconnects about 2 s after a session's expiry
+  and expects the session to be gone.
+- `test_will_delay` accepts a will up to 2 s after its delay.
+
+Bumping the default tick to 5 s landed once and was reverted within the
+same session. With a 5 s tick both tests fail on every run (6 of 6 on
+2026-11-18).
+
+Keep the default at 1 s. Operators who want longer intervals set the
 env explicitly.
 
-### Paho conformance flakes hide real signal in tier3
+What enforces this is `test_session_expiry`. It is a hard test, so a
+longer default turns tier 2 and the CI conformance job red.
+`test_will_delay` is on the known-flaky list and only prints a warning,
+for the reason given in the next section.
+
+### Paho conformance: the known-flaky list
 
 `scripts/paho-conformance.py` runs the upstream Eclipse Paho test suite.
-A handful of tests are documented-flaky upstream (`test_request_response`,
-`test_subscribe_options` — both have a `waitfor` race that fires on
-timing) and a handful are out-of-scope for v1 (`test_subscribe_failure`
-needs ACLs, `test_shared_subscriptions` is documented-out-of-scope).
-Fail-fasting on any of these blocks the rest of tier3 (multi-broker
-paho + soak smoke).
+A test on its `--known-flaky` list that fails prints `FAIL(known-flaky)`
+and does not change the exit code; any other failure does, and adds a
+`hard fails:` line. The default list has five tests:
 
-Fix: pass `--known-flaky` to the wrapper. The default list (set in the
-script) covers the documented flakes and out-of-scope tests. Tests in
-that set that fail emit a `FAIL(known-flaky)` line and are excluded
-from the wrapper's exit-code calculation. Override with
-`--known-flaky ''` if you want every test to be hard.
+- `test_subscribe_failure` (in both the v3.1.1 and the v5 suite) and
+  `test_shared_subscriptions` need ACLs and shared subscriptions, which
+  pgmqtt does not have. They always fail.
+- `test_request_response` and `test_subscribe_options` wait for the
+  wrong client's SUBACK and then publish, so the publish races their
+  own subscribe. They fail in most single-broker runs and usually pass
+  in the multi-broker run.
+- `test_will_delay` passes in most runs but not all. It accepts a will
+  up to 2 s late. The janitor's 1 s jobs do not run every second: a job
+  is skipped whenever a tick starts slightly less than 1 s after that
+  job's last run, so `fire_due_wills` runs every 1–2 s (41 times in
+  60 s, measured) and a will can be just over 2 s late. Measured on
+  2026-11-18 against one broker, the test's first check came in late
+  in 9 of 200 tries started at random points in the tick; it passed in
+  all 21 CI runs sampled since October and in both multi-broker runs
+  that day. Once those jobs run on every tick, take this test off the
+  list, so that it guards the tick interval as well.
 
-The summary line reads `v5: 24/27 passing (+3 known-flaky)` so operators
-see the real signal at a glance.
+So the normal summary lines are `v311: 9/10 passing (+1 known-flaky)`
+and, for v5, anything from `23/27 passing (+4 known-flaky)` (typical
+for a single broker) to `25/27 passing (+2 known-flaky)` (typical for
+the multi-broker run). Override the list with `--known-flaky ''` to
+make every test hard.
 

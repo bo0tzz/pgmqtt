@@ -100,9 +100,9 @@ phase() {
     local start end rc
     start=$(date +%s)
     # Not `"$@" || rc=$?`: bash ignores errexit inside a function called
-    # from an && / || list, so a command failing mid-phase was masked by
-    # whatever ran after it (a failed coverage run by `go tool cover`).
-    # A subshell outside any list keeps errexit in force.
+    # from an && / || list, so only the last command of a phase would
+    # decide its result (a failing `go test` hidden by the `go tool
+    # cover` after it). A subshell outside any list keeps errexit on.
     set +e
     ( set -e; "$@" )
     rc=$?
