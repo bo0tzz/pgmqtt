@@ -71,9 +71,19 @@ kubectl -n mqtt get secret homeassistant-mqtt-credentials \
     -o jsonpath='{.data.uri}' | base64 -d
 ```
 
+A User's MQTT username is `spec.username`, or its name if that is
+unset. Usernames are global to the broker, but Users are namespaced, so
+each username belongs to the first User that claims it. Another User
+asking for the same one stays `Ready=False` with reason
+`UsernameConflict`, naming the owner, and gets no Secret. A password
+can never be empty: a User whose own Secret has an empty password is
+refused, and the broker rejects an empty password at CONNECT.
+
 For TLS, front the broker with an L4 terminator (HAProxy, ingress-nginx
 `tcp-services`, etc.) for `mqtts://1883` and any HTTPS proxy for
-`wss://8083/mqtt`. The broker itself does not terminate TLS.
+`wss://8083/mqtt`. The broker itself does not terminate TLS. Set
+`operator.tls.host` (and `operator.tls.port` / `operator.tls.wssPort`)
+to have the generated credentials Secrets carry the TLS endpoint too.
 
 The broker does not speak the PROXY protocol, so behind a terminator,
 a proxy or SNAT every client reaches it from the same address, and the
@@ -113,6 +123,10 @@ Most knobs have sensible defaults. The ones you may want to set:
 | `PGMQTT_MAX_QUEUED_DELIVERIES_PER_CLIENT` | `10000` | Undelivered messages one client may have queued, counted separately for QoS 0 and QoS 1/2. A client over either is disconnected with reason 0x97 |
 | `PGMQTT_MAX_CONNECTS_PER_IP_PER_SEC` | `5` | Connects per source address; 0 turns it off. See the proxy note above |
 | `PGMQTT_MAX_AUTH_FAILURES_PER_IP_PER_MIN` | `30` | Failed logins per source address before it is locked out for 60 s; 0 turns it off |
+| `PGMQTT_WATCH_NAMESPACES` | (all) | Comma-separated namespaces whose Users the operator reconciles |
+| `PGMQTT_LEADER_ELECTION_ID` | `pgmqtt-operator` | Lease the operator's Pods elect a leader on; the chart sets one per release |
+| `PGMQTT_TLS_HOST` | (unset) | TLS endpoint to advertise in generated Secrets (`tls-host`, `mqtts-uri`, `wss-uri`) |
+| `PGMQTT_TLS_PORT` / `PGMQTT_WSS_PORT` | `8883` / `0` | Ports for those keys; a WSS port of 0 leaves `wss-uri` out |
 
 The full list is in `internal/config/config.go`; chart values are
 documented inline in `deploy/helm/pgmqtt/values.yaml`.
