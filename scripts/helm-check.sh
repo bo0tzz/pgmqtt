@@ -190,6 +190,8 @@ renders() {
         --set probes.useHTTP=false
     lacks ws-only '"1883"'
     has ws-only '"8083"'
+    # The helm test client cannot reach a WebSocket-only broker.
+    lacks ws-only 'helm.sh/hook'
 
     render tcp-only \
         --set database.url='postgres://x/y' \
@@ -224,6 +226,10 @@ renders() {
         --set database.url='postgres://x/y' \
         --set podAntiAffinity.enabled=true \
         --set 'affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey=zone'
+
+    refuses test-without-secret 'tests.credentialsSecret is required' \
+        --set database.url='postgres://x/y' \
+        --set tests.credentialsSecret=
 
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \

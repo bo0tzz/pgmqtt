@@ -1,11 +1,15 @@
 {{- /*
 A `helm test` Pod that runs an MQTT round-trip against the deployed chart.
-Mirrors .github/ci/smoke-in-cluster.sh, but uses an inline username/password
-of the chart-installed User if you've created one. Otherwise the test
-expects a pre-seeded User CR named per `Values.test.username` whose
-credentials Secret is mounted via env.
+Mirrors .github/ci/smoke-in-cluster.sh. The chart creates no User: host,
+port, username and password come from the Secret named by
+`tests.credentialsSecret`, which has to exist before `helm test` runs
+(the operator generates `<name>-mqtt-credentials` for a User CR `<name>`).
+
+mosquitto_pub/sub only speak MQTT over TCP, so there is nothing to render
+when that listener is off.
 */ -}}
-{{- if .Values.tests.enabled }}
+{{- if and .Values.tests.enabled .Values.listeners.tcp.enabled }}
+{{- $secret := required "tests.credentialsSecret is required when tests.enabled=true" .Values.tests.credentialsSecret }}
 apiVersion: v1
 kind: Pod
 metadata:
@@ -35,11 +39,11 @@ spec:
           grep -q hello /tmp/got
       env:
         - name: HOST
-          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: host } }
+          valueFrom: { secretKeyRef: { name: {{ $secret }}, key: host } }
         - name: PORT
-          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: port } }
+          valueFrom: { secretKeyRef: { name: {{ $secret }}, key: port } }
         - name: U
-          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: username } }
+          valueFrom: { secretKeyRef: { name: {{ $secret }}, key: username } }
         - name: P
-          valueFrom: { secretKeyRef: { name: {{ .Values.tests.credentialsSecret }}, key: password } }
+          valueFrom: { secretKeyRef: { name: {{ $secret }}, key: password } }
 {{- end }}

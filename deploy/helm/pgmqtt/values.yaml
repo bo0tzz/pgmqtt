@@ -225,6 +225,8 @@ networkPolicy:
 ## helm test target. Spins up a mosquitto Pod that does a pub/sub round-trip
 ## against the broker. Requires a pre-existing credentials Secret — easiest
 ## is to apply a User CR named e.g. "smoketest" before `helm test pgmqtt`.
+## The Pod speaks MQTT over TCP only and is not rendered when
+## listeners.tcp.enabled=false.
 tests:
   enabled: true
   image: eclipse-mosquitto:2.0

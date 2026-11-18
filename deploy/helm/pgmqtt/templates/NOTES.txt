@@ -76,11 +76,12 @@ Create an MQTT user (the broker reads from Postgres via the operator):
      --set serviceMonitor.labels.release=prometheus
 {{- end }}
 
-{{- if and .Values.tests.enabled (not .Values.tests.credentialsSecret) }}
+{{- if and .Values.tests.enabled .Values.listeners.tcp.enabled }}
 
-ℹ  helm test will spin up a mosquitto Pod that needs MQTT credentials.
-   Apply a User CR named e.g. `smoketest` (which auto-creates
-   `smoketest-mqtt-credentials`) BEFORE running `helm test`.
+ℹ  `helm test` runs a mosquitto Pod that reads MQTT credentials from the
+   Secret `{{ .Values.tests.credentialsSecret }}` in this namespace.
+   Create it BEFORE running `helm test`: a User CR named `<name>` gets
+   the Secret `<name>-mqtt-credentials`.
 {{- end }}
 
 For ops, see the README and the sizing-matrix comment in values.yaml
