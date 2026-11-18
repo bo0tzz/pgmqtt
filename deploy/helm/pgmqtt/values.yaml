@@ -175,24 +175,38 @@ autoscaling:
   #         type: AverageValue
   #         averageValue: "1000"
 
-## NetworkPolicy. Off by default; enable to lock down broker→postgres egress
-## and broker ingress. The ingress block is permissive when `from` is empty
-## (allow all sources, restricted to broker ports). Provide explicit pod or
-## namespace selectors in production.
+## NetworkPolicy. Off by default; enable to lock down broker ingress and
+## limit broker egress to DNS, Postgres and the Kubernetes API. The ingress
+## block is permissive when `from` is empty (allow all sources, restricted
+## to broker ports). Provide explicit pod or namespace selectors in
+## production.
 networkPolicy:
   enabled: false
   ingress:
     from: []
   egress:
+    ## Must match the port in the database URL.
     postgresPort: 5432
+    ## Peers the broker may reach on postgresPort. Empty allows any
+    ## destination on that port, so that enabling the policy never cuts
+    ## the broker off from its database; pin it in production.
     postgres: []
     # Example: pin egress to a CloudNativePG-managed cluster.
     # postgres:
     #   - podSelector:
     #       matchLabels:
     #         cnpg.io/cluster: my-cluster
+    ## Peers the broker may reach on TCP 443 and 6443 for the Kubernetes
+    ## API. Empty renders a fallback that selects API server pods by label
+    ## (in `default`) and everything in `kube-system`. Most network
+    ## plugins do not apply pod selectors to a host-network API server, so
+    ## on those clusters the fallback matches nothing, the embedded
+    ## operator cannot reach the API and Users stop reconciling. Set the
+    ## API server address explicitly unless you have confirmed the
+    ## fallback works with your plugin.
     kubernetesAPI: []
-    # Example for the cluster's API endpoint(s):
+    # Example for the cluster's API endpoint(s), as listed by
+    # `kubectl -n default get endpointslices kubernetes`:
     # kubernetesAPI:
     #   - ipBlock:
     #       cidr: 10.0.0.1/32

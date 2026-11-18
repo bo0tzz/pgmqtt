@@ -60,47 +60,45 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    {{- with .Values.networkPolicy.egress.postgres }}
-    # Postgres egress — operator picks the selector that fits their cluster.
-    - to:
-        {{- toYaml . | nindent 8 }}
-      ports:
+    # Postgres. With no peers configured the rule has no `to`, which allows
+    # any destination on the Postgres port: the chart cannot know where the
+    # database lives, and leaving the rule out cuts the broker off from it.
+    - ports:
         - protocol: TCP
-          port: {{ $.Values.networkPolicy.egress.postgresPort }}
-    {{- end }}
+          port: {{ .Values.networkPolicy.egress.postgresPort }}
+      {{- with .Values.networkPolicy.egress.postgres }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     # Kubernetes API — required for the User-CRD reconciler (every Pod
     # runs a controller-runtime manager; one wins the K8s Lease and
-    # reconciles, all need API access for the Lease + watch). When the
-    # operator left this empty, the operator goroutine silently broke;
-    # default to the kube-system DNS-style fallback so a misconfigured
-    # NetworkPolicy doesn't take the operator down without explanation.
-    {{- if .Values.networkPolicy.egress.kubernetesAPI }}
+    # reconciles, all need API access for the Lease + watch).
+    #
+    # The fallback selects API server pods by label. Most network plugins
+    # ignore host-network pods when matching selectors, and the API server
+    # usually is one (or is not a pod at all), so on those clusters the
+    # fallback matches nothing and networkPolicy.egress.kubernetesAPI has
+    # to be set for the operator to work.
+    #
+    # 6443 is allowed next to 443 because policy is usually enforced after
+    # the `kubernetes` Service is translated to the API server's own port.
     - to:
+        {{- if .Values.networkPolicy.egress.kubernetesAPI }}
         {{- toYaml .Values.networkPolicy.egress.kubernetesAPI | nindent 8 }}
-      ports:
-        - protocol: TCP
-          port: 443
-    {{- else }}
-    - to:
+        {{- else }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: default
           podSelector:
             matchLabels:
               component: apiserver
-      ports:
-        - protocol: TCP
-          port: 443
-        - protocol: TCP
-          port: 6443
-    - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        {{- end }}
       ports:
         - protocol: TCP
           port: 443
         - protocol: TCP
           port: 6443
-    {{- end }}
 {{- end }}

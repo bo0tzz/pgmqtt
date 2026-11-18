@@ -151,6 +151,22 @@ renders() {
         --set networkPolicy.enabled=true \
         --set autoscaling.enabled=true \
         --set podDisruptionBudget.enabled=true
+    # The policy must let the broker reach its database with no peers set.
+    has everything 'port: 5432'
+    # The helm test Pod must not match the broker selectors (Service, PDB,
+    # NetworkPolicy).
+    has everything 'app.kubernetes.io/component: test'
+
+    render netpol-pinned \
+        --set database.url='postgres://x/y' \
+        --set networkPolicy.enabled=true \
+        --set networkPolicy.egress.postgresPort=6432 \
+        --set 'networkPolicy.egress.postgres[0].podSelector.matchLabels.cnpg\.io/cluster=pg' \
+        --set 'networkPolicy.egress.kubernetesAPI[0].ipBlock.cidr=10.0.0.1/32'
+    has netpol-pinned 'cnpg.io/cluster: pg'
+    has netpol-pinned 'port: 6432'
+    has netpol-pinned 'cidr: 10.0.0.1/32'
+    lacks netpol-pinned 'component: apiserver'
 }
 
 case "${1:-all}" in

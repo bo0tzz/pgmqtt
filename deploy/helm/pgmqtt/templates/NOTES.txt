@@ -32,6 +32,22 @@ Create an MQTT user (the broker reads from Postgres via the operator):
    broker outside its VLAN.
 {{- end }}
 
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.egress.postgres) }}
+
+ℹ  networkPolicy.egress.postgres is empty, so the policy allows egress
+   to any destination on TCP {{ .Values.networkPolicy.egress.postgresPort }}.
+   Pin it to your Postgres pods or CIDR.
+{{- end }}
+
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.egress.kubernetesAPI) }}
+
+⚠  networkPolicy.egress.kubernetesAPI is empty.
+   The fallback rule selects API server pods by label. Most network
+   plugins do not match a host-network API server that way; if the
+   operator logs API timeouts and Users stay unreconciled, set it:
+     --set 'networkPolicy.egress.kubernetesAPI[0].ipBlock.cidr=<api-server-ip>/32'
+{{- end }}
+
 {{- if and (not .Values.database.url) (not .Values.database.existingSecret) }}
 
 ⚠  database.url AND database.existingSecret are both empty.
