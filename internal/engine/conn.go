@@ -44,9 +44,9 @@ type Conn struct {
 	clientID string
 	protocol byte
 
-	// sessionToken is set by takeOwnership and used by handleDisconnect to
+	// sessionToken is set by takeOwnership and used by finish to
 	// scope its session-DELETE. Each takeOwnership rotates it via
-	// gen_random_uuid(); a stale disconnect whose handleDisconnect runs
+	// gen_random_uuid(); a stale disconnect whose finish runs
 	// after a peer takeover will see 0 rows match and roll back rather
 	// than wipe the new conn's row. See migration 0012.
 	sessionToken uuid.UUID
@@ -93,7 +93,7 @@ type Conn struct {
 	closing           atomic.Bool
 	gracefulRequested atomic.Bool
 	// takenOver is set by the listener's takeover dispatch immediately
-	// before calling Shutdown on a stale Conn. handleDisconnect reads it
+	// before calling Shutdown on a stale Conn. finish reads it
 	// to suppress will fire/schedule: a session-takeover-driven server-
 	// side shutdown is NOT abnormal termination, so per MQTT-3.1.2.5
 	// the Will Message must not be published. Without this, a client
@@ -731,7 +731,7 @@ func (c *Conn) shutdown() {
 func (c *Conn) Shutdown() { c.shutdown() }
 
 // ShutdownForTakeover marks the Conn as superseded by a peer takeover and
-// then closes it. handleDisconnect uses the takenOver flag to suppress
+// then closes it. finish uses the takenOver flag to suppress
 // the will (per MQTT-3.1.2.5 the Will Message is for ABNORMAL termination,
 // not for server-side shutdown of a stale conn whose session has been
 // adopted by a new owner). Safe to call from outside the conn's goroutine.

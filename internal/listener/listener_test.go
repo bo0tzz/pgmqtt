@@ -300,14 +300,14 @@ func TestStaleTakeoverNotifyDoesNotKillFreshConn(t *testing.T) {
 }
 
 // TestTakeoverDoesNotClobberNewSession exercises BUG-1: a takeover-driven
-// Shutdown of a stale Conn (handleDisconnect on the prior owner) must NOT
+// Shutdown of a stale Conn (finish on the prior owner) must NOT
 // wipe the broker_id of the new owner that has since taken over the
 // sessions row. The persist-path UPDATE (broker_id=NULL, ...) is token-
 // scoped exactly like the clean-session DELETE.
 //
 // Scenario: persistent client (no-clean, expiry>0) connects to pod 0;
 // reconnects on pod 1. Pod 0's listener fires the takeover Shutdown of
-// the now-stale Conn → handleDisconnect runs the persist-path UPDATE.
+// the now-stale Conn → finish runs the persist-path UPDATE.
 // If the UPDATE isn't token-scoped, it clears pod 1's broker_id back
 // to NULL and the ownership sweeper kicks the healthy reconnect later.
 // With the guard, pod 1's row survives unchanged.
@@ -342,7 +342,7 @@ func TestTakeoverDoesNotClobberNewSession(t *testing.T) {
 	defer c2.Close()
 
 	// Wait for the takeover NOTIFY to fire on pod 0's listener and
-	// the stale Conn's handleDisconnect to complete its UPDATE. The
+	// the stale Conn's finish to complete its UPDATE. The
 	// listener is async over pg_notify so we poll the sessions row.
 	wantBroker := mh.Pods[1].BrokerID
 	deadline := time.Now().Add(5 * time.Second)
@@ -360,7 +360,7 @@ func TestTakeoverDoesNotClobberNewSession(t *testing.T) {
 		}
 		observedBroker = b
 		observedConn = connected
-		// Give the stale handleDisconnect a window to clobber, then
+		// Give the stale finish a window to clobber, then
 		// re-read once more and assert.
 		time.Sleep(50 * time.Millisecond)
 		if b != nil && *b == wantBroker && connected {
@@ -376,13 +376,13 @@ func TestTakeoverDoesNotClobberNewSession(t *testing.T) {
 		}
 	}
 	if observedBroker == nil {
-		t.Fatalf("sessions.broker_id NULL after takeover — stale handleDisconnect clobbered the new owner")
+		t.Fatalf("sessions.broker_id NULL after takeover — stale finish clobbered the new owner")
 	}
 	if *observedBroker != wantBroker {
 		t.Fatalf("sessions.broker_id=%s, want pod1=%s", observedBroker, wantBroker)
 	}
 	if !observedConn {
-		t.Fatalf("sessions.connected=false after takeover — stale handleDisconnect clobbered the new owner")
+		t.Fatalf("sessions.connected=false after takeover — stale finish clobbered the new owner")
 	}
 }
 
@@ -441,7 +441,7 @@ func TestTakeoverSuppressesWillFire(t *testing.T) {
 	defer c2.Close()
 
 	// Wait long enough for the takeover NOTIFY → Shutdown →
-	// handleDisconnect chain to complete on pod 0. The will, if fired,
+	// finish chain to complete on pod 0. The will, if fired,
 	// would publish via pg_notify and reach the subscriber on pod 1
 	// within a few hundred ms. We give it 2s and assert silence.
 	if err := sub.Conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -458,7 +458,7 @@ func TestTakeoverSuppressesWillFire(t *testing.T) {
 // TestSamePodTakeoverSuppressesWillFire exercises BUG-2's same-pod
 // variant: a client reconnects to the same pod it was on. The prior
 // Conn's prev.shutdown() must mark the conn as taken-over so its
-// handleDisconnect suppresses will firing.
+// finish suppresses will firing.
 func TestSamePodTakeoverSuppressesWillFire(t *testing.T) {
 	t.Parallel()
 	mh := enginetest.NewMultiHarness(t, 1, nil)

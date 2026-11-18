@@ -168,8 +168,8 @@ type Metrics struct {
 	// scraped.
 	ListenerRestartsTotal *prometheus.CounterVec
 
-	// DrainSessionQueueTotal counts invocations of drainSessionQueue —
-	// the bulk re-send of state 0/1/2 deliveries to a resumed session
+	// DrainSessionQueueTotal counts runs of Conn.resumeInflight —
+	// the re-send of in-flight (state 1/2) deliveries to a resumed session
 	// after CONNACK. Labelled by reason so a soak operator can confirm
 	// "drain calls are bounded by reconnect rate" rather than firing
 	// spuriously from another path. Today's only call site is the
@@ -178,7 +178,7 @@ type Metrics struct {
 	// fanout) can be distinguished without a metric rename.
 	DrainSessionQueueTotal *prometheus.CounterVec
 
-	// DrainSessionQueueFailuresTotal counts drainSessionQueue invocations
+	// DrainSessionQueueFailuresTotal counts Conn.resumeInflight runs
 	// that returned an error before completing. Companion to
 	// DrainSessionQueueTotal — the success counter Inc lives strictly
 	// after the drain returns nil so dashboards aren't lied to about
@@ -400,7 +400,7 @@ func New() *Metrics {
 		}, []string{"reason"}),
 		DrainSessionQueueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_drain_session_queue_total",
-			Help: "drainSessionQueue invocations that completed without error, " +
+			Help: "Resumptions of a session's in-flight deliveries at CONNECT that completed without error, " +
 				"labelled by reason. Reasons: reconnect (CONNECT with " +
 				"cleanStart=false; resume queued/inflight deliveries for the " +
 				"returning session). Bounded by the reconnect rate; sustained " +
@@ -410,7 +410,7 @@ func New() *Metrics {
 		}, []string{"reason"}),
 		DrainSessionQueueFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgmqtt_drain_session_queue_failures_total",
-			Help: "drainSessionQueue invocations that returned an error " +
+			Help: "Resumptions of a session's in-flight deliveries at CONNECT that returned an error " +
 				"(typically PG unreachable during resume). Labelled by the " +
 				"same reasons as pgmqtt_drain_session_queue_total. " +
 				"Growing _failures_total with flat _total is the 'PG-wedged on " +

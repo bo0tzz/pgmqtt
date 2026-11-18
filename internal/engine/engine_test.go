@@ -376,7 +376,7 @@ func TestSessionExpiryDisconnectExtension(t *testing.T) {
 		p.Properties.SessionExpiryIntervalFlag = true
 	})
 
-	// handleDisconnect's deferred UPDATE runs on a background context
+	// finish's deferred UPDATE runs on a background context
 	// after the broker's read loop unwinds; poll briefly so we don't
 	// race the test query against the async commit.
 	var expiresAt *time.Time

@@ -625,7 +625,7 @@ func (e *Engine) ConnFor(clientID string) (*Conn, bool) {
 // reconnect: while the LISTEN socket was down, peer Pods' `pg_notify`
 // fan-outs for our subscribers landed on a deaf channel, so the delivery
 // rows they inserted (state=0) never wake the per-conn drain loop. A
-// single kick per client picks those up — drainOnce iterates until the
+// single kick per client picks those up — the sender drains until the
 // queue is empty. Best-effort and non-blocking: drainKick is a 1-slot
 // channel and the select default skips any client whose kick is already
 // pending.
@@ -744,7 +744,14 @@ func (e *Engine) recordAuthFailureFor(addr net.Addr) {
 	if e.iplimit == nil || addr == nil {
 		return
 	}
-	e.iplimit.recordAuthFailure(addr.String())
+	if e.iplimit.recordAuthFailure(addr.String()) {
+		// Once per entry into the box, and loud: the limiter keys on the
+		// TCP peer, so behind a proxy or SNAT this is every client at
+		// once, and the only other trace is a counter.
+		e.logger.Warn("too many failed logins from one address; dropping all connections from it for a while",
+			"addr", addr.String(), "for", e.iplimit.penaltyDuration,
+			"note", "if clients reach the broker through a proxy or SNAT, they all share this address")
+	}
 }
 
 // tryReserveConn atomically reserves a slot if under cap. Returns false when

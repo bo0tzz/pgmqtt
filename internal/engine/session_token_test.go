@@ -14,7 +14,7 @@ import (
 
 // TestSessionTokenRotatesOnTakeover asserts that every CONNECT (whether
 // it inserts a fresh sessions row or updates an existing one) rotates
-// session_token. This is the property handleDisconnect relies on to
+// session_token. This is the property finish relies on to
 // distinguish "my own session row" from "a peer that took over before I
 // got to clean up".
 func TestSessionTokenRotatesOnTakeover(t *testing.T) {
@@ -56,8 +56,8 @@ func TestSessionTokenRotatesOnTakeover(t *testing.T) {
 // surfaced in Paho test_session_expiry. Conn A sets up a session,
 // captures its token T1. The "client" reconnects (Conn B), takeOwnership
 // rotates token to T2 — this is what would happen if the same client_id
-// reconnects before A's handleDisconnect's session-DELETE tx fires.
-// Then A's handleDisconnect runs (using its captured T1) and *must not*
+// reconnects before A's finish's session-DELETE tx fires.
+// Then A's finish runs (using its captured T1) and *must not*
 // wipe Conn B's session.
 //
 // Test drives the SQL guard directly rather than racing two real
@@ -92,7 +92,7 @@ func TestStaleHandleDisconnectDoesNotWipeTakeover(t *testing.T) {
 		t.Fatalf("update B: %v", err)
 	}
 
-	// Conn A's stale handleDisconnect now runs with its captured t1.
+	// Conn A's stale finish now runs with its captured t1.
 	// The token-scoped DELETE is the production query — copy it here.
 	deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

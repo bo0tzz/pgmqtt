@@ -259,7 +259,7 @@ func (c *Conn) handleConnect(ctx context.Context, pk *packets.Packet) error {
 	}
 
 	// Register this Conn locally; if the prior owner was *us*, close it.
-	// Mark the prior conn as taken-over so its handleDisconnect suppresses
+	// Mark the prior conn as taken-over so its finish suppresses
 	// will firing — same-pod takeover is also a session migration, not
 	// the client dying (MQTT-3.1.2.5).
 	if prev := c.eng.registerConn(c.clientID, c); prev != nil {
@@ -476,12 +476,12 @@ func authReasonLabel(reason byte) string {
 // if no prior session), and whether this is a brand-new row.
 //
 // Every takeOwnership rotates the row's session_token so a peer's stale
-// handleDisconnect can guard its DELETE on the token captured at takeover
+// finish can guard its DELETE on the token captured at takeover
 // time and roll back instead of wiping the new conn's row. The previous
 // token is also handed back so NotifyTakeover can target only the truly
 // stale Conn on the prior owner pod (and not a newer Conn that might have
 // since been re-taken-over back). Token is stored on Conn.sessionToken
-// for handleDisconnect to read later.
+// for finish to read later.
 func (c *Conn) takeOwnership(ctx context.Context, pk *packets.Packet) (prevBroker uuid.UUID, prevToken uuid.UUID, newSession bool, err error) {
 	self := c.eng.BrokerID()
 	tx, err := c.eng.beginTxTimed(ctx, pgx.TxOptions{})

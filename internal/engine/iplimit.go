@@ -133,18 +133,19 @@ func (l *ipLimiter) allowConnect(ip string) bool {
 // recordAuthFailure ticks the auth-failure bucket for ip. When the
 // bucket is exhausted the IP enters a `penaltyDuration` cool-off during
 // which inPenaltyBox returns true. Already-in-box IPs are no-ops here —
-// the box is sticky for the configured window.
-func (l *ipLimiter) recordAuthFailure(ip string) {
+// the box is sticky for the configured window. Reports whether this
+// failure is the one that put the IP in the box.
+func (l *ipLimiter) recordAuthFailure(ip string) (boxed bool) {
 	if l == nil || l.authFailuresPerMin <= 0 {
-		return
+		return false
 	}
 	addr, ok := parseIP(ip)
 	if !ok {
-		return
+		return false
 	}
 	e := l.entryFor(addr, true)
 	if e.auth == nil {
-		return
+		return false
 	}
 	now := l.nowFunc()
 	e.mu.Lock()
@@ -152,13 +153,14 @@ func (l *ipLimiter) recordAuthFailure(ip string) {
 	if !e.until.IsZero() && now.Before(e.until) {
 		// Already in box — don't extend, just refresh lastSeen.
 		e.mu.Unlock()
-		return
+		return false
 	}
 	allowed := e.auth.AllowN(now, 1)
 	if !allowed {
 		e.until = now.Add(l.penaltyDuration)
 	}
 	e.mu.Unlock()
+	return !allowed
 }
 
 // inPenaltyBox returns true when ip is currently in the bcrypt-skip
