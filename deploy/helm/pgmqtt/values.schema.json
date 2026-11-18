@@ -381,8 +381,9 @@
     },
     "lifecycle": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
+        "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
         "preStop": {
           "type": "object",
           "additionalProperties": true

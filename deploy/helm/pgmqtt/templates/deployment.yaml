@@ -208,11 +208,19 @@ spec:
               port: {{ if .Values.listeners.tcp.enabled }}mqtt{{ else }}mqtt-ws{{ end }}
             periodSeconds: {{ .Values.probes.startup.periodSeconds | default 5 }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+          {{- end }}
           {{- if .Values.lifecycle.preStop }}
           lifecycle:
             preStop:
               {{- toYaml .Values.lifecycle.preStop | nindent 14 }}
+          {{- else if gt (int .Values.lifecycle.preStopSleepSeconds) 0 }}
+          {{- if ge (int .Values.lifecycle.preStopSleepSeconds) (int .Values.terminationGracePeriodSeconds) }}
+          {{- fail "lifecycle.preStopSleepSeconds must be less than terminationGracePeriodSeconds: the sleep counts against the grace period, so the broker would be SIGKILLed before it can drain" }}
           {{- end }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.lifecycle.preStopSleepSeconds }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

@@ -338,9 +338,11 @@ extraVolumes: []
 ##       readOnly: true
 extraVolumeMounts: []
 
-## Grace period the kubelet honors after sending SIGTERM before SIGKILL.
-## The broker drains in-flight CONNACK/PUBLISH/SUBSCRIBE handlers and closes
-## connections cleanly during this window — bump for very large fan-outs.
+## Time the kubelet allows from the start of Pod termination until
+## SIGKILL. It covers the preStop sleep (lifecycle.preStopSleepSeconds)
+## and then the broker's own shutdown after SIGTERM: draining in-flight
+## CONNACK/PUBLISH/SUBSCRIBE handlers and closing connections cleanly.
+## Bump for very large fan-outs.
 terminationGracePeriodSeconds: 30
 
 ## Use the host's network namespace. Almost never needed — the broker is a
@@ -403,25 +405,24 @@ probes:
     periodSeconds: 5
     failureThreshold: 30
 
-## Pod lifecycle hooks. preStop fires once kubelet has decided to
-## terminate the Pod and runs alongside SIGTERM; pairing it with a
-## small sleep gives kube-proxy time to remove this Pod's endpoint
-## from the Service before the listener closes, so a rolling upgrade
-## doesn't generate "connection refused" bursts on freshly-routed
-## CONNECTs.
+## Pod termination. When a Pod is deleted the kubelet runs the preStop
+## hook to completion and only then sends SIGTERM; in parallel the Pod is
+## removed from the Service's endpoints. The broker closes its listeners
+## on SIGTERM, so without a delay any kube-proxy or load balancer that
+## has not yet seen the endpoint removal sends new CONNECTs to a closed
+## port on every rollout.
 ##
-## Distroless images don't ship `sleep`, so the default block uses
-## /healthz/live as a pseudo-sleep target — the kubelet keeps the Pod
-## around until the exec returns or the grace period elapses, and the
-## httpGet path naturally takes a few hundred ms per attempt.
+## preStopSleepSeconds renders the kubelet's native `sleep` handler (the
+## image is distroless, so there is no sleep binary to exec). The handler
+## needs Kubernetes >= 1.30, which is why the chart's kubeVersion starts
+## there. The sleep counts against terminationGracePeriodSeconds and must
+## be shorter than it. 0 renders no hook.
 ##
-## Override with your own preStop (exec/httpGet/tcpSocket) if your
-## image ships a sleep binary.
+## preStop, when non-empty, is rendered instead of the sleep: any handler
+## the Pod spec accepts (exec / httpGet / tcpSocket / sleep).
 lifecycle:
-  preStop:
-    httpGet:
-      path: /healthz/live
-      port: metrics
+  preStopSleepSeconds: 5
+  preStop: {}
 
 ## Install the User CRD. Set to false if managing CRDs out-of-band.
 crds:
