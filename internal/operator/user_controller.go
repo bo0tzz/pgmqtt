@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
@@ -44,9 +45,13 @@ const (
 // optionally generates a credentials Secret for clients to consume.
 type UserReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Pool   *pgxpool.Pool
-	Logger *slog.Logger
+	// APIReader reads straight from the API server. It is used for the one
+	// lookup that must not be answered from a lagging cache (see
+	// ownerGone); nil falls back to Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Pool      *pgxpool.Pool
+	Logger    *slog.Logger
 
 	// Wire details for auto-generated Secrets — supplied via env so the
 	// reconciler can patch stale host/port values.
@@ -202,28 +207,43 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	username := user.Spec.Username
-	if username == "" {
-		username = user.Name
-	}
+	username := usernameFor(&user)
+	me := ownerOf(&user)
 
 	// Rename handling: if spec.username has been edited since the last
-	// successful reconcile, the row keyed by the OLD username must be
-	// removed — otherwise the old credentials remain valid for auth and
-	// the old username slot stays occupied even after the slot is
-	// logically free. status.observedUsername is the authoritative
-	// pointer to the row we last wrote, so we delete that row first and
-	// fall through to the upsert which writes the new one.
+	// successful reconcile, the row under the OLD username must go —
+	// otherwise the old credentials remain valid for auth and the old
+	// username stays occupied. Rows are found by their recorded owner, so
+	// this also catches a row whose status update never landed; the row
+	// status.observedUsername points at is included for rows written
+	// before owners were recorded.
 	//
-	// Idempotency: the DELETE is a no-op when the row is already gone,
-	// so a mid-reconcile failure that prevents the status update is
-	// safe — the next pass observes the same observedUsername, re-runs
-	// the (no-op) DELETE, and tries the upsert again.
-	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
-	if renamed {
-		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
+	// Idempotency: the DELETE is a no-op when there is nothing to release,
+	// so it is safe to repeat after a failure further down.
+	if user.Status.ObservedUsername != username {
+		if err := r.releaseOtherRows(ctx, me, username, user.Status.ObservedUsername); err != nil {
 			return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 		}
+	}
+
+	row, err := r.loadRow(ctx, username)
+	if err != nil {
+		return r.fail(ctx, &user, reasonDBError, scrubReason(err), fmt.Errorf("read users row: %w", err))
+	}
+	// Checked before the Secret is touched, so a User that cannot have the
+	// username does not get credentials generated for it. The write below
+	// repeats the check atomically; this one exists to report the conflict.
+	var replaces *rowOwner
+	if row != nil && row.owner != nil && *row.owner != me {
+		gone, err := r.ownerGone(ctx, *row.owner)
+		if err != nil {
+			return r.fail(ctx, &user, reasonUsernameConflict,
+				conflictMessage(username, *row.owner)+"; could not check whether that User still exists", err)
+		}
+		if !gone {
+			return r.reportConflict(ctx, &user, username, *row.owner)
+		}
+		replaces = row.owner
 	}
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
@@ -242,60 +262,70 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		cost = bcrypt.DefaultCost
 	}
 
-	// Decide whether the short-circuit applies. The cleartext-unchanged
-	// branch fires when ObservedSecretHash matches AND the stored bcrypt
-	// row is at-or-above the configured cost. Bumping operator.bcryptCost
-	// must NOT leave existing rows on the old cost forever — see
-	// pgmqtt_user_rehash_total{reason="cost_bump"} for rollout tracking.
+	// Decide what, if anything, has to be written. The stored hash is kept
+	// when the cleartext is the one last reconciled (ObservedSecretHash
+	// matches) AND the hash is at or above the configured cost: bumping
+	// operator.bcryptCost must not leave existing rows on the old cost
+	// forever — see pgmqtt_user_rehash_total{reason="cost_bump"}.
 	//
-	// On a rename we skip the short-circuit entirely: even when the
-	// password is unchanged the new-username row may not yet exist in PG
-	// (storedBcryptCost would return 0 → cost-bump branch), but more
-	// importantly we want the upsert path to run unconditionally so the
-	// new row lands and status.observedUsername advances.
+	// Requiring ObservedUsername == username means a rename always writes
+	// the row under the new name, and so does the first pass over a User
+	// last reconciled before status.observedUsername existed.
 	//
-	// Requiring ObservedUsername == username (NOT just !renamed) also
-	// handles the upgrade path: an old User CR reconciled by a pre-rename-
-	// handling broker has ObservedSecretHash set but ObservedUsername
-	// empty. The first reconcile on the new broker bypasses the short-
-	// circuit, runs the (idempotent) upsert, and backfills
-	// ObservedUsername so subsequent reconciles short-circuit normally.
+	// A row taken over from a User that no longer exists holds that User's
+	// password, whatever this User's status says, so it is always rehashed.
 	hash := sha256Hex(password)
-	rehashReason := ""
-	if user.Status.ObservedUsername == username &&
+	cleartextUnchanged := row != nil && replaces == nil &&
+		user.Status.ObservedUsername == username &&
 		user.Status.ObservedSecretHash == hash &&
 		user.Status.CredentialsSecretRef != nil &&
-		user.Status.CredentialsSecretRef.Name == secret.Name {
-		// Cleartext is unchanged — still need to verify the stored hash
-		// is at the configured cost. A miss here means an operator bumped
-		// bcryptCost since the last reconcile; we re-bcrypt the same
-		// password at the new cost.
-		storedCost, err := r.storedBcryptCost(ctx, username)
-		if err != nil {
-			return r.fail(ctx, &user, reasonDBError, scrubReason(err), fmt.Errorf("read stored cost: %w", err))
-		}
-		if storedCost >= cost {
-			before := user.DeepCopy()
-			setReady(&user, true, "Reconciled", "")
-			return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
-		}
-		rehashReason = "cost_bump"
-	} else {
+		user.Status.CredentialsSecretRef.Name == secret.Name
+	rehashReason := ""
+	switch {
+	case !cleartextUnchanged:
 		rehashReason = "rotation"
+	case bcryptCostOf(row.hash) < cost:
+		rehashReason = "cost_bump"
 	}
 
-	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+	owned := row != nil && row.owner != nil && *row.owner == me
+	if rehashReason == "" && owned {
+		before := user.DeepCopy()
+		setReady(&user, true, "Reconciled", "")
+		return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
+	}
+
+	// Reaching here with nothing to rehash means the row is right but has
+	// no owner yet: it predates the owner columns and is adopted as it is.
+	newHash := ""
+	if rehashReason == "" {
+		newHash = row.hash
+	} else {
+		b, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+		if err != nil {
+			return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
+		}
+		newHash = string(b)
+	}
+
+	claimed, err := r.writeRow(ctx, username, newHash, me, replaces)
 	if err != nil {
-		return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
-	}
-
-	if _, err := r.Pool.Exec(ctx, `
-		INSERT INTO users(username, password_hash) VALUES($1, $2)
-		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
-	`, username, string(bcryptHash)); err != nil {
 		return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 	}
-	userRehashTotal.WithLabelValues(rehashReason).Inc()
+	if !claimed {
+		// Another User took the username after loadRow. The next pass
+		// reads who and reports the conflict.
+		logger.Info("username claimed concurrently by another User; rechecking", "username", username)
+		before := user.DeepCopy()
+		setReady(&user, false, reasonUsernameConflict, fmt.Sprintf("username %q was claimed by another User", username))
+		if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if rehashReason != "" {
+		userRehashTotal.WithLabelValues(rehashReason).Inc()
+	}
 
 	before := user.DeepCopy()
 	user.Status.ObservedSecretHash = hash
@@ -305,46 +335,178 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
 	}
-	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
+	logReason := rehashReason
+	if logReason == "" {
+		logReason = "adopted"
+	}
+	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", logReason)
 	return ctrl.Result{}, nil
 }
 
-// storedBcryptCost returns the cost parameter encoded in the user row's
-// password_hash, or 0 if the row does not exist (caller should treat as
-// "needs initial hash"). Returns -1 only on a DB error so the caller can
-// distinguish "no row" (proceed with rehash branch via the reason path)
-// from "PG unavailable" (return error).
-//
-// The pgx ErrNoRows case is mapped to (0, nil) — the row will be inserted
-// by the upsert below, so a stored cost of 0 reliably falls under any
-// configured cost (which is at least bcrypt.MinCost = 4).
-func (r *UserReconciler) storedBcryptCost(ctx context.Context, username string) (int, error) {
-	var stored string
-	err := r.Pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored)
+// usernameFor is the MQTT username a User asks for.
+func usernameFor(user *pgmqttv1alpha1.User) string {
+	if user.Spec.Username != "" {
+		return user.Spec.Username
+	}
+	return user.Name
+}
+
+// rowOwner identifies the User object a users row belongs to. The UID is
+// what makes it exact: a User deleted and created again under the same
+// namespace and name is a different owner.
+type rowOwner struct {
+	namespace, name, uid string
+}
+
+func ownerOf(user *pgmqttv1alpha1.User) rowOwner {
+	return rowOwner{namespace: user.Namespace, name: user.Name, uid: string(user.UID)}
+}
+
+// userRow is a users row as the reconciler sees it. owner is nil for a row
+// nobody has claimed: one written before migration 0019, by a broker older
+// than that during a rolling upgrade, or by hand.
+type userRow struct {
+	hash  string
+	owner *rowOwner
+}
+
+// loadRow returns the row for username, or nil if there is none.
+func (r *UserReconciler) loadRow(ctx context.Context, username string) (*userRow, error) {
+	var (
+		row           userRow
+		ns, name, uid *string
+	)
+	err := r.Pool.QueryRow(ctx,
+		`SELECT password_hash, owner_namespace, owner_name, owner_uid FROM users WHERE username=$1`,
+		username).Scan(&row.hash, &ns, &name, &uid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
+		return nil, err
+	}
+	if uid != nil {
+		row.owner = &rowOwner{uid: *uid}
+		if ns != nil {
+			row.owner.namespace = *ns
 		}
-		return -1, err
+		if name != nil {
+			row.owner.name = *name
+		}
 	}
-	c, err := bcrypt.Cost([]byte(stored))
+	return &row, nil
+}
+
+// writeRow inserts the row for username, or updates it if this User may:
+// the row is unowned, already owned by me, or owned by replaces (an owner
+// the caller has established no longer exists). It reports false when the
+// row belongs to someone else, in which case nothing was changed. The
+// condition is part of the statement so that two reconcilers racing for
+// one username cannot both win.
+func (r *UserReconciler) writeRow(ctx context.Context, username, hash string, me rowOwner, replaces *rowOwner) (bool, error) {
+	var oldNS, oldName, oldUID *string
+	if replaces != nil {
+		oldNS, oldName, oldUID = &replaces.namespace, &replaces.name, &replaces.uid
+	}
+	tag, err := r.Pool.Exec(ctx, `
+		INSERT INTO users AS u (username, password_hash, owner_namespace, owner_name, owner_uid)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (username) DO UPDATE
+		   SET password_hash   = EXCLUDED.password_hash,
+		       owner_namespace = EXCLUDED.owner_namespace,
+		       owner_name      = EXCLUDED.owner_name,
+		       owner_uid       = EXCLUDED.owner_uid
+		 WHERE u.owner_uid IS NULL
+		    OR (u.owner_namespace, u.owner_name, u.owner_uid) = ($3, $4, $5)
+		    OR (u.owner_namespace, u.owner_name, u.owner_uid) = ($6::text, $7::text, $8::text)
+	`, username, hash, me.namespace, me.name, me.uid, oldNS, oldName, oldUID)
 	if err != nil {
-		// Stored hash is unparseable (corrupted or non-bcrypt). Treat as
-		// cost=0 so the rehash branch fires and replaces it.
-		return 0, nil
+		return false, err
 	}
-	return c, nil
+	return tag.RowsAffected() == 1, nil
+}
+
+// releaseOtherRows deletes rows this User holds under a username other
+// than keep. legacyUsername is status.observedUsername: a row there that
+// has no owner was written for this User before owners were recorded.
+func (r *UserReconciler) releaseOtherRows(ctx context.Context, me rowOwner, keep, legacyUsername string) error {
+	_, err := r.Pool.Exec(ctx, `
+		DELETE FROM users
+		 WHERE username <> $1
+		   AND ((owner_namespace, owner_name, owner_uid) = ($2, $3, $4)
+		        OR (owner_uid IS NULL AND $5 <> '' AND username = $5))
+	`, keep, me.namespace, me.name, me.uid, legacyUsername)
+	return err
+}
+
+// ownerGone reports whether the User recorded as a row's owner no longer
+// exists, which happens when its finalizer was removed by force. It asks
+// the API server rather than the cache: a cache that has not yet seen a
+// newly created owner must not make that owner's row look abandoned.
+func (r *UserReconciler) ownerGone(ctx context.Context, owner rowOwner) (bool, error) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	var other pgmqttv1alpha1.User
+	err := reader.Get(ctx, client.ObjectKey{Namespace: owner.namespace, Name: owner.name}, &other)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("look up User %s/%s, owner of a contested username: %w", owner.namespace, owner.name, err)
+	}
+	return string(other.UID) != owner.uid, nil
+}
+
+func conflictMessage(username string, owner rowOwner) string {
+	return fmt.Sprintf("username %q is owned by User %s/%s", username, owner.namespace, owner.name)
+}
+
+// reportConflict marks a User that asks for a username another User holds.
+// That is a standing condition rather than a failure, so it is not returned
+// as an error; the User is looked at again later because nothing else would
+// wake it when the owner goes away.
+func (r *UserReconciler) reportConflict(ctx context.Context, user *pgmqttv1alpha1.User, username string, owner rowOwner) (ctrl.Result, error) {
+	before := user.DeepCopy()
+	setReady(user, false, reasonUsernameConflict, conflictMessage(username, owner))
+	// releaseOtherRows has run by now, so this User holds no row at all.
+	user.Status.ObservedUsername = ""
+	if err := r.Status().Patch(ctx, user, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: conflictRecheckInterval}, nil
+}
+
+// bcryptCostOf returns the cost encoded in a stored hash, or 0 for
+// anything that is not a bcrypt hash so that it gets replaced.
+func bcryptCostOf(hash string) int {
+	c, err := bcrypt.Cost([]byte(hash))
+	if err != nil {
+		return 0
+	}
+	return c
 }
 
 func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alpha1.User) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(user, finalizerName) {
 		return ctrl.Result{}, nil
 	}
-	username := user.Spec.Username
-	if username == "" {
-		username = user.Name
+	// What to delete is decided by what this User owns, not by what its
+	// spec asks for now: spec.username may have been edited since the last
+	// reconcile, and the name it currently gives may belong to someone else.
+	me := ownerOf(user)
+	legacyUsername := user.Status.ObservedUsername
+	if legacyUsername == "" && user.Status.CredentialsSecretRef != nil {
+		// Reconciled by a release from before status.observedUsername:
+		// the spec-derived name is the only record of which row it wrote.
+		legacyUsername = usernameFor(user)
 	}
-	if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, username); err != nil {
+	if _, err := r.Pool.Exec(ctx, `
+		DELETE FROM users
+		 WHERE (owner_namespace, owner_name, owner_uid) = ($1, $2, $3)
+		    OR (owner_uid IS NULL AND $4 <> '' AND username = $4)
+	`, me.namespace, me.name, me.uid, legacyUsername); err != nil {
 		// Without this the object just sits in Terminating with nothing
 		// on it to say why.
 		return r.fail(ctx, user, reasonDBError, scrubReason(err), err)
@@ -521,10 +683,15 @@ func sha256Hex(s string) string {
 
 // Reasons set on the Ready condition when a reconcile fails.
 const (
-	reasonDBError     = "DBError"
-	reasonSecretError = "SecretError"
-	reasonHashError   = "HashError"
+	reasonDBError          = "DBError"
+	reasonSecretError      = "SecretError"
+	reasonHashError        = "HashError"
+	reasonUsernameConflict = "UsernameConflict"
 )
+
+// conflictRecheckInterval is how often a User in UsernameConflict is
+// reconciled again to see whether the username has become free.
+const conflictRecheckInterval = time.Minute
 
 // fail records a failed reconcile on the Ready condition and returns err so
 // controller-runtime retries. msg ends up in the User's status, which is

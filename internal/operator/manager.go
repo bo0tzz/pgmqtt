@@ -130,6 +130,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 
 	r := &UserReconciler{
 		Client:      mgr.GetClient(),
+		APIReader:   mgr.GetAPIReader(),
 		Scheme:      mgr.GetScheme(),
 		Pool:        pool,
 		Logger:      logger,
