@@ -500,6 +500,20 @@ operator:
   ## Bcrypt cost used by the User reconciler when hashing passwords for the
   ## broker's `users` table. Library default is 10.
   bcryptCost: 10
+  ## The broker does not terminate TLS. When something in front of it does,
+  ## set tls.host and generated credentials Secrets also carry `tls-host`,
+  ## `mqtts-uri` (on tls.port) and, if wssPort is set, `wss-uri`. Empty
+  ## host: no TLS keys, and any left over from before are removed.
+  tls:
+    host: ""
+    port: 8883
+    wssPort: 0
+  ## Namespaces whose User objects (and the Secrets next to them) this
+  ## release reconciles. Empty: every namespace. Set it when two releases
+  ## share a cluster, so they do not both reconcile the same Users. It
+  ## narrows what the operator watches, not what the chart's ClusterRole
+  ## allows.
+  watchNamespaces: []
 
 ## Janitor base tick frequency (the GCD of per-job stratified intervals).
 ## 1s default. fire_due_wills runs at this cadence (Paho v5 test_will_delay

@@ -99,6 +99,20 @@ spec:
             {{- end }}
             - name: PGMQTT_SERVICE_HOST
               value: {{ include "pgmqtt.serviceHost" . | quote }}
+            {{- with .Values.operator.tls }}
+            {{- if .host }}
+            - name: PGMQTT_TLS_HOST
+              value: {{ .host | quote }}
+            - name: PGMQTT_TLS_PORT
+              value: {{ int .port | quote }}
+            - name: PGMQTT_WSS_PORT
+              value: {{ int .wssPort | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.operator.watchNamespaces }}
+            - name: PGMQTT_WATCH_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
             # 0 tells the operator not to advertise that listener in the
             # credentials Secrets it generates.
             - name: PGMQTT_SERVICE_PORT

@@ -219,7 +219,8 @@ renders() {
         --set-string 'serviceMonitor.labels.release=prometheus'
     has label-collisions 'team: home'
     has label-collisions '"release": "prometheus"'
-    lacks label-collisions 'other'
+    lacks label-collisions ': other'
+    lacks label-collisions '"other"'
 
     # The convenience anti-affinity plus other affinity kinds is fine; plus
     # a hand-written podAntiAffinity it would be a duplicate key.
@@ -261,7 +262,13 @@ renders() {
         --set grafana.dashboard.instanceSelector.matchLabels.foo=bar \
         --set networkPolicy.enabled=true \
         --set autoscaling.enabled=true \
-        --set podDisruptionBudget.enabled=true
+        --set podDisruptionBudget.enabled=true \
+        --set operator.tls.host=mqtt.example.com \
+        --set operator.tls.wssPort=8443 \
+        --set 'operator.watchNamespaces={apps,home}'
+    has everything 'value: "mqtt.example.com"'
+    has everything 'value: "8443"'
+    has everything 'value: "apps,home"'
     # The policy must let the broker reach its database with no peers set.
     has everything 'port: 5432'
     # The helm test Pod must not match the broker selectors (Service, PDB,
