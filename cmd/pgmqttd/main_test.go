@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -86,32 +86,36 @@ func TestFatalRecoverOperator_NoPanicIsNoOp(t *testing.T) {
 	}
 }
 
-// TestOperatorPanicTriggersProcessExit verifies the main() post-Serve
-// branch: when the operatorPanicked flag is set, operatorExit is called
-// with code 1 so K8s restarts the pod. We swap operatorExit with a
-// recorder so the test process doesn't actually terminate, then drive
-// the same condition (flag-set, Serve returned) and assert exit(1)
-// was called.
-func TestOperatorPanicTriggersProcessExit(t *testing.T) {
-	t.Cleanup(func() {
-		operatorPanicked.Store(false)
-		operatorExit = os.Exit
-	})
-	var exitCode atomic.Int32
-	exitCode.Store(-1)
-	operatorExit = func(code int) {
-		exitCode.Store(int32(code))
-	}
-	operatorPanicked.Store(true)
+// TestOperatorPanicExitRunsDeferredCleanup checks the exit path main uses
+// after an operator panic: the exit code is decided late, the exit happens
+// after main's other deferred calls (pool.Close, lst.Stop) have run, and
+// a clean shutdown does not exit at all. main called os.Exit directly
+// before, which skipped that cleanup.
+func TestOperatorPanicExitRunsDeferredCleanup(t *testing.T) {
+	t.Cleanup(func() { operatorExit = os.Exit })
+	var events []string
+	operatorExit = func(code int) { events = append(events, fmt.Sprintf("exit(%d)", code)) }
 
-	// Replicate main()'s post-Serve check.
-	if operatorPanicked.Load() {
-		operatorExit(1)
+	shaped := func(panicked bool) {
+		exitCode := 0
+		defer exitAfterDeferred(&exitCode)
+		defer func() { events = append(events, "pool.Close") }()
+		defer func() { events = append(events, "lst.Stop") }()
+		if panicked {
+			exitCode = 1
+			return
+		}
 	}
 
-	got := exitCode.Load()
-	if got != 1 {
-		t.Errorf("expected operatorExit(1), got code=%d", got)
+	shaped(true)
+	if got, want := strings.Join(events, ", "), "lst.Stop, pool.Close, exit(1)"; got != want {
+		t.Errorf("after a panic: %s, want %s", got, want)
+	}
+
+	events = nil
+	shaped(false)
+	if got, want := strings.Join(events, ", "), "lst.Stop, pool.Close"; got != want {
+		t.Errorf("clean shutdown: %s, want %s", got, want)
 	}
 }
 

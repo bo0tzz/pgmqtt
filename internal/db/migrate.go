@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,19 +26,31 @@ const migrateLockKey int64 = 0x70676d717474_0001
 // recorded in `schema_migrations`. Safe to call concurrently from multiple Pods —
 // callers serialise on a session-scoped Postgres advisory lock.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	conn, err := pool.Acquire(ctx)
+	pooled, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migrate conn: %w", err)
 	}
-	defer conn.Release()
+	// The session is taken out of the pool and closed on return rather than
+	// released: ending it drops the advisory lock and the statement_timeout
+	// override together, so neither can leak back into the pool on an error
+	// path.
+	conn := pooled.Hijack()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
 
-	// pg_advisory_lock serialises on a session — held until the connection is
-	// released. We use a dedicated conn from the pool so the lock doesn't
-	// linger past Migrate returning.
+	// The pool's statement_timeout bounds broker queries. Waiting for a peer
+	// Pod to finish migrating, or running a slow migration, legitimately
+	// takes longer than that; ctx is the only bound here.
+	if _, err := conn.Exec(ctx, `SET statement_timeout = 0`); err != nil {
+		return fmt.Errorf("disable statement_timeout for migrate: %w", err)
+	}
+
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
 		return fmt.Errorf("acquire migrate lock: %w", err)
 	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrateLockKey)
 
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
@@ -56,7 +69,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if exists {
 			continue
 		}
-		if err := applyMigrationOnConn(ctx, conn.Conn(), f); err != nil {
+		if err := applyMigrationOnConn(ctx, conn, f); err != nil {
 			return err
 		}
 	}

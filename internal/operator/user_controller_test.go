@@ -485,10 +485,12 @@ func TestReconcile_BYOSecret_DefaultKey(t *testing.T) {
 	}
 }
 
-// TestReconcile_DefaultsServiceWireDetails verifies the fallbacks when
-// the reconciler's ServiceHost / ServicePort / WSPort are zero-valued.
-// The auto-generated Secret should still contain valid wire fields.
-func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
+// TestReconcile_ZeroValuedWireDetails verifies what the reconciler does
+// when ServiceHost / ServicePort / WSPort are zero-valued: the host falls
+// back to the chart's default Service name, and a port of 0 means that
+// listener is disabled, so no port or URI is published for it. (The
+// defaults 1883 / 8083 for an unset environment live in internal/config.)
+func TestReconcile_ZeroValuedWireDetails(t *testing.T) {
 	t.Parallel()
 	pool := dbtest.FreshPool(t)
 	scheme := newScheme(t)
@@ -497,7 +499,6 @@ func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
 	}
 	cli := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
-	// All wire defaults left at zero so the reconciler picks its fallbacks.
 	r := &operator.UserReconciler{
 		Client: cli, Scheme: scheme, Pool: pool,
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -514,17 +515,13 @@ func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
 	if string(sec.Data["host"]) != "pgmqtt" {
 		t.Errorf("default host: got %q, want %q", sec.Data["host"], "pgmqtt")
 	}
-	if string(sec.Data["port"]) != "1883" {
-		t.Errorf("default port: got %q, want %q", sec.Data["port"], "1883")
+	for _, key := range []string{"port", "uri", "ws-port", "ws-uri"} {
+		if v, ok := sec.Data[key]; ok {
+			t.Errorf("%s = %q published for a disabled listener", key, v)
+		}
 	}
-	if string(sec.Data["ws-port"]) != "8083" {
-		t.Errorf("default ws-port: got %q, want %q", sec.Data["ws-port"], "8083")
-	}
-	if !strings.HasPrefix(string(sec.Data["uri"]), "mqtt://") {
-		t.Errorf("uri default scheme: %q", sec.Data["uri"])
-	}
-	if !strings.HasPrefix(string(sec.Data["ws-uri"]), "ws://") {
-		t.Errorf("ws-uri default scheme: %q", sec.Data["ws-uri"])
+	if len(sec.Data["username"]) == 0 || len(sec.Data["password"]) == 0 {
+		t.Errorf("credentials missing: %v", sec.Data)
 	}
 }
 
@@ -561,13 +558,13 @@ func TestReconcile_AutoGenSecretPasswordPreservedAcrossReconciles(t *testing.T) 
 		t.Fatal("first-pass password is empty")
 	}
 
-	// Wipe the observed-hash status so the reconciler is forced through the
+	// Wipe the observed Secret version so the reconciler is forced through the
 	// existing-secret password-preservation branch on the next pass.
 	var u pgmqttv1alpha1.User
 	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "preserve"}, &u); err != nil {
 		t.Fatalf("get user: %v", err)
 	}
-	u.Status.ObservedSecretHash = ""
+	u.Status.ObservedSecretVersion = ""
 	u.Status.CredentialsSecretRef = nil
 	if err := cli.Status().Update(context.Background(), &u); err != nil {
 		t.Fatalf("status update: %v", err)
@@ -1220,7 +1217,7 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 //
 // The fix re-orders Reconcile so each manager runs Secret CreateOrUpdate
 // FIRST (with a MutateFn that preserves any pre-existing data["password"]
-// rather than always overwriting), then re-Gets the merged Secret to read
+// rather than always overwriting), then takes from the stored Secret
 // the password that won the K8s API race, and finally bcrypts THAT before
 // writing PG. The post-condition is the system invariant:
 //
@@ -1230,10 +1227,10 @@ func TestReconcile_AutoGenSecretGetTransientError(t *testing.T) {
 // Secret. We then simulate "peer manager B reached the K8s API faster
 // than R_A's view" by directly mutating the Secret's data["password"]
 // to a fresh value via the underlying client, then clear the User CR's
-// observed-secret-hash to force R_A through the non-short-circuit path.
+// observed Secret version to force R_A through the non-short-circuit path.
 // R_A's next Reconcile must:
 //   - preserve the peer-set password (NOT overwrite with a fresh random),
-//   - re-Get to observe that password,
+//   - read that password back from the API server,
 //   - bcrypt THAT password into PG.
 //
 // The assertion checks the invariant holds after each reconcile, which
@@ -1277,13 +1274,13 @@ func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
 	if err := cli.Update(context.Background(), &sec); err != nil {
 		t.Fatalf("simulate peer write: %v", err)
 	}
-	// Bypass the ObservedSecretHash short-circuit so reconcile re-runs
+	// Bypass the settled-Secret shortcut so reconcile re-runs
 	// the bcrypt+PG path.
 	var u pgmqttv1alpha1.User
 	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: "ha"}, &u); err != nil {
 		t.Fatalf("get user: %v", err)
 	}
-	u.Status.ObservedSecretHash = ""
+	u.Status.ObservedSecretVersion = ""
 	u.Status.CredentialsSecretRef = nil
 	if err := cli.Status().Update(context.Background(), &u); err != nil {
 		t.Fatalf("clear status: %v", err)
@@ -1291,7 +1288,7 @@ func TestUserReconcileLeaseHandoffPasswordRace(t *testing.T) {
 
 	// R_A reconciles after the peer-write. With the fix's MutateFn
 	// preserving existing passwords, the peer's value must persist;
-	// without the re-Get-then-bcrypt ordering, the DB hash could lag
+	// without the Secret-then-bcrypt ordering, the DB hash could lag
 	// behind. The post-condition is the invariant.
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "mqtt", Name: "ha"}}); err != nil {
 		t.Fatalf("reconcile post-peer-write: %v", err)
@@ -1338,9 +1335,10 @@ func assertSecretMatchesDB(t *testing.T, cli client.Client, pool *pgxpool.Pool, 
 // Setup: seed a User row with a cost-4 hash via direct PG insert
 // (bypassing the reconciler so we can pin the cost). Configure the
 // reconciler with BcryptCost=10 and a credentials Secret already
-// holding the cleartext that produced the cost-4 hash, with the User
-// CR's Status.ObservedSecretHash matching sha256(cleartext) so the
-// short-circuit *would* trigger. Run Reconcile.
+// holding the cleartext that produced the cost-4 hash. The User's
+// status is what a release before 0.3.0 left behind (a SHA-256 of the
+// password, no Secret version), so this is also the upgrade path: the
+// password is found unchanged by comparing it with the stored hash.
 //
 // Expected post-condition: stored hash now has cost prefix "$2a$10$"
 // AND the metric counter for reason="cost_bump" incremented by 1.
@@ -1369,8 +1367,7 @@ func TestRehashOnCostBump(t *testing.T) {
 	}
 
 	// Build the corresponding K8s state: a User CR + auto-gen Secret with
-	// the same cleartext, plus a populated Status that would normally
-	// short-circuit (ObservedSecretHash matches sha256(cleartext)).
+	// the same cleartext, plus the Status an older release wrote.
 	hashSum := sha256.Sum256([]byte(cleartext))
 	observedHash := hex.EncodeToString(hashSum[:])
 	user := &pgmqttv1alpha1.User{
@@ -1427,6 +1424,19 @@ func TestRehashOnCostBump(t *testing.T) {
 	after := operator.UserRehashTotalForTest("cost_bump")
 	if after-before != 1 {
 		t.Errorf("cost_bump metric delta: got %v, want 1", after-before)
+	}
+
+	// Post-condition 3: the password digest the older release left in
+	// status is gone, replaced by the Secret's identity.
+	var got pgmqttv1alpha1.User
+	if err := cli.Get(context.Background(), types.NamespacedName{Namespace: "mqtt", Name: username}, &got); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if got.Status.ObservedSecretHash != "" {
+		t.Errorf("status.observedSecretHash still holds %q", got.Status.ObservedSecretHash)
+	}
+	if got.Status.ObservedSecretVersion == "" {
+		t.Error("status.observedSecretVersion not set")
 	}
 }
 

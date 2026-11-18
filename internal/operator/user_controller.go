@@ -7,20 +7,21 @@ package operator
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,22 +45,28 @@ const (
 // optionally generates a credentials Secret for clients to consume.
 type UserReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Pool   *pgxpool.Pool
-	Logger *slog.Logger
+	// APIReader reads straight from the API server. It is used for the one
+	// lookup that must not be answered from a lagging cache (see
+	// ownerGone); nil falls back to Client.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	Pool      *pgxpool.Pool
+	Logger    *slog.Logger
 
 	// Wire details for auto-generated Secrets — supplied via env so the
-	// reconciler can patch stale host/port values.
+	// reconciler can patch stale host/port values. A port of 0 means that
+	// endpoint is not offered: its port and URI keys are left out of the
+	// Secret, and removed from one that has them.
 	ServiceHost string // e.g. "pgmqtt.mqtt.svc.cluster.local"
-	ServicePort int    // e.g. 1883
-	WSPort      int    // e.g. 8083
+	ServicePort int    // e.g. 1883; 0 = TCP listener disabled
+	WSPort      int    // e.g. 8083; 0 = websocket listener disabled
 	// Optional TLS endpoint for the User CR's Secret. When TLSHost is
 	// non-empty the operator emits an mqtts:// URI alongside the plain
 	// mqtt:// one. Operators wanting to push apps to TLS-only set the
 	// matching listener up out-of-band (ingress-nginx, HAProxy, etc.).
 	TLSHost string
-	TLSPort int    // e.g. 8883
-	WSSPort int    // e.g. 8443
+	TLSPort int // e.g. 8883; 0 = no mqtts endpoint
+	WSSPort int // e.g. 8443; 0 = no wss endpoint
 
 	// BcryptCost overrides the cost used when hashing the User's password.
 	// 0 falls back to bcrypt.DefaultCost (10).
@@ -86,14 +93,23 @@ type UserReconciler struct {
 // whose spec.PasswordSecretRef.Name matches the Secret. Non-matching
 // Secret events return an empty slice, keeping the cost of cluster-
 // wide Secret churn bounded to a single namespaced List per event.
+//
+// Both Secret watches are metadata-only. A BYO Secret can be any Secret
+// in a watched namespace, so the watch cannot be narrowed by label or
+// owner; what can be avoided is holding their contents. The handlers
+// need a Secret's name, namespace and owner references, nothing more,
+// and Reconcile reads the Secret it cares about from the API server
+// (the manager's client does not cache Secrets). Without OnlyMetadata
+// here the cache would hold every Secret in the cluster in full.
 func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("pgmqtt-user").
 		For(&pgmqttv1alpha1.User{}).
-		Owns(&corev1.Secret{}, builder.MatchEveryOwner).
+		Owns(&corev1.Secret{}, builder.MatchEveryOwner, builder.OnlyMetadata).
 		Watches(
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.usersForSecret),
+			builder.OnlyMetadata,
 		).
 		Complete(r)
 }
@@ -110,9 +126,12 @@ func (r *UserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // return for empty UserList keeps non-pgmqtt Secret churn essentially
 // free. Returning nil for non-matching events is required — handler
 // machinery treats a nil/empty slice as "do not enqueue".
-func (r *UserReconciler) usersForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
-	secret, ok := obj.(*corev1.Secret)
-	if !ok {
+func (r *UserReconciler) usersForSecret(ctx context.Context, secret client.Object) []reconcile.Request {
+	// The watch delivers metadata-only objects; a full Secret is accepted
+	// too so the function does not depend on how it was wired.
+	switch secret.(type) {
+	case *metav1.PartialObjectMetadata, *corev1.Secret:
+	default:
 		return nil
 	}
 	var users pgmqttv1alpha1.UserList
@@ -166,7 +185,7 @@ func (r *UserReconciler) usersForSecret(ctx context.Context, obj client.Object) 
 // Reordering the Secret reconcile to come first, *and* having the MutateFn
 // preserve any existing data["password"] rather than always overwriting it,
 // makes the password-that-wins the K8s API race the single source of truth.
-// Both managers then re-Get the merged Secret and feed THAT password into
+// Both managers then feed the password the API server actually stored into
 // bcrypt before writing PG, so the DB hash always matches the cleartext
 // stored in the Secret regardless of which manager wrote last.
 //
@@ -202,41 +221,54 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	username := user.Spec.Username
-	if username == "" {
-		username = user.Name
-	}
+	username := usernameFor(&user)
+	me := ownerOf(&user)
 
 	// Rename handling: if spec.username has been edited since the last
-	// successful reconcile, the row keyed by the OLD username must be
-	// removed — otherwise the old credentials remain valid for auth and
-	// the old username slot stays occupied even after the slot is
-	// logically free. status.observedUsername is the authoritative
-	// pointer to the row we last wrote, so we delete that row first and
-	// fall through to the upsert which writes the new one.
+	// successful reconcile, the row under the OLD username must go —
+	// otherwise the old credentials remain valid for auth and the old
+	// username stays occupied. Rows are found by their recorded owner, so
+	// this also catches a row whose status update never landed; the row
+	// status.observedUsername points at is included for rows written
+	// before owners were recorded.
 	//
-	// Idempotency: the DELETE is a no-op when the row is already gone,
-	// so a mid-reconcile failure that prevents the status update is
-	// safe — the next pass observes the same observedUsername, re-runs
-	// the (no-op) DELETE, and tries the upsert again.
-	renamed := user.Status.ObservedUsername != "" && user.Status.ObservedUsername != username
-	if renamed {
-		if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, user.Status.ObservedUsername); err != nil {
-			before := user.DeepCopy()
-			setReady(&user, false, "DBError", scrubReason(err))
-			logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-				"rename-cleanup DBError", err)
-			return ctrl.Result{}, err
+	// Idempotency: the DELETE is a no-op when there is nothing to release,
+	// so it is safe to repeat after a failure further down.
+	if user.Status.ObservedUsername != username {
+		if err := r.releaseOtherRows(ctx, me, username, user.Status.ObservedUsername); err != nil {
+			return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
 		}
+	}
+
+	row, err := r.loadRow(ctx, username)
+	if err != nil {
+		return r.fail(ctx, &user, reasonDBError, scrubReason(err), fmt.Errorf("read users row: %w", err))
+	}
+	// Checked before the Secret is touched, so a User that cannot have the
+	// username does not get credentials generated for it. The write below
+	// repeats the check atomically; this one exists to report the conflict.
+	var replaces *rowOwner
+	if row != nil && row.owner != nil && *row.owner != me {
+		gone, err := r.ownerGone(ctx, *row.owner)
+		if err != nil {
+			return r.fail(ctx, &user, reasonUsernameConflict,
+				conflictMessage(username, *row.owner)+"; could not check whether that User still exists", err)
+		}
+		if !gone {
+			return r.reportConflict(ctx, &user, username, *row.owner)
+		}
+		replaces = row.owner
 	}
 
 	secret, password, err := r.resolveCredentialSecret(ctx, &user, username)
 	if err != nil {
-		before := user.DeepCopy()
-		setReady(&user, false, "SecretError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-			"resolveCredentialSecret SecretError", err)
-		return ctrl.Result{}, err
+		return r.fail(ctx, &user, reasonSecretError, secretErrorMessage(err), err)
+	}
+	// Both Secret paths refuse an empty password themselves; this is the one
+	// place every path passes through before a row is written.
+	if password == "" {
+		err := fmt.Errorf("secret %s/%s holds an empty password", user.Namespace, secret.Name)
+		return r.fail(ctx, &user, reasonSecretError, fmt.Sprintf("secret %q holds an empty password", secret.Name), err)
 	}
 
 	cost := r.BcryptCost
@@ -244,114 +276,284 @@ func (r *UserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		cost = bcrypt.DefaultCost
 	}
 
-	// Decide whether the short-circuit applies. The cleartext-unchanged
-	// branch fires when ObservedSecretHash matches AND the stored bcrypt
-	// row is at-or-above the configured cost. Bumping operator.bcryptCost
-	// must NOT leave existing rows on the old cost forever — see
-	// pgmqtt_user_rehash_total{reason="cost_bump"} for rollout tracking.
+	// Decide what, if anything, has to be written.
 	//
-	// On a rename we skip the short-circuit entirely: even when the
-	// password is unchanged the new-username row may not yet exist in PG
-	// (storedBcryptCost would return 0 → cost-bump branch), but more
-	// importantly we want the upsert path to run unconditionally so the
-	// new row lands and status.observedUsername advances.
+	// settled: this User owns the row, and the Secret is the same object at
+	// the same resourceVersion as when the row was last written. Its content
+	// cannot have changed, so the password is not compared at all. That is
+	// what keeps a no-op reconcile cheap, and it is why status needs to hold
+	// nothing derived from the password: a Secret's identity says when to
+	// look again, and the bcrypt hash already in the row says whether the
+	// password is still the same.
 	//
-	// Requiring ObservedUsername == username (NOT just !renamed) also
-	// handles the upgrade path: an old User CR reconciled by a pre-rename-
-	// handling broker has ObservedSecretHash set but ObservedUsername
-	// empty. The first reconcile on the new broker bypasses the short-
-	// circuit, runs the (idempotent) upsert, and backfills
-	// ObservedUsername so subsequent reconciles short-circuit normally.
-	hash := sha256Hex(password)
-	rehashReason := ""
-	if user.Status.ObservedUsername == username &&
-		user.Status.ObservedSecretHash == hash &&
+	// Requiring ObservedUsername == username means a rename always writes
+	// the row under the new name.
+	version := secretVersion(secret)
+	owned := row != nil && row.owner != nil && *row.owner == me
+	settled := owned && version != "" &&
+		user.Status.ObservedUsername == username &&
+		user.Status.ObservedSecretVersion == version &&
 		user.Status.CredentialsSecretRef != nil &&
-		user.Status.CredentialsSecretRef.Name == secret.Name {
-		// Cleartext is unchanged — still need to verify the stored hash
-		// is at the configured cost. A miss here means an operator bumped
-		// bcryptCost since the last reconcile; we re-bcrypt the same
-		// password at the new cost.
-		storedCost, err := r.storedBcryptCost(ctx, username)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("read stored cost: %w", err)
-		}
-		if storedCost >= cost {
-			before := user.DeepCopy()
-			setReady(&user, true, "Reconciled", "")
-			return ctrl.Result{}, r.Status().Patch(ctx, &user, client.MergeFrom(before))
-		}
-		rehashReason = "cost_bump"
-	} else {
+		user.Status.CredentialsSecretRef.Name == secret.Name
+
+	var cleartextUnchanged bool
+	switch {
+	case row == nil, replaces != nil:
+		// No row yet, or one taken over from a User that no longer exists
+		// and so holding that User's password.
+	case settled:
+		cleartextUnchanged = true
+	default:
+		cleartextUnchanged = bcrypt.CompareHashAndPassword([]byte(row.hash), []byte(password)) == nil
+	}
+
+	// Bumping operator.bcryptCost must not leave existing rows on the old
+	// cost forever — see pgmqtt_user_rehash_total{reason="cost_bump"}.
+	rehashReason := ""
+	switch {
+	case !cleartextUnchanged:
 		rehashReason = "rotation"
+	case bcryptCostOf(row.hash) < cost:
+		rehashReason = "cost_bump"
 	}
 
-	bcryptHash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("bcrypt: %w", err)
-	}
+	if rehashReason != "" || !owned {
+		// With nothing to rehash, the row is right but has no owner yet
+		// (it predates the owner columns): it is adopted as it stands.
+		newHash := ""
+		if rehashReason == "" {
+			newHash = row.hash
+		} else {
+			b, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+			if err != nil {
+				return r.fail(ctx, &user, reasonHashError, hashErrorMessage(err, cost), fmt.Errorf("bcrypt: %w", err))
+			}
+			newHash = string(b)
+		}
 
-	if _, err := r.Pool.Exec(ctx, `
-		INSERT INTO users(username, password_hash) VALUES($1, $2)
-		ON CONFLICT (username) DO UPDATE SET password_hash=EXCLUDED.password_hash
-	`, username, string(bcryptHash)); err != nil {
-		before := user.DeepCopy()
-		setReady(&user, false, "DBError", scrubReason(err))
-		logStatusUpdateError(logger, r.Status().Patch(ctx, &user, client.MergeFrom(before)),
-			"users upsert DBError", err)
-		return ctrl.Result{}, err
+		claimed, err := r.writeRow(ctx, username, newHash, me, replaces)
+		if err != nil {
+			return r.fail(ctx, &user, reasonDBError, scrubReason(err), err)
+		}
+		if !claimed {
+			// Another User took the username after loadRow. The next pass
+			// reads who and reports the conflict.
+			logger.Info("username claimed concurrently by another User; rechecking", "username", username)
+			before := user.DeepCopy()
+			setReady(&user, false, reasonUsernameConflict, fmt.Sprintf("username %q was claimed by another User", username))
+			if err := r.patchStatus(ctx, &user, before); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if rehashReason != "" {
+			userRehashTotal.WithLabelValues(rehashReason).Inc()
+		}
+		logReason := rehashReason
+		if logReason == "" {
+			logReason = "adopted"
+		}
+		logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", logReason)
 	}
-	userRehashTotal.WithLabelValues(rehashReason).Inc()
 
 	before := user.DeepCopy()
-	user.Status.ObservedSecretHash = hash
+	user.Status.ObservedSecretVersion = version
 	user.Status.ObservedUsername = username
 	user.Status.CredentialsSecretRef = &corev1.LocalObjectReference{Name: secret.Name}
 	setReady(&user, true, "Reconciled", "")
-	if err := r.Status().Patch(ctx, &user, client.MergeFrom(before)); err != nil {
-		return ctrl.Result{}, err
-	}
-	logger.Info("user upserted", "username", username, "secret", secret.Name, "reason", rehashReason)
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, r.patchStatus(ctx, &user, before)
 }
 
-// storedBcryptCost returns the cost parameter encoded in the user row's
-// password_hash, or 0 if the row does not exist (caller should treat as
-// "needs initial hash"). Returns -1 only on a DB error so the caller can
-// distinguish "no row" (proceed with rehash branch via the reason path)
-// from "PG unavailable" (return error).
-//
-// The pgx ErrNoRows case is mapped to (0, nil) — the row will be inserted
-// by the upsert below, so a stored cost of 0 reliably falls under any
-// configured cost (which is at least bcrypt.MinCost = 4).
-func (r *UserReconciler) storedBcryptCost(ctx context.Context, username string) (int, error) {
-	var stored string
-	err := r.Pool.QueryRow(ctx, `SELECT password_hash FROM users WHERE username=$1`, username).Scan(&stored)
+// secretVersion identifies one revision of a Secret object. Two reads that
+// return the same value saw the same content; nothing about the content can
+// be derived from it.
+func secretVersion(secret *corev1.Secret) string {
+	if secret.ResourceVersion == "" {
+		return ""
+	}
+	return string(secret.UID) + "/" + secret.ResourceVersion
+}
+
+// patchStatus writes the status changes made to user since before was
+// copied from it, and skips the API call when there are none.
+func (r *UserReconciler) patchStatus(ctx context.Context, user, before *pgmqttv1alpha1.User) error {
+	// Releases before 0.3.0 kept a SHA-256 of the password here. Clearing it
+	// on every write removes it from each User the first time it is
+	// reconciled, without depending on the installed CRD pruning it.
+	user.Status.ObservedSecretHash = ""
+	if equality.Semantic.DeepEqual(before.Status, user.Status) {
+		return nil
+	}
+	return r.Status().Patch(ctx, user, client.MergeFrom(before))
+}
+
+// usernameFor is the MQTT username a User asks for.
+func usernameFor(user *pgmqttv1alpha1.User) string {
+	if user.Spec.Username != "" {
+		return user.Spec.Username
+	}
+	return user.Name
+}
+
+// rowOwner identifies the User object a users row belongs to. The UID is
+// what makes it exact: a User deleted and created again under the same
+// namespace and name is a different owner.
+type rowOwner struct {
+	namespace, name, uid string
+}
+
+func ownerOf(user *pgmqttv1alpha1.User) rowOwner {
+	return rowOwner{namespace: user.Namespace, name: user.Name, uid: string(user.UID)}
+}
+
+// userRow is a users row as the reconciler sees it. owner is nil for a row
+// nobody has claimed: one written before migration 0019, by a broker older
+// than that during a rolling upgrade, or by hand.
+type userRow struct {
+	hash  string
+	owner *rowOwner
+}
+
+// loadRow returns the row for username, or nil if there is none.
+func (r *UserReconciler) loadRow(ctx context.Context, username string) (*userRow, error) {
+	var (
+		row           userRow
+		ns, name, uid *string
+	)
+	err := r.Pool.QueryRow(ctx,
+		`SELECT password_hash, owner_namespace, owner_name, owner_uid FROM users WHERE username=$1`,
+		username).Scan(&row.hash, &ns, &name, &uid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
+		return nil, err
+	}
+	if uid != nil {
+		row.owner = &rowOwner{uid: *uid}
+		if ns != nil {
+			row.owner.namespace = *ns
 		}
-		return -1, err
+		if name != nil {
+			row.owner.name = *name
+		}
 	}
-	c, err := bcrypt.Cost([]byte(stored))
+	return &row, nil
+}
+
+// writeRow inserts the row for username, or updates it if this User may:
+// the row is unowned, already owned by me, or owned by replaces (an owner
+// the caller has established no longer exists). It reports false when the
+// row belongs to someone else, in which case nothing was changed. The
+// condition is part of the statement so that two reconcilers racing for
+// one username cannot both win.
+func (r *UserReconciler) writeRow(ctx context.Context, username, hash string, me rowOwner, replaces *rowOwner) (bool, error) {
+	var oldNS, oldName, oldUID *string
+	if replaces != nil {
+		oldNS, oldName, oldUID = &replaces.namespace, &replaces.name, &replaces.uid
+	}
+	tag, err := r.Pool.Exec(ctx, `
+		INSERT INTO users AS u (username, password_hash, owner_namespace, owner_name, owner_uid)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (username) DO UPDATE
+		   SET password_hash   = EXCLUDED.password_hash,
+		       owner_namespace = EXCLUDED.owner_namespace,
+		       owner_name      = EXCLUDED.owner_name,
+		       owner_uid       = EXCLUDED.owner_uid
+		 WHERE u.owner_uid IS NULL
+		    OR (u.owner_namespace, u.owner_name, u.owner_uid) = ($3, $4, $5)
+		    OR (u.owner_namespace, u.owner_name, u.owner_uid) = ($6::text, $7::text, $8::text)
+	`, username, hash, me.namespace, me.name, me.uid, oldNS, oldName, oldUID)
 	if err != nil {
-		// Stored hash is unparseable (corrupted or non-bcrypt). Treat as
-		// cost=0 so the rehash branch fires and replaces it.
-		return 0, nil
+		return false, err
 	}
-	return c, nil
+	return tag.RowsAffected() == 1, nil
+}
+
+// releaseOtherRows deletes rows this User holds under a username other
+// than keep. legacyUsername is status.observedUsername: a row there that
+// has no owner was written for this User before owners were recorded.
+func (r *UserReconciler) releaseOtherRows(ctx context.Context, me rowOwner, keep, legacyUsername string) error {
+	_, err := r.Pool.Exec(ctx, `
+		DELETE FROM users
+		 WHERE username <> $1
+		   AND ((owner_namespace, owner_name, owner_uid) = ($2, $3, $4)
+		        OR (owner_uid IS NULL AND $5 <> '' AND username = $5))
+	`, keep, me.namespace, me.name, me.uid, legacyUsername)
+	return err
+}
+
+// ownerGone reports whether the User recorded as a row's owner no longer
+// exists, which happens when its finalizer was removed by force. It asks
+// the API server rather than the cache: a cache that has not yet seen a
+// newly created owner must not make that owner's row look abandoned.
+func (r *UserReconciler) ownerGone(ctx context.Context, owner rowOwner) (bool, error) {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	var other pgmqttv1alpha1.User
+	err := reader.Get(ctx, client.ObjectKey{Namespace: owner.namespace, Name: owner.name}, &other)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("look up User %s/%s, owner of a contested username: %w", owner.namespace, owner.name, err)
+	}
+	return string(other.UID) != owner.uid, nil
+}
+
+func conflictMessage(username string, owner rowOwner) string {
+	return fmt.Sprintf("username %q is owned by User %s/%s", username, owner.namespace, owner.name)
+}
+
+// reportConflict marks a User that asks for a username another User holds.
+// That is a standing condition rather than a failure, so it is not returned
+// as an error; the User is looked at again later because nothing else would
+// wake it when the owner goes away.
+func (r *UserReconciler) reportConflict(ctx context.Context, user *pgmqttv1alpha1.User, username string, owner rowOwner) (ctrl.Result, error) {
+	before := user.DeepCopy()
+	setReady(user, false, reasonUsernameConflict, conflictMessage(username, owner))
+	// releaseOtherRows has run by now, so this User holds no row at all.
+	user.Status.ObservedUsername = ""
+	if err := r.patchStatus(ctx, user, before); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: conflictRecheckInterval}, nil
+}
+
+// bcryptCostOf returns the cost encoded in a stored hash, or 0 for
+// anything that is not a bcrypt hash so that it gets replaced.
+func bcryptCostOf(hash string) int {
+	c, err := bcrypt.Cost([]byte(hash))
+	if err != nil {
+		return 0
+	}
+	return c
 }
 
 func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alpha1.User) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(user, finalizerName) {
 		return ctrl.Result{}, nil
 	}
-	username := user.Spec.Username
-	if username == "" {
-		username = user.Name
+	// What to delete is decided by what this User owns, not by what its
+	// spec asks for now: spec.username may have been edited since the last
+	// reconcile, and the name it currently gives may belong to someone else.
+	me := ownerOf(user)
+	legacyUsername := user.Status.ObservedUsername
+	if legacyUsername == "" && user.Status.CredentialsSecretRef != nil {
+		// Reconciled by a release from before status.observedUsername:
+		// the spec-derived name is the only record of which row it wrote.
+		legacyUsername = usernameFor(user)
 	}
-	if _, err := r.Pool.Exec(ctx, `DELETE FROM users WHERE username=$1`, username); err != nil {
-		return ctrl.Result{}, err
+	if _, err := r.Pool.Exec(ctx, `
+		DELETE FROM users
+		 WHERE (owner_namespace, owner_name, owner_uid) = ($1, $2, $3)
+		    OR (owner_uid IS NULL AND $4 <> '' AND username = $4)
+	`, me.namespace, me.name, me.uid, legacyUsername); err != nil {
+		// Without this the object just sits in Terminating with nothing
+		// on it to say why.
+		return r.fail(ctx, user, reasonDBError, scrubReason(err), err)
 	}
 	// Finalizer-removal via Patch (MergeFrom) — same lease-handoff
 	// rationale as finalizer-add above. Spec is untouched.
@@ -368,8 +570,8 @@ func (r *UserReconciler) reconcileDelete(ctx context.Context, user *pgmqttv1alph
 // K8s API write race inside CreateOrUpdate, NOT by which manager generated
 // the candidate first. Concretely: the MutateFn preserves any existing
 // data["password"] rather than overwriting it, so the FIRST manager to
-// successfully Create the Secret seeds the password value; subsequent
-// peers re-Get the merged Secret to read whatever password landed. This
+// successfully Create the Secret seeds the password value; a peer whose
+// Create or Update loses retries and reads whatever password landed. This
 // closes the lease-handoff divergence between Secret-cleartext and
 // PG-bcrypt-hash described on the Reconcile docstring.
 func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmqttv1alpha1.User, username string) (*corev1.Secret, string, error) {
@@ -377,7 +579,10 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		ref := user.Spec.PasswordSecretRef
 		var sec corev1.Secret
 		if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: ref.Name}, &sec); err != nil {
-			return nil, "", fmt.Errorf("get secret %s/%s: %w", user.Namespace, ref.Name, err)
+			return nil, "", statusErr{
+				error:   fmt.Errorf("get secret %s/%s: %w", user.Namespace, ref.Name, err),
+				message: fmt.Sprintf("secret %q: %s", ref.Name, apiErrorSummary(err)),
+			}
 		}
 		key := ref.Key
 		if key == "" {
@@ -385,7 +590,18 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		}
 		password, ok := sec.Data[key]
 		if !ok {
-			return nil, "", fmt.Errorf("secret %s/%s missing key %s", user.Namespace, ref.Name, key)
+			return nil, "", statusErr{
+				error:   fmt.Errorf("secret %s/%s missing key %s", user.Namespace, ref.Name, key),
+				message: fmt.Sprintf("secret %q has no key %q", ref.Name, key),
+			}
+		}
+		// An empty value would become an account anyone can use by knowing
+		// only its username.
+		if len(password) == 0 {
+			return nil, "", statusErr{
+				error:   fmt.Errorf("secret %s/%s key %s is empty", user.Namespace, ref.Name, key),
+				message: fmt.Sprintf("secret %q key %q is empty; a password is required", ref.Name, key),
+			}
 		}
 		return &sec, string(password), nil
 	}
@@ -402,14 +618,6 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 	host := r.ServiceHost
 	if host == "" {
 		host = "pgmqtt"
-	}
-	port := r.ServicePort
-	if port == 0 {
-		port = 1883
-	}
-	wsPort := r.WSPort
-	if wsPort == 0 {
-		wsPort = 8083
 	}
 
 	desired := &corev1.Secret{
@@ -434,56 +642,68 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		if len(password) == 0 {
 			password = []byte(candidate)
 		}
-		desired.Data["username"] = []byte(username)
-		desired.Data["password"] = password
-		desired.Data["host"] = []byte(host)
-		desired.Data["port"] = []byte(fmt.Sprintf("%d", port))
-		desired.Data["ws-port"] = []byte(fmt.Sprintf("%d", wsPort))
-		desired.Data["uri"] = []byte(fmt.Sprintf("mqtt://%s:%s@%s:%d",
-			url.PathEscape(username), url.PathEscape(string(password)), host, port))
-		desired.Data["ws-uri"] = []byte(fmt.Sprintf("ws://%s:%s@%s:%d/mqtt",
-			url.PathEscape(username), url.PathEscape(string(password)), host, wsPort))
-		// TLS endpoints — populated only when an operator wires
-		// TLSHost/TLSPort into the broker's env (helm
-		// `operator.tlsHost` etc.). The plain mqtt:// URI stays in
-		// the Secret either way for in-cluster traffic; mqtts://
-		// gives consumer apps an opinionated path to the encrypted
-		// listener so they don't fall back to plaintext by default.
-		if r.TLSHost != "" {
-			tlsPort := r.TLSPort
-			if tlsPort == 0 {
-				tlsPort = 8883
-			}
-			desired.Data["tls-host"] = []byte(r.TLSHost)
-			desired.Data["tls-port"] = []byte(fmt.Sprintf("%d", tlsPort))
-			desired.Data["mqtts-uri"] = []byte(fmt.Sprintf("mqtts://%s:%s@%s:%d",
-				url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, tlsPort))
-			if wssPort := r.WSSPort; wssPort > 0 {
-				desired.Data["wss-port"] = []byte(fmt.Sprintf("%d", wssPort))
-				desired.Data["wss-uri"] = []byte(fmt.Sprintf("wss://%s:%s@%s:%d/mqtt",
-					url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, wssPort))
-			}
+		data := desired.Data
+		data["username"] = []byte(username)
+		data["password"] = password
+		data["host"] = []byte(host)
+
+		// Each endpoint's keys are written when it is offered and removed
+		// when it is not. A consumer wired to `uri` should then fail to
+		// start rather than be handed a port nothing listens on.
+		userinfo := url.PathEscape(username) + ":" + url.PathEscape(string(password))
+		advertise(data, "port", "uri", "mqtt://%s@%s:%d", userinfo, host, r.ServicePort)
+		advertise(data, "ws-port", "ws-uri", "ws://%s@%s:%d/mqtt", userinfo, host, r.WSPort)
+
+		// The plain mqtt:// URI stays next to the TLS one for in-cluster
+		// traffic; mqtts:// gives consumers a ready-made path to the
+		// encrypted endpoint so they don't default to plaintext.
+		tlsPort, wssPort := r.TLSPort, r.WSSPort
+		if r.TLSHost == "" {
+			delete(data, "tls-host")
+			tlsPort, wssPort = 0, 0
+		} else {
+			data["tls-host"] = []byte(r.TLSHost)
 		}
+		advertise(data, "tls-port", "mqtts-uri", "mqtts://%s@%s:%d", userinfo, r.TLSHost, tlsPort)
+		advertise(data, "wss-port", "wss-uri", "wss://%s@%s:%d/mqtt", userinfo, r.TLSHost, wssPort)
+
 		return controllerutil.SetControllerReference(user, desired, r.Scheme)
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", statusErr{
+			error:   fmt.Errorf("reconcile secret %s/%s: %w", user.Namespace, name, err),
+			message: fmt.Sprintf("secret %q: %s", name, apiErrorSummary(err)),
+		}
 	}
 	r.Logger.Debug("credentials secret reconciled", "op", op, "name", name)
 
-	// Re-Get after the merge so we observe the password that "won" the
-	// CreateOrUpdate race. Without this, a concurrent peer manager could
-	// have written a different password between our MutateFn run and our
-	// caller's bcrypt+PG write — leading to Secret/DB divergence.
-	var resolved corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: user.Namespace, Name: name}, &resolved); err != nil {
-		return nil, "", fmt.Errorf("re-get secret %s/%s: %w", user.Namespace, name, err)
+	// desired now holds what the API server stored, so its password is the
+	// one that won any race with a peer manager: a Create that lost returns
+	// AlreadyExists and an Update carries the resourceVersion it read, so
+	// neither can succeed over a peer's write. This relies on the Secret
+	// having been read from the API server and not from a cache, which the
+	// manager's client guarantees for Secrets.
+	pw := desired.Data["password"]
+	if len(pw) == 0 {
+		return nil, "", statusErr{
+			error:   fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name),
+			message: fmt.Sprintf("secret %q has no password after being written", name),
+		}
 	}
-	pw, ok := resolved.Data["password"]
-	if !ok || len(pw) == 0 {
-		return nil, "", fmt.Errorf("secret %s/%s missing password after reconcile", user.Namespace, name)
+	return desired, string(pw), nil
+}
+
+// advertise writes the port and URI keys of one endpoint into a generated
+// Secret, or removes both when port is 0, which means the endpoint is not
+// offered.
+func advertise(data map[string][]byte, portKey, uriKey, uriFormat, userinfo, host string, port int) {
+	if port <= 0 {
+		delete(data, portKey)
+		delete(data, uriKey)
+		return
 	}
-	return &resolved, string(pw), nil
+	data[portKey] = []byte(strconv.Itoa(port))
+	data[uriKey] = []byte(fmt.Sprintf(uriFormat, userinfo, host, port))
 }
 
 // generatePassword returns a base64-url-encoded 24-byte random password.
@@ -495,9 +715,76 @@ func generatePassword() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-func sha256Hex(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
+// Reasons set on the Ready condition when a reconcile fails.
+const (
+	reasonDBError          = "DBError"
+	reasonSecretError      = "SecretError"
+	reasonHashError        = "HashError"
+	reasonUsernameConflict = "UsernameConflict"
+)
+
+// conflictRecheckInterval is how often a User in UsernameConflict is
+// reconciled again to see whether the username has become free.
+const conflictRecheckInterval = time.Minute
+
+// fail records a failed reconcile on the Ready condition and returns err so
+// controller-runtime retries. msg ends up in the User's status, which is
+// readable by anyone who can read the User: it must not carry raw error
+// text from Postgres or Secret contents.
+func (r *UserReconciler) fail(ctx context.Context, user *pgmqttv1alpha1.User, reason, msg string, err error) (ctrl.Result, error) {
+	before := user.DeepCopy()
+	setReady(user, false, reason, msg)
+	logStatusUpdateError(log.FromContext(ctx).WithName("pgmqtt-user"),
+		r.patchStatus(ctx, user, before), reason, err)
+	return ctrl.Result{}, err
+}
+
+// statusErr carries, next to an error, the sentence to show for it in the
+// User's status. The sentence is assembled from object names and a coarse
+// classification, so unlike the error text it is safe to publish.
+type statusErr struct {
+	error
+	message string
+}
+
+func (e statusErr) Unwrap() error { return e.error }
+
+func secretErrorMessage(err error) string {
+	var se statusErr
+	if errors.As(err, &se) {
+		return se.message
+	}
+	return scrubReason(err)
+}
+
+// apiErrorSummary names the class of a Kubernetes API error without
+// repeating the server's message.
+func apiErrorSummary(err error) string {
+	var owned *controllerutil.AlreadyOwnedError
+	switch {
+	case apierrors.IsNotFound(err):
+		return "not found"
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
+		return "access denied"
+	case apierrors.IsConflict(err), apierrors.IsAlreadyExists(err):
+		return "changed concurrently, retrying"
+	case apierrors.IsInvalid(err):
+		return "rejected by the API server as invalid"
+	case apierrors.IsTooManyRequests(err), apierrors.IsServerTimeout(err),
+		apierrors.IsTimeout(err), apierrors.IsServiceUnavailable(err):
+		return "API server unavailable, retrying"
+	case errors.As(err, &owned):
+		return "already controlled by another object"
+	default:
+		return scrubReason(err)
+	}
+}
+
+func hashErrorMessage(err error, cost int) string {
+	if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		return "password is longer than 72 bytes, the most bcrypt accepts"
+	}
+	return fmt.Sprintf("could not hash the password at bcrypt cost %d", cost)
 }
 
 // scrubReason produces a User-CR-Status-safe summary of an error. We
