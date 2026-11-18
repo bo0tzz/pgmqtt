@@ -266,10 +266,10 @@ ui:
       drop:
         - ALL
 
-## Sized for typical homelab / small-cluster shapes (≤ ~1k conns +
-## few hundred msg/s). If you're driving meaningfully higher load,
-## bump these with the table below — but at that scale you should be
-## thinking about resource settings anyway.
+## Sized for typical homelab / small-cluster shapes (≤ ~1k conns across
+## the default two replicas + few hundred msg/s). If you're driving
+## meaningfully higher load, bump these with the table below — but at
+## that scale you should be thinking about resource settings anyway.
 ##
 ## Measured at idle (Linux x86_64 dev box, GOMAXPROCS=8, postgres:18-alpine,
 ## 2026-05-05): RSS scales linearly with conn count above ~500 conns at
@@ -280,7 +280,10 @@ ui:
 ## Goroutine count is exactly N_connections × 2 + ~16 baseline (one read
 ## goroutine + one drain goroutine per connection).
 ##
-##   conns   measured idle RSS    suggested limit (×2 burst)   request
+## Connections are per Pod. From 500 connections up, the suggested limit
+## is roughly 3-4× the idle figure, as headroom for bursts.
+##
+##   conns   measured idle RSS    suggested limit              request
 ##       0           ~42 MiB              256 MiB (default)       64 MiB
 ##     500           ~70 MiB              256 MiB (default)       64 MiB
 ##    1000           ~88 MiB                  384 MiB            128 MiB
@@ -288,10 +291,24 @@ ui:
 ##    5000          ~250 MiB                  1 GiB              256 MiB
 ##   10000          ~460 MiB                  1.5 GiB            512 MiB
 ##
-## At chart default `limits.maxConnections=5000` the *cap* is 5k but
-## the *expected* working set is much smaller. The 256 MiB limit
-## comfortably covers up to ~3.5k conns idle plus burst headroom. Going
-## bigger means owning the sizing — there's no good default.
+## What the table does not count:
+##   - Traffic. The clients were connected and idle. Payloads in flight
+##     (up to limits.maxPacketSize each) and fan-out come on top; the
+##     headroom in the suggested limit is the only allowance for them.
+##   - The embedded operator. The Pod that holds the leader Lease keeps a
+##     Kubernetes informer cache of the Users and Secrets the operator
+##     watches. Its size follows the number and size of those objects,
+##     not the connection count, and it was not part of the measurement.
+##     Where the operator watches Secrets cluster-wide, a cluster with
+##     many or large Secrets (Helm release Secrets, for instance) makes
+##     that one Pod heavier than its peers.
+##
+## The default limit does not cover the default `limits.maxConnections`.
+## A Pod idles at ~250 MiB with 5000 connections, which leaves no room
+## for traffic under 256 MiB: near the connection cap it is OOM-killed
+## rather than refusing connections. The two defaults fit together up to
+## roughly 500 connections per Pod. Beyond that, raise the limit from the
+## table or lower maxConnections.
 resources:
   requests:
     cpu: 100m
@@ -500,9 +517,10 @@ v5:
   keepaliveMaxSec: 60
 
 ## Slow-subscriber backpressure. When a subscriber has this many rows in the
-## deliveries table, new QoS-0 messages are silently dropped and new QoS>0
-## messages cause that subscriber to be DISCONNECTed with reason 0x97
-## (Quota Exceeded). 0 disables the cap entirely.
+## deliveries table, a new QoS>0 message for it is not queued and the
+## subscriber is DISCONNECTed with reason 0x97 (Quota Exceeded). QoS-0
+## messages are exempt and still delivered: their rows are deleted on
+## send, so they do not build up. 0 disables the cap entirely.
 ##
 ## maxConnections is a per-Pod cap on accepted TCP/WS sockets — at the cap,
 ## CONNACK is rejected with 0x9F and the socket closed.
