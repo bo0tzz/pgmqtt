@@ -526,14 +526,20 @@ v5:
   receiveMaximum: 100
   keepaliveMaxSec: 60
 
-## Slow-subscriber backpressure. When a subscriber has this many rows in the
-## deliveries table, a new QoS>0 message for it is not queued and the
-## subscriber is DISCONNECTed with reason 0x97 (Quota Exceeded). QoS-0
-## messages are exempt and still delivered: their rows are deleted on
-## send, so they do not build up. 0 disables the cap entirely.
+## Slow-subscriber backpressure. The cap is on a subscriber's queued
+## deliveries, counted separately for QoS 0 and for QoS>0. When a
+## subscriber already has this many queued in the class a new message
+## falls in, the message is not queued for it and the subscriber is
+## DISCONNECTed with reason 0x97 (Quota Exceeded). QoS>0 messages wait
+## in the queue until acknowledged, so that class fills up when a client
+## is away or stops acknowledging. QoS 0 messages are only queued for a
+## connected client and leave the queue as they are sent, so that class
+## only fills up for a client that reads far slower than it is sent to.
+## 0 disables the cap entirely.
 ##
-## maxConnections is a per-Pod cap on accepted TCP/WS sockets — at the cap,
-## CONNACK is rejected with 0x9F and the socket closed.
+## maxConnections is a per-Pod cap on accepted TCP/WS sockets. At the cap
+## a new connection is closed without a CONNACK, so the client retries
+## (a refusing CONNACK is treated as final by MQTT.js and others).
 ##
 ## maxInboundMsgsPerSec is a per-conn token-bucket rate on inbound
 ## PUBLISH/SUBSCRIBE. Sustained over-rate triggers DISCONNECT 0x96
