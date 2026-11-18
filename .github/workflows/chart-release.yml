@@ -1,8 +1,13 @@
 name: chart-release
 
-# Publish the Helm chart to ghcr.io as an OCI artefact on every `vX.Y.Z`
-# tag push. The chart version + appVersion are rewritten from the tag
+# Publish the Helm chart to ghcr.io as an OCI artefact for a `vX.Y.Z`
+# tag. The chart version + appVersion are rewritten from the tag
 # (leading `v` stripped) so the chart we ship matches the binary tag.
+#
+# This workflow has no tag trigger of its own. ci.yml calls it from its
+# `chart` job, which runs on a tag push only after test, helm-lint,
+# conformance, smoke and the image push have all succeeded. A tag trigger
+# here would publish the chart in parallel with those checks.
 #
 # Consumers install with:
 #   helm install pgmqtt oci://ghcr.io/<owner>/charts/pgmqtt --version X.Y.Z
@@ -12,8 +17,7 @@ name: chart-release
 # pushing, so the tarball can be inspected before cutting a real tag.
 
 on:
-  push:
-    tags: ['v*']
+  workflow_call: {}
   workflow_dispatch:
     inputs:
       tag:

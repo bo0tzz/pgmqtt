@@ -17,7 +17,10 @@
 #
 # Optional:
 #   --paho-image  reuse a pre-built image instead of building one
-#   --user U --pass P  if the cluster doesn't have allowAnonymous=true
+#
+# The suite connects without credentials, so the release needs
+# auth.allowAnonymous=true. scripts/validate.sh tier3 is the reference
+# install; it also switches off the connection and rate limits.
 #
 # Required tooling: docker, kind, kubectl.
 
@@ -36,7 +39,7 @@ KEEP_POD=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)
-            sed -n '2,22p' "$0"; exit 0 ;;
+            sed -n '2,/^$/p' "$0"; exit 0 ;;
         --cluster)            CLUSTER="$2"; shift 2 ;;
         --namespace)          NS="$2"; shift 2 ;;
         --version)            VERSION="$2"; shift 2 ;;
@@ -140,11 +143,18 @@ kubectl --context "$KCTX" -n "$NS" wait --for=condition=Ready pod/"$POD" \
 # and we have a transcript to grep at the end.
 kubectl --context "$KCTX" -n "$NS" logs -f "$POD" | tee "$OUT"
 
-# kubectl logs -f exits when the Pod terminates. Read the exit code from
-# the Pod status.
-PHASE="$(kubectl --context "$KCTX" -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}')"
+# kubectl logs -f returns when the container's log stream closes, which
+# can be a moment before the kubelet records the Pod as terminated. Read
+# the verdict only once the phase is final, or a pass shows up as
+# "phase=Running exit=".
+PHASE=""
+for _ in $(seq 1 60); do
+    PHASE="$(kubectl --context "$KCTX" -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}')"
+    case "$PHASE" in Succeeded|Failed) break ;; esac
+    sleep 1
+done
 EXIT_CODE="$(kubectl --context "$KCTX" -n "$NS" get pod "$POD" \
-    -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)"
+    -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}')"
 
 echo
 if [ "$PHASE" = "Succeeded" ] || [ "$EXIT_CODE" = "0" ]; then

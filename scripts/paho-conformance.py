@@ -76,18 +76,21 @@ def main() -> int:
             "test_request_response,test_subscribe_options,"
             # Out-of-scope (no ACLs, no shared subs).
             "test_subscribe_failure,test_shared_subscriptions,"
-            # Timing-brittle: paho asserts will fires within 1s of
-            # WillDelayInterval, but `fire_due_wills` runs at 1s cadence
-            # so the worst-case fire latency is ~1s and the test
-            # occasionally lands on the wrong side of its delta. The
-            # implementation is spec-correct ([MQTT-3.1.2.11.2] has no
-            # upper bound on lateness); the test's tolerance is brittle.
+            # The test accepts a will up to 2 s after WillDelayInterval.
+            # The janitor's `fire_due_wills` has a 1 s interval but skips
+            # a tick that starts slightly under 1 s after its last run,
+            # so it runs every 1–2 s and a will can be just over 2 s
+            # late (9 of 200 tries of the test's first check against one
+            # broker, 2026-11-18). Late is still spec-correct
+            # ([MQTT-3.1.2.11.2] sets no upper bound). This can come off
+            # the list once that job runs on every tick.
             "test_will_delay"
         ),
-        help="comma-separated test names whose failure is reported as WARN, "
-             "not FAIL — used so tier3 doesn't fail-fast on documented flakes "
-             "or out-of-scope tests. Override with --known-flaky '' to make "
-             "every test hard.",
+        help="comma-separated test names whose failure is reported as "
+             "FAIL(known-flaky) and does not affect the exit code: tests "
+             "for features pgmqtt lacks, and tests that are not reliable. "
+             "AGENTS.md explains each entry. Override with "
+             "--known-flaky '' to make every test hard.",
     )
     args = p.parse_args()
     flaky = {t.strip() for t in args.known_flaky.split(",") if t.strip()}

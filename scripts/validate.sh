@@ -9,22 +9,31 @@
 #
 # Tiers (additive — tier3 implies tier2 implies tier1):
 #
-#   tier1   fast — after every change. ~1–2 min on a developer laptop.
-#           go vet + make test-race + helm lint + helm template (default
-#           values + a couple of overrides).
+#   tier1   after every change. Needs Docker: `go test -race` runs the
+#           whole suite, and most of it talks to a Postgres testcontainer.
+#           go vet + go test -race + helm lint + helm template (four value
+#           sets, each strict-parsed with kustomize).
+#
+#   tier2   before commit.
+#           tier1 + a coverage run + Paho v3 + Paho v5 against one broker.
+#           Requires --paho /path/to/paho.mqtt.testing.
+#           CI runs this as the `conformance` job on every PR and push.
+#
+#   tier3   before tag.
+#           tier2 + a 3-replica kind cluster: multi-broker Paho, helm
+#           test, and two soak smokes (QoS 1, 60s × 1000 msg/s; QoS 0,
+#           120s × 100 msg/s).
+#           CI runs this weekly (soak-weekly.yml).
+#
+# Measured wall-clock per tier is in scripts/validate-timings.md.
 #
 # --vulncheck adds a govulncheck phase to any tier. Off by default because
 # it fails on advisories published against unchanged code (often stdlib,
 # fixable only by a toolchain bump), which is a different signal from
 # "did my change break something". CI runs it as its own job.
 #
-#   tier2   slow — before commit. ~5–10 min.
-#           tier1 + make coverage + Paho v3 + Paho v5 single-broker.
-#           Requires --paho /path/to/paho.mqtt.testing.
-#
-#   tier3   full — before tag / nightly CI.
-#           tier2 + multi-broker Paho via kind + helm test in kind +
-#           soak smoke (60s × 1000 msg/s).
+# --keep-cluster leaves the tier3 kind cluster running when the script
+# exits, pass or fail, so it can be inspected.
 #
 # Usage:
 #   scripts/validate.sh tier1
@@ -36,6 +45,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+# internal/db/dbtest skips database-backed tests when it cannot start its
+# Postgres container. Those are most of the suite, so here a missing
+# container has to fail the tier rather than pass it.
+export PGMQTT_TEST_REQUIRE_DB=1
 
 # `go install` deposits binaries in $GOPATH/bin which isn't always on PATH.
 # Without this, govulncheck_phase's auto-install succeeds but the next line
@@ -83,9 +97,16 @@ phase() {
     local name="$1"; shift
     echo
     echo "==> [$TIER] $name"
-    local start end rc=0
+    local start end rc
     start=$(date +%s)
-    "$@" || rc=$?
+    # Not `"$@" || rc=$?`: bash ignores errexit inside a function called
+    # from an && / || list, so only the last command of a phase would
+    # decide its result (a failing `go test` hidden by the `go tool
+    # cover` after it). A subshell outside any list keeps errexit on.
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    set -e
     end=$(date +%s)
     PHASES+=("$((end - start))s  $name  rc=$rc")
     if [ $rc -ne 0 ]; then
@@ -143,13 +164,22 @@ t2_coverage() {
 
 # Boot a single-broker pgmqttd (TCP only) against an ephemeral postgres
 # container, run the Paho v3+v5 conformance wrapper, capture results.
-T2_PG_PORT=55435
-T2_BROKER_PORT=11885
+# Ports, container and scratch files are per run, so that worktrees can
+# run tier2 at the same time without sharing a broker.
 T2_PG_NAME="pgmqtt-validate-pg-$$"
+T2_BIN="/tmp/pgmqttd-validate-$$"
+T2_LOG="/tmp/pgmqttd-validate-$$.log"
+T2_PID="/tmp/pgmqttd-validate-$$.pid"
+T2_PG_PORT=""
+T2_BROKER_PORT=""
+
+free_port() {
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
 t2_paho_setup() {
-    docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
     docker run --rm -d --name "$T2_PG_NAME" \
-        -p "$T2_PG_PORT:5432" \
+        -p "127.0.0.1:$T2_PG_PORT:5432" \
         -e POSTGRES_USER=pgmqtt -e POSTGRES_PASSWORD=pgmqtt -e POSTGRES_DB=pgmqtt \
         postgres:18-alpine \
         -c shared_preload_libraries=pg_stat_statements >/dev/null
@@ -158,26 +188,29 @@ t2_paho_setup() {
         if docker exec "$T2_PG_NAME" pg_isready -U pgmqtt >/dev/null 2>&1; then break; fi
         sleep 1
     done
-    go build -o /tmp/pgmqttd-validate ./cmd/pgmqttd
-    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@localhost:$T2_PG_PORT/pgmqtt?sslmode=disable" \
+    go build -o "$T2_BIN" ./cmd/pgmqttd
+    PGMQTT_DATABASE_URL="postgres://pgmqtt:pgmqtt@127.0.0.1:$T2_PG_PORT/pgmqtt?sslmode=disable" \
     PGMQTT_TCP_ADDR="127.0.0.1:$T2_BROKER_PORT" \
     PGMQTT_WS_ADDR= \
     PGMQTT_METRICS_ADDR= \
     PGMQTT_ALLOW_ANONYMOUS=true \
-        /tmp/pgmqttd-validate >/tmp/pgmqttd-validate.log 2>&1 &
-    echo $! >/tmp/pgmqttd-validate.pid
+        "$T2_BIN" >"$T2_LOG" 2>&1 &
+    echo $! >"$T2_PID"
     # Wait for the broker to start listening.
     for _ in $(seq 1 30); do
-        if (echo > /dev/tcp/127.0.0.1/$T2_BROKER_PORT) 2>/dev/null; then break; fi
+        if (echo > "/dev/tcp/127.0.0.1/$T2_BROKER_PORT") 2>/dev/null; then return 0; fi
         sleep 1
     done
+    echo "validate.sh: broker is not listening on 127.0.0.1:$T2_BROKER_PORT; see $T2_LOG" >&2
+    return 1
 }
 
 t2_paho_teardown() {
-    if [ -f /tmp/pgmqttd-validate.pid ]; then
-        kill "$(cat /tmp/pgmqttd-validate.pid)" 2>/dev/null || true
-        rm -f /tmp/pgmqttd-validate.pid
+    if [ -f "$T2_PID" ]; then
+        kill "$(cat "$T2_PID")" 2>/dev/null || true
+        rm -f "$T2_PID"
     fi
+    rm -f "$T2_BIN"
     docker rm -f "$T2_PG_NAME" >/dev/null 2>&1 || true
 }
 
@@ -193,11 +226,15 @@ t2_paho_run() {
 run_tier2() {
     run_tier1
     phase "make coverage"    t2_coverage
-    phase "paho setup"       t2_paho_setup
+    T2_PG_PORT="$(free_port)"
+    T2_BROKER_PORT="$(free_port)"
     trap t2_paho_teardown EXIT
+    phase "paho setup"       t2_paho_setup
     phase "paho v3+v5"       t2_paho_run
     phase "paho teardown"    t2_paho_teardown
     trap - EXIT
+    # Kept until here so a failed run leaves the broker log behind.
+    rm -f "$T2_LOG"
 }
 
 # ---------- tier3 phases ----------
@@ -211,6 +248,7 @@ run_tier2() {
 # parallel sessions don't collide.
 T3_CLUSTER="pgmqtt-validate-tier3-$$"
 T3_NS="mqtt"
+T3_TEST_USER="smoketest"
 
 t3_multi_broker_setup() {
     docker build --quiet -t pgmqtt:tier3 . >/dev/null
@@ -230,6 +268,8 @@ t3_multi_broker_setup() {
         --set 'limits.maxConnectsPerIPPerSec=0' \
         --set 'limits.maxAuthFailuresPerIPPerMin=0' \
         --set operator.bcryptCost=4 \
+        --set tests.enabled=true \
+        --set "tests.credentialsSecret=$T3_TEST_USER-mqtt-credentials" \
         --set "database.url=postgres://pgmqtt:pgmqtt@postgres.$T3_NS.svc:5432/pgmqtt?sslmode=disable" >/dev/null
     kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" rollout status deployment/pgmqtt --timeout=180s
 }
@@ -241,8 +281,49 @@ t3_multi_broker() {
         --version both
 }
 
+# `helm test` runs the chart's round-trip hook Pod, which logs in with the
+# credentials Secret the operator writes for a User CR. The Paho and soak
+# phases connect anonymously, so this is the one tier3 phase that goes
+# through the reconciler and password auth.
+t3_helm_test() {
+    local secret="$T3_TEST_USER-mqtt-credentials"
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" apply -f - <<EOF || return 1
+apiVersion: pgmqtt.io/v1alpha1
+kind: User
+metadata:
+  name: $T3_TEST_USER
+EOF
+    for _ in $(seq 1 60); do
+        if kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get secret "$secret" >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get secret "$secret" >/dev/null || return 1
+    # No --logs: the hook's delete policy removes the Pod on success, and
+    # helm then fails the test because it cannot fetch the logs. A failed
+    # Pod is kept, and t3_diagnostics prints it.
+    helm --kube-context "kind-$T3_CLUSTER" -n "$T3_NS" test pgmqtt --timeout 180s
+}
+
+t3_diagnostics() {
+    echo "==> [$TIER] cluster state after a failed phase" >&2
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get pods -o wide >&2 || true
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" logs -l app.kubernetes.io/name=pgmqtt \
+        --all-containers --prefix --tail=200 >&2 || true
+    kubectl --context "kind-$T3_CLUSTER" -n "$T3_NS" get events --sort-by=.lastTimestamp 2>&1 | tail -30 >&2 || true
+}
+
 t3_multi_broker_teardown() {
+    if [ -n "$KEEP_CLUSTER" ]; then
+        echo "validate.sh: --keep-cluster: kind cluster '$T3_CLUSTER' left running (kind delete cluster --name $T3_CLUSTER)"
+        return 0
+    fi
     kind delete cluster --name "$T3_CLUSTER" >/dev/null 2>&1 || true
+}
+
+t3_on_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] || t3_diagnostics
+    t3_multi_broker_teardown
 }
 
 t3_soak_smoke() {
@@ -282,13 +363,13 @@ t3_soak_homelab() {
 
 run_tier3() {
     run_tier2
-    # tier3 reuses one kind cluster for both multi-broker paho and the
-    # soak smokes — same broker install, no per-phase teardown. The
-    # cluster is created in t3_multi_broker_setup and torn down in
-    # t3_multi_broker_teardown.
+    # tier3 reuses one kind cluster for multi-broker paho, helm test and
+    # the soak smokes — same broker install, no per-phase teardown. The
+    # trap is set before setup so a half-built cluster is cleaned up too.
+    trap t3_on_exit EXIT
     phase "tier3 cluster setup" t3_multi_broker_setup
-    trap t3_multi_broker_teardown EXIT
     phase "multi-broker paho"   t3_multi_broker
+    phase "helm test"           t3_helm_test
     phase "soak smoke (qos1)"   t3_soak_smoke
     phase "soak smoke (qos0)"   t3_soak_homelab
     phase "tier3 cluster teardown" t3_multi_broker_teardown
