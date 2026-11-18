@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,17 +54,19 @@ type UserReconciler struct {
 	Logger    *slog.Logger
 
 	// Wire details for auto-generated Secrets — supplied via env so the
-	// reconciler can patch stale host/port values.
+	// reconciler can patch stale host/port values. A port of 0 means that
+	// endpoint is not offered: its port and URI keys are left out of the
+	// Secret, and removed from one that has them.
 	ServiceHost string // e.g. "pgmqtt.mqtt.svc.cluster.local"
-	ServicePort int    // e.g. 1883
-	WSPort      int    // e.g. 8083
+	ServicePort int    // e.g. 1883; 0 = TCP listener disabled
+	WSPort      int    // e.g. 8083; 0 = websocket listener disabled
 	// Optional TLS endpoint for the User CR's Secret. When TLSHost is
 	// non-empty the operator emits an mqtts:// URI alongside the plain
 	// mqtt:// one. Operators wanting to push apps to TLS-only set the
 	// matching listener up out-of-band (ingress-nginx, HAProxy, etc.).
 	TLSHost string
-	TLSPort int    // e.g. 8883
-	WSSPort int    // e.g. 8443
+	TLSPort int // e.g. 8883; 0 = no mqtts endpoint
+	WSSPort int // e.g. 8443; 0 = no wss endpoint
 
 	// BcryptCost overrides the cost used when hashing the User's password.
 	// 0 falls back to bcrypt.DefaultCost (10).
@@ -604,14 +607,6 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 	if host == "" {
 		host = "pgmqtt"
 	}
-	port := r.ServicePort
-	if port == 0 {
-		port = 1883
-	}
-	wsPort := r.WSPort
-	if wsPort == 0 {
-		wsPort = 8083
-	}
 
 	desired := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -635,36 +630,31 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		if len(password) == 0 {
 			password = []byte(candidate)
 		}
-		desired.Data["username"] = []byte(username)
-		desired.Data["password"] = password
-		desired.Data["host"] = []byte(host)
-		desired.Data["port"] = []byte(fmt.Sprintf("%d", port))
-		desired.Data["ws-port"] = []byte(fmt.Sprintf("%d", wsPort))
-		desired.Data["uri"] = []byte(fmt.Sprintf("mqtt://%s:%s@%s:%d",
-			url.PathEscape(username), url.PathEscape(string(password)), host, port))
-		desired.Data["ws-uri"] = []byte(fmt.Sprintf("ws://%s:%s@%s:%d/mqtt",
-			url.PathEscape(username), url.PathEscape(string(password)), host, wsPort))
-		// TLS endpoints — populated only when an operator wires
-		// TLSHost/TLSPort into the broker's env (helm
-		// `operator.tlsHost` etc.). The plain mqtt:// URI stays in
-		// the Secret either way for in-cluster traffic; mqtts://
-		// gives consumer apps an opinionated path to the encrypted
-		// listener so they don't fall back to plaintext by default.
-		if r.TLSHost != "" {
-			tlsPort := r.TLSPort
-			if tlsPort == 0 {
-				tlsPort = 8883
-			}
-			desired.Data["tls-host"] = []byte(r.TLSHost)
-			desired.Data["tls-port"] = []byte(fmt.Sprintf("%d", tlsPort))
-			desired.Data["mqtts-uri"] = []byte(fmt.Sprintf("mqtts://%s:%s@%s:%d",
-				url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, tlsPort))
-			if wssPort := r.WSSPort; wssPort > 0 {
-				desired.Data["wss-port"] = []byte(fmt.Sprintf("%d", wssPort))
-				desired.Data["wss-uri"] = []byte(fmt.Sprintf("wss://%s:%s@%s:%d/mqtt",
-					url.PathEscape(username), url.PathEscape(string(password)), r.TLSHost, wssPort))
-			}
+		data := desired.Data
+		data["username"] = []byte(username)
+		data["password"] = password
+		data["host"] = []byte(host)
+
+		// Each endpoint's keys are written when it is offered and removed
+		// when it is not. A consumer wired to `uri` should then fail to
+		// start rather than be handed a port nothing listens on.
+		userinfo := url.PathEscape(username) + ":" + url.PathEscape(string(password))
+		advertise(data, "port", "uri", "mqtt://%s@%s:%d", userinfo, host, r.ServicePort)
+		advertise(data, "ws-port", "ws-uri", "ws://%s@%s:%d/mqtt", userinfo, host, r.WSPort)
+
+		// The plain mqtt:// URI stays next to the TLS one for in-cluster
+		// traffic; mqtts:// gives consumers a ready-made path to the
+		// encrypted endpoint so they don't default to plaintext.
+		tlsPort, wssPort := r.TLSPort, r.WSSPort
+		if r.TLSHost == "" {
+			delete(data, "tls-host")
+			tlsPort, wssPort = 0, 0
+		} else {
+			data["tls-host"] = []byte(r.TLSHost)
 		}
+		advertise(data, "tls-port", "mqtts-uri", "mqtts://%s@%s:%d", userinfo, r.TLSHost, tlsPort)
+		advertise(data, "wss-port", "wss-uri", "wss://%s@%s:%d/mqtt", userinfo, r.TLSHost, wssPort)
+
 		return controllerutil.SetControllerReference(user, desired, r.Scheme)
 	})
 	if err != nil {
@@ -694,6 +684,19 @@ func (r *UserReconciler) resolveCredentialSecret(ctx context.Context, user *pgmq
 		}
 	}
 	return &resolved, string(pw), nil
+}
+
+// advertise writes the port and URI keys of one endpoint into a generated
+// Secret, or removes both when port is 0, which means the endpoint is not
+// offered.
+func advertise(data map[string][]byte, portKey, uriKey, uriFormat, userinfo, host string, port int) {
+	if port <= 0 {
+		delete(data, portKey)
+		delete(data, uriKey)
+		return
+	}
+	data[portKey] = []byte(strconv.Itoa(port))
+	data[uriKey] = []byte(fmt.Sprintf(uriFormat, userinfo, host, port))
 }
 
 // generatePassword returns a base64-url-encoded 24-byte random password.

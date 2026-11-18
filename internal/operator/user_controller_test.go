@@ -485,10 +485,12 @@ func TestReconcile_BYOSecret_DefaultKey(t *testing.T) {
 	}
 }
 
-// TestReconcile_DefaultsServiceWireDetails verifies the fallbacks when
-// the reconciler's ServiceHost / ServicePort / WSPort are zero-valued.
-// The auto-generated Secret should still contain valid wire fields.
-func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
+// TestReconcile_ZeroValuedWireDetails verifies what the reconciler does
+// when ServiceHost / ServicePort / WSPort are zero-valued: the host falls
+// back to the chart's default Service name, and a port of 0 means that
+// listener is disabled, so no port or URI is published for it. (The
+// defaults 1883 / 8083 for an unset environment live in internal/config.)
+func TestReconcile_ZeroValuedWireDetails(t *testing.T) {
 	t.Parallel()
 	pool := dbtest.FreshPool(t)
 	scheme := newScheme(t)
@@ -497,7 +499,6 @@ func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
 	}
 	cli := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(user).WithStatusSubresource(&pgmqttv1alpha1.User{}).Build()
-	// All wire defaults left at zero so the reconciler picks its fallbacks.
 	r := &operator.UserReconciler{
 		Client: cli, Scheme: scheme, Pool: pool,
 		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -514,17 +515,13 @@ func TestReconcile_DefaultsServiceWireDetails(t *testing.T) {
 	if string(sec.Data["host"]) != "pgmqtt" {
 		t.Errorf("default host: got %q, want %q", sec.Data["host"], "pgmqtt")
 	}
-	if string(sec.Data["port"]) != "1883" {
-		t.Errorf("default port: got %q, want %q", sec.Data["port"], "1883")
+	for _, key := range []string{"port", "uri", "ws-port", "ws-uri"} {
+		if v, ok := sec.Data[key]; ok {
+			t.Errorf("%s = %q published for a disabled listener", key, v)
+		}
 	}
-	if string(sec.Data["ws-port"]) != "8083" {
-		t.Errorf("default ws-port: got %q, want %q", sec.Data["ws-port"], "8083")
-	}
-	if !strings.HasPrefix(string(sec.Data["uri"]), "mqtt://") {
-		t.Errorf("uri default scheme: %q", sec.Data["uri"])
-	}
-	if !strings.HasPrefix(string(sec.Data["ws-uri"]), "ws://") {
-		t.Errorf("ws-uri default scheme: %q", sec.Data["ws-uri"])
+	if len(sec.Data["username"]) == 0 || len(sec.Data["password"]) == 0 {
+		t.Errorf("credentials missing: %v", sec.Data)
 	}
 }
 

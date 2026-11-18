@@ -54,6 +54,11 @@ spec:
                 username:
                   description: |
                     MQTT username. Defaults to `metadata.name` when empty.
+                    A username belongs to the first User that claims it,
+                    in any namespace. Another User asking for the same
+                    one gets no account and reports `UsernameConflict`
+                    on its Ready condition until the owner is deleted or
+                    renamed.
                     Restricted to `[A-Za-z0-9._-]{1,128}` so a malformed
                     name can't bloat broker storage or push the
                     pg_notify takeover/quota payloads (which carry the
@@ -63,12 +68,17 @@ spec:
                   pattern: "^[A-Za-z0-9._-]+$"
                 passwordSecretRef:
                   description: |
-                    References an existing Secret holding the password.
+                    References an existing Secret holding the password. The
+                    key must hold a non-empty value.
                     Omit to have the reconciler generate a credentials Secret
                     named `<metadata.name>-mqtt-credentials` containing
-                    `username`, `password`, `host`, `port`, `ws-port`,
-                    `uri`, and `ws-uri` (plus `tls-host`/`tls-port`/
-                    `mqtts-uri` when the operator has a TLSHost configured).
+                    `username`, `password` and `host`, plus `port`/`uri`
+                    for the TCP listener and `ws-port`/`ws-uri` for the
+                    websocket listener, each only while that listener is
+                    enabled. When the broker is given a TLS endpoint
+                    (`PGMQTT_TLS_HOST`) the Secret also carries `tls-host`,
+                    and `tls-port`/`mqtts-uri` and `wss-port`/`wss-uri`
+                    for whichever of those ports is configured.
                   type: object
                   properties:
                     name:

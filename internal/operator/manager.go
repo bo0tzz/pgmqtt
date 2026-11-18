@@ -43,10 +43,17 @@ func resolveLeaderElectionNamespace(explicit string) string {
 
 // Options configures the operator manager.
 type Options struct {
+	// Endpoints written into generated credentials Secrets. A port of 0
+	// means the endpoint is not offered and is left out; TLSPort and
+	// WSSPort only apply when TLSHost is set.
 	ServiceHost string
 	ServicePort int
 	WSPort      int
-	BcryptCost  int
+	TLSHost     string
+	TLSPort     int
+	WSSPort     int
+
+	BcryptCost int
 
 	// LeaderElectionNamespace is the namespace where the controller-runtime
 	// Lease resource lives. Empty means "auto-detect from the in-cluster
@@ -137,6 +144,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, opts Opti
 		ServiceHost: opts.ServiceHost,
 		ServicePort: opts.ServicePort,
 		WSPort:      opts.WSPort,
+		TLSHost:     opts.TLSHost,
+		TLSPort:     opts.TLSPort,
+		WSSPort:     opts.WSSPort,
 		BcryptCost:  opts.BcryptCost,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {

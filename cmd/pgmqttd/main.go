@@ -163,6 +163,9 @@ func main() {
 			ServiceHost:             cfg.ServiceHost,
 			ServicePort:             cfg.ServicePort,
 			WSPort:                  cfg.WSPort,
+			TLSHost:                 cfg.TLSHost,
+			TLSPort:                 cfg.TLSPort,
+			WSSPort:                 cfg.WSSPort,
 			BcryptCost:              cfg.BcryptCost,
 			LeaderElectionNamespace: cfg.PodNamespace,
 		}
