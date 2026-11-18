@@ -56,6 +56,7 @@ func main() {
 		logger.Warn("PGMQTT_LOG_LEVEL parse failed; falling back to info",
 			"value", os.Getenv("PGMQTT_LOG_LEVEL"), "err", levelParseErr)
 	}
+	logger.Info("pgmqttd", "version", version)
 
 	cfg, err := config.FromEnv()
 	if err != nil {
