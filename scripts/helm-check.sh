@@ -262,6 +262,8 @@ renders() {
     # Prometheus renames a metric's own `job` label to `exported_job`, so
     # a dashboard query grouping by it sees one series.
     lacks everything 'by (job)'
+    # `job` is the Service name, which follows the release name.
+    lacks everything 'job=\"'
 
     render netpol-pinned \
         --set database.url='postgres://x/y' \

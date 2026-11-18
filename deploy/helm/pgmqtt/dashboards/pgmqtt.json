@@ -1213,7 +1213,7 @@
       },
       "targets": [
         {
-          "expr": "process_resident_memory_bytes{namespace=~\"$namespace\",pod=~\"$pod\",job=\"pgmqtt\"}",
+          "expr": "process_resident_memory_bytes{namespace=~\"$namespace\",pod=~\"$pod\"} and on (job, instance) pgmqtt_connections{namespace=~\"$namespace\",pod=~\"$pod\"}",
           "refId": "A",
           "legendFormat": "{{pod}}"
         }
@@ -1253,7 +1253,7 @@
       },
       "targets": [
         {
-          "expr": "go_goroutines{namespace=~\"$namespace\",pod=~\"$pod\",job=\"pgmqtt\"}",
+          "expr": "go_goroutines{namespace=~\"$namespace\",pod=~\"$pod\"} and on (job, instance) pgmqtt_connections{namespace=~\"$namespace\",pod=~\"$pod\"}",
           "refId": "A",
           "legendFormat": "{{pod}}"
         }
