@@ -317,8 +317,14 @@ func (j *Janitor) tickWithRecover(ctx context.Context) (err error) {
 	return j.Tick(ctx)
 }
 
-// shouldRun reports whether (now - j.lastRun[job]) >= j.jobIntervals[job].
-// The first call for any job always fires (zero-value lastRun).
+// shouldRun reports whether job is due: whether its interval has passed
+// since it last ran, give or take half a base tick. The first call for any
+// job always fires (zero-value lastRun).
+//
+// Without the slack, a job whose interval is a whole number of ticks
+// skipped a tick whenever the ticker fired a hair early, which it does:
+// fire_due_wills, nominally every second, ran 41 times a minute, and a
+// will could go out up to a second late.
 func (j *Janitor) shouldRun(job string, now time.Time) bool {
 	interval := j.jobIntervals[job]
 	if interval <= 0 {
@@ -330,7 +336,7 @@ func (j *Janitor) shouldRun(job string, now time.Time) bool {
 	if last.IsZero() {
 		return true
 	}
-	return now.Sub(last) >= interval
+	return now.Sub(last) >= interval-j.interval/2
 }
 
 // markRun records the time job last fired.
