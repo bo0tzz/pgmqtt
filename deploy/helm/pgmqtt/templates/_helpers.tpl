@@ -45,3 +45,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s.%s.svc.cluster.local" (include "pgmqtt.fullname" .) .Release.Namespace -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The binary serves /metrics and /healthz/* from one HTTP server, so the
+server has to stay up for HTTP probes even when metrics.enabled=false.
+Renders "true" or nothing.
+*/}}
+{{- define "pgmqtt.httpServerEnabled" -}}
+{{- if or .Values.metrics.enabled (and .Values.probes.enabled .Values.probes.useHTTP) -}}
+true
+{{- end -}}
+{{- end -}}

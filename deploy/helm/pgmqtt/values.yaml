@@ -95,8 +95,8 @@ service:
 
 ## Optional ServiceMonitor for prometheus-operator. Disabled by default; set
 ## to true if you have prometheus-operator installed. The metrics endpoint
-## listens on metricsPort (defaults below) and exports pgmqtt_* counters
-## plus Go runtime metrics + pgxpool stats.
+## listens on metrics.port (below) and exports pgmqtt_* counters plus Go
+## runtime metrics + pgxpool stats. Not rendered when metrics.enabled=false.
 serviceMonitor:
   enabled: false
   ## Scrape interval; passed straight through to the ServiceMonitor spec.
@@ -111,6 +111,13 @@ serviceMonitor:
   ##     release: prometheus
   labels: {}
 
+## Metrics exposure. The binary serves /metrics and the /healthz/* probe
+## endpoints from one HTTP server on `port`. enabled=false removes the
+## port from the Service and from the NetworkPolicy ingress rule and drops
+## the ServiceMonitor, but while HTTP probes are on (probes.useHTTP, the
+## default) the server keeps listening on the Pod so the probes have
+## something to hit, and /metrics stays reachable on the Pod IP. To run
+## without the HTTP server at all, also set probes.useHTTP=false.
 metrics:
   enabled: true
   port: 9090
@@ -364,8 +371,8 @@ runtimeClassName: ""
 ## Kubernetes API. Mounting the SA token is required.
 automountServiceAccountToken: true
 
-## Liveness/readiness probe is a TCP connect to the MQTT port. The default
-## thresholds are conservative for normal startup; production operators
+## Liveness/readiness probes. The default thresholds are conservative for
+## normal startup; production operators
 ## frequently bump failureThreshold / timeoutSeconds when their Postgres is
 ## occasionally slow (managed PG vacuums, PITR replays, etc.) so a brief
 ## stall doesn't restart the broker mid-stream.
@@ -381,7 +388,8 @@ probes:
   ## port. This generates a "read connect" DEBUG log line on every probe
   ## (kubelet opens TCP, doesn't speak MQTT, the broker reads EOF) and
   ## can't distinguish "process is up" from "process is up AND can reach
-  ## PG". Set false only for environments without an HTTP metrics port.
+  ## PG". Set false only to run without the HTTP server (together with
+  ## metrics.enabled=false).
   useHTTP: true
   liveness:
     initialDelaySeconds: 5

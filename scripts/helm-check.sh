@@ -108,6 +108,26 @@ renders() {
         --set lifecycle.preStopSleepSeconds=30 \
         --set terminationGracePeriodSeconds=30
 
+    # The health endpoints live on the metrics HTTP server, so it stays up
+    # for the probes; only its exposure goes away.
+    render metrics-off \
+        --set database.url='postgres://x/y' \
+        --set metrics.enabled=false \
+        --set serviceMonitor.enabled=true \
+        --set networkPolicy.enabled=true
+    has metrics-off 'path: /healthz/ready'
+    lacks metrics-off 'targetPort: metrics'
+    lacks metrics-off 'kind: ServiceMonitor'
+    lacks metrics-off 'port: 9090'
+
+    # No HTTP server at all: TCP probes on the MQTT port.
+    render metrics-off-tcp-probes \
+        --set database.url='postgres://x/y' \
+        --set metrics.enabled=false \
+        --set probes.useHTTP=false
+    lacks metrics-off-tcp-probes 'containerPort: 9090'
+    lacks metrics-off-tcp-probes 'path: /healthz'
+
     # 3 replicas + UI on + tests off (operator-style install).
     render multi \
         --set database.url='postgres://x/y' \
