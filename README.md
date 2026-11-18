@@ -15,13 +15,26 @@ holds only TCP sockets, a per-Pod `client_id → *Conn` map, a
 `pg_advisory_lock`. Cross-Pod fanout is `pg_notify`. There is no
 singleton leader.
 
-Conformance: Paho v3.1.1 9/10, v5 24/27 (`scripts/paho-conformance.py`
-runs both — the off-list ones are documented-flaky upstream or
-out-of-scope features like ACLs and shared subscriptions).
+When a Pod dies, its clients reconnect to another one through the
+Service. The surviving Pods notice the dead broker by its released
+advisory lock and reap it about 30–35 s later. Wills for its clients
+that have not reconnected by then are published no sooner than that.
+The wait is deliberate: a Postgres restart frees every broker's lock
+for a few seconds, and that must not look like every broker dying.
+
+Conformance, measured with the Eclipse Paho interoperability suite
+(`scripts/paho-conformance.py` runs both protocol versions): v3.1.1
+9/10, v5 23–25 of 27. `test_subscribe_failure` (both versions) and
+`test_shared_subscriptions` always fail, because pgmqtt has no ACLs and
+no shared subscriptions. Two more v5 tests, `test_request_response` and
+`test_subscribe_options`, publish without waiting for their own
+subscribe to be acknowledged; they fail in most single-broker runs
+(23/27) and usually pass against a multi-broker cluster (25/27).
 
 ## Quick start (Kubernetes)
 
-You need Postgres reachable from your cluster. Any Postgres ≥ 14.
+You need Postgres reachable from your cluster. pgmqtt is developed and
+tested against Postgres 18 only; nothing verifies an older version.
 
 ```bash
 kubectl create namespace mqtt
@@ -82,10 +95,17 @@ documented inline in `deploy/helm/pgmqtt/values.yaml`.
 ## Development
 
 ```bash
-go test ./...                       # full suite (uses Docker for Postgres)
-make validate TIER=tier1            # vet + race + helm lint (~10s)
-make validate TIER=tier3 PAHO=...   # adds multi-broker paho + soak smoke
+go test ./...                       # full suite; DB tests need Docker and skip without it
+make validate TIER=tier1            # vet + full suite under -race + helm checks
+make validate TIER=tier2 PAHO=...   # adds Paho v3+v5 conformance against one broker
+make validate TIER=tier3 PAHO=...   # adds a kind cluster: multi-broker Paho, helm test, soak
 ```
+
+`PAHO` is a checkout of
+[paho.mqtt.testing](https://github.com/eclipse/paho.mqtt.testing).
+Every tier needs Docker and fails without it. Timings and what each
+tier catches are in
+[`scripts/validate-timings.md`](scripts/validate-timings.md).
 
 For agents working in this repo (parallel-worktree pattern, common
 pitfalls, validation tier model), see [`AGENTS.md`](AGENTS.md).
